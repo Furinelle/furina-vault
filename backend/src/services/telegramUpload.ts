@@ -666,7 +666,9 @@ function extractFileInfo(message: Api.Message): { fileName: string; mimeType: st
                 else if (audioAttr) fileName = `audio_${message.id}.mp3`;
             }
         } else if (message.photo) {
-            fileName = `photo_${message.id}.jpg`;
+            const date = new Date();
+            const timestamp = date.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+            fileName = `Img_${timestamp}.jpg`;
             mimeType = 'image/jpeg';
         } else if (message.video) {
             const video = message.video as Api.Document;
@@ -1000,7 +1002,20 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
         // 上面的 setInterval 已经负责了轮询状态并更新 UI。
         // 我们只需等待所有 promise 完成。
 
-        await Promise.all(queue.files.map(file => processFileUpload(client, file, queue)));
+        // 启动所有文件上传，并根据索引命名
+        await Promise.all(queue.files.map((file, index) => {
+            // 如果文件夹名不是默认的 ID，我们可以给里面的文件加个索引
+            const ext = path.extname(file.fileName);
+            const baseName = queue.folderName || 'file';
+            // 只有当文件夹名比较有意义时才使用文件夹名作为前缀
+            const isDefaultFolder = /^[0-9-]+$/.test(baseName);
+
+            if (!isDefaultFolder) {
+                file.fileName = `${baseName}_${index + 1}${ext}`;
+            }
+
+            return processFileUpload(client, file, queue);
+        }));
 
         // 最后一次更新状态
         await onBatchProgress();
@@ -1131,8 +1146,12 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
         const caption = message.message || '';
         if (caption && caption.trim()) {
             const ext = path.extname(fileName);
-            const sanitizedCaption = sanitizeFilename(caption.trim());
-            if (!sanitizedCaption.toLowerCase().endsWith(ext.toLowerCase()) && ext) {
+            // 这里我们只需要取标题的第一行作为文件名
+            const firstLine = caption.split(/\r?\n/)[0].trim();
+            const sanitizedCaption = sanitizeFilename(firstLine);
+
+            // 检查 sanitizedCaption 是否已经包含了扩展名
+            if (ext && !sanitizedCaption.toLowerCase().endsWith(ext.toLowerCase())) {
                 finalFileName = `${sanitizedCaption}${ext}`;
             } else {
                 finalFileName = sanitizedCaption;
