@@ -26,11 +26,10 @@ async function sendLoginNotification(req: Request) {
     const ip = getClientIP(req);
     const ua = new UAParser(req.headers['user-agent']).getResult();
     const location = await getIPLocation(ip);
-    const now = new Date();
-    // 转换为北京时间 (UTC+8)
-    const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString()
-        .replace(/T/, ' ')
-        .replace(/\..+/, '') + ' (CST)';
+    const beijingTime = new Date().toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false
+    }).replace(/\//g, '-') + ' (中国/上海)';
 
     const message = `🔔 **安全登录提示**\n\n` +
         `👤 **账号**: 管理员\n` +
