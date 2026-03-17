@@ -576,11 +576,9 @@ function App() {
         files,
         fileCount: realFiles.length,
         coverFile,
-        latestDate: realFiles.length > 0 
-          ? realFiles.reduce((latest, file) => {
-              return !latest || new Date(file.created_at) > new Date(latest) ? file.created_at : latest;
-            }, '')
-          : files[0].created_at // 如果全是占位文件，用占位文件的日期
+        latestDate: files.reduce((latest, file) => {
+          return !latest || new Date(file.created_at) > new Date(latest) ? file.created_at : latest;
+        }, '')
       });
     });
 
