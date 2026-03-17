@@ -565,17 +565,22 @@ function App() {
     // 生成 FolderData 数组
     const result: FolderData[] = [];
     folderMap.forEach((files, name) => {
+      // 排除占位文件进行统计和封面展示
+      const realFiles = files.filter(f => f.name !== '.folder');
+      
       // 找到第一个有缩略图的文件作为封面
-      const coverFile = files.find(f => f.thumbnailUrl || f.type === 'image' || f.type === 'video') || files[0];
+      const coverFile = realFiles.find(f => f.thumbnailUrl || f.type === 'image' || f.type === 'video') || realFiles[0];
 
       result.push({
         name,
         files,
-        fileCount: files.length,
+        fileCount: realFiles.length,
         coverFile,
-        latestDate: files.reduce((latest, file) => {
-          return !latest || new Date(file.created_at) > new Date(latest) ? file.created_at : latest;
-        }, '')
+        latestDate: realFiles.length > 0 
+          ? realFiles.reduce((latest, file) => {
+              return !latest || new Date(file.created_at) > new Date(latest) ? file.created_at : latest;
+            }, '')
+          : files[0].created_at // 如果全是占位文件，用占位文件的日期
       });
     });
 
