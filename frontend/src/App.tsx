@@ -528,6 +528,7 @@ function App() {
   const filteredFiles = useMemo(() => {
     return files.filter(file => {
       const matchesCategory =
+        file.name === '.folder' || // 占位文件始终允许通过，以便计算文件夹列表
         currentCategory === "favorites" ||
         currentCategory === "all" ||
         (currentCategory === "ytdlp" && file.folder === "ytdlp") ||
