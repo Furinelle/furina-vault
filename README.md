@@ -9,53 +9,80 @@
   <img src="https://img.shields.io/github/stars/hicocos/FlClouds?style=flat-square&color=gold" alt="Stars" />
   <img src="https://img.shields.io/github/forks/hicocos/FlClouds?style=flat-square&color=lightgrey" alt="Forks" />
   <img src="https://img.shields.io/github/issues/hicocos/FlClouds?style=flat-square&color=red" alt="Issues" />
-  <img src="https://img.shields.io/badge/Fork-FlClouds-purple?style=flat-square" alt="Fork" />
+  <img src="https://img.shields.io/badge/Docker-Compose-blue?style=flat-square" alt="Docker Compose" />
 </p>
 
 <p align="center">
-  <strong>FlClouds</strong> 是基于 FoomClous 魔改的个人私有云存储方案。它保留大文件切片上传、图片/视频预览、Web 管理与 Telegram Bot 集成，并强化了 Telegram 账号级下载、桥接群/频道转发、并发下载调参、任务停止和 Google Drive 授权刷新等自用部署体验。
+  <strong>FlClouds</strong> 是一款面向个人和小团队的私有云存储系统，支持大文件切片上传、图片/视频预览、Web 管理、Telegram Bot 操作、账号级 Telegram 下载、桥接群/频道转发、并发下载调参、任务停止和 Google Drive 授权刷新。
 </p>
-
-> [!NOTE]
-> 本仓库是 `hicocos/FlClouds` fork 版本，部署和镜像默认以本仓库源码自行构建为准；不要再使用原项目的旧多 Compose 部署说明或旧 Docker Hub 镜像说明。
 
 ---
 
 ## 🚀 快速部署 (Docker Compose)
 
-这是最简单、最推荐的方式。当前版本只保留一个 `docker-compose.yml`。
-
 ### 1. 克隆仓库
+
 ```bash
 git clone https://github.com/hicocos/FlClouds.git
 cd FlClouds
 ```
 
 ### 2. 配置环境变量
+
 ```bash
 cp .env.example .env
-vi .env  # 修改 DB_PASSWORD、VITE_API_URL、CORS_ORIGIN、DOMAIN 等
+vi .env
 ```
 
-### 3. 构建并启动
+至少建议先填写：
 
-由于 `VITE_API_URL` 是**前端构建时变量**，生产部署前请先确认 `.env` 中的 `VITE_API_URL` 已经是你的真实 API 地址。
+- `DB_PASSWORD`
+- `VITE_API_URL`
+- `CORS_ORIGIN`
+- `DOMAIN`
+- 如需 Telegram Bot，再填写 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_API_ID`、`TELEGRAM_API_HASH`
+- 如需账号级 Telegram 下载器，再填写 `TELEGRAM_USER_API_ID`、`TELEGRAM_USER_API_HASH`
+
+### 3. 构建前端
+
+`VITE_API_URL` 是前端构建时变量。请先在 `.env` 中设置好它，然后用变量传入构建命令：
 
 ```bash
-# 构建并启动所有服务
-docker compose up -d --build
+set -a
+source .env
+set +a
+
+docker build \
+  --build-arg VITE_API_URL="${VITE_API_URL}" \
+  -t foomclous-frontend:latest \
+  ./frontend
 ```
 
-如果你需要手动分步构建，也可以：
+### 4. 构建后端
 
 ```bash
-# 构建前端（将地址替换为你的真实 API 地址）
-docker build --build-arg VITE_API_URL=https://your-api.example.com -t foomclous-frontend ./frontend
+docker build -t foomclous-backend:latest ./backend
+```
 
-# 构建后端
-docker build -t foomclous-backend ./backend
+### 5. 生成用户账号 session（可选）
 
-# 启动服务
+如果你要启用账号级 Telegram 下载器，请在启动服务前生成 session。该命令会使用 `docker-compose.yml` 中的 `/data` 持久化卷，默认写入 `.env` 里的 `TELEGRAM_USER_SESSION_FILE` 路径。
+
+```bash
+docker compose run --rm --no-deps backend npm run login:telegram-user
+```
+
+按提示登录 Telegram 后，确认 `.env` 中包含：
+
+```env
+TELEGRAM_USER_SESSION_FILE=/data/telegram_user_session.txt
+```
+
+如果暂时不使用账号级下载器，可以跳过这一步。
+
+### 6. 启动服务
+
+```bash
 docker compose up -d
 ```
 
@@ -66,26 +93,24 @@ docker compose up -d
 
 ## 🛠️ 环境变量配置
 
-在启动前，请确保设置好以下核心变量（建议放入 `.env` 文件）：
-
-| 变量名 | 说明 | 示例 |
-| :--- | :--- | :--- |
-| `VITE_API_URL` | 前端访问后端的地址，必须包含协议 | `https://api.yourdomain.com` |
-| `DB_PASSWORD` | PostgreSQL 数据库密码 | `change_me_to_a_strong_password` |
-| `CORS_ORIGIN` | 允许跨域的前端来源 | `https://cloud.yourdomain.com` |
-| `DOMAIN` | 应用主域名，不带协议 | `cloud.yourdomain.com` |
-| `ACCESS_PASSWORD_HASH` | 可选，网页登录/接口访问密码的 SHA-256 Hash | `sha256_hash_here...` |
-| `TELEGRAM_BOT_TOKEN` | 可选，Telegram Bot Token | `123456:ABC-DEF...` |
-| `TELEGRAM_API_ID` | 可选，Telegram API ID | `123456` |
-| `TELEGRAM_API_HASH` | 可选，Telegram API Hash | `abcdef123456...` |
-| `TELEGRAM_USER_API_ID` | 可选，账号级下载器 API ID | `123456` |
-| `TELEGRAM_USER_API_HASH` | 可选，账号级下载器 API Hash | `abcdef123456...` |
-| `TELEGRAM_USER_SESSION_FILE` | 可选，用户账号 session 文件路径 | `/data/telegram_user_session.txt` |
-| `TELEGRAM_DOWNLOAD_BRIDGE_CHAT_ID` | 可选，桥接群/频道 ID；多人使用时推荐配置 | `-1001234567890` |
-| `TELEGRAM_DOWNLOAD_WORKERS` | 可选，Telegram 并发下载 worker 数，建议 4-8 | `4` |
-| `YTDLP_BIN` | 可选，yt-dlp 可执行文件路径 | `yt-dlp` |
-| `YTDLP_WORK_DIR` | 可选，yt-dlp 下载临时目录 | `./data/uploads/ytdlp` |
-| `YTDLP_MAX_CONCURRENT` | 可选，yt-dlp 并发任务数 | `1` |
+| 变量名 | 说明 | 示例 | 获取说明 |
+| :--- | :--- | :--- | :--- |
+| `VITE_API_URL` | 前端访问后端的地址，必须包含协议 | `https://api.yourdomain.com` | 你的后端反代公网地址，例如 Nginx/Caddy 指向宿主机 `51947` |
+| `DB_PASSWORD` | PostgreSQL 数据库密码 | `change_me_to_a_strong_password` | 自行生成强密码，首次部署前写入 `.env` |
+| `CORS_ORIGIN` | 允许跨域的前端来源 | `https://cloud.yourdomain.com` | 你的前端网页公网地址，例如 Nginx/Caddy 指向宿主机 `47832` |
+| `DOMAIN` | 应用主域名，不带协议 | `cloud.yourdomain.com` | 填前端主域名，用于生成链接和展示 |
+| `ACCESS_PASSWORD_HASH` | 可选，网页登录/接口访问密码的 SHA-256 Hash | `sha256_hash_here...` | 见“生成密码哈希”章节；不填则不启用访问密码 |
+| `TELEGRAM_BOT_TOKEN` | 可选，Telegram Bot Token | `123456:ABC-DEF...` | 找 [@BotFather](https://t.me/BotFather) 创建机器人后获取 |
+| `TELEGRAM_API_ID` | 可选，Telegram API ID | `123456` | 登录 [my.telegram.org](https://my.telegram.org) 创建应用后获取 |
+| `TELEGRAM_API_HASH` | 可选，Telegram API Hash | `abcdef123456...` | 与 `TELEGRAM_API_ID` 在同一页面获取 |
+| `TELEGRAM_USER_API_ID` | 可选，账号级下载器 API ID | `123456` | 通常可与 `TELEGRAM_API_ID` 相同；用于用户账号 MTProto session |
+| `TELEGRAM_USER_API_HASH` | 可选，账号级下载器 API Hash | `abcdef123456...` | 通常可与 `TELEGRAM_API_HASH` 相同；用于用户账号 MTProto session |
+| `TELEGRAM_USER_SESSION_FILE` | 可选，用户账号 session 文件路径 | `/data/telegram_user_session.txt` | 运行 `docker compose run --rm --no-deps backend npm run login:telegram-user` 生成 |
+| `TELEGRAM_DOWNLOAD_BRIDGE_CHAT_ID` | 可选，桥接群/频道 ID；多人使用时推荐配置 | `-1001234567890` | 把 bot 和用户账号加入同一群/频道后获取聊天 ID |
+| `TELEGRAM_DOWNLOAD_WORKERS` | 可选，Telegram 并发下载 worker 数，建议 4-8 | `4` | 自行按线路稳定性调整；也可通过 Bot 的 `/download_workers` 菜单调整 |
+| `YTDLP_BIN` | 可选，yt-dlp 可执行文件路径 | `yt-dlp` | 镜像内默认已安装；只有自定义环境找不到命令时才需要改 |
+| `YTDLP_WORK_DIR` | 可选，yt-dlp 下载临时目录 | `./data/uploads/ytdlp` | 默认即可；需要独立磁盘目录时再改 |
+| `YTDLP_MAX_CONCURRENT` | 可选，yt-dlp 并发任务数 | `1` | 按服务器 CPU、带宽和目标站点限速情况调整 |
 
 ---
 
@@ -94,38 +119,21 @@ docker compose up -d
 集成 Telegram Bot 后，你可以通过聊天窗口上传文件、查看任务、删除文件、查看存储统计，并调用 yt-dlp 下载视频链接。
 
 ### 1. 获取 Bot Token
+
 1. 在 Telegram 中搜索 [@BotFather](https://t.me/BotFather) 并开始对话。
 2. 发送 `/newbot`，按提示创建机器人。
 3. 复制 BotFather 返回的 `HTTP API TOKEN`。
 4. 写入 `.env` 的 `TELEGRAM_BOT_TOKEN`。
 
 ### 2. 获取 API ID 和 API Hash
+
 1. 访问 [my.telegram.org](https://my.telegram.org) 并登录 Telegram 账号。
 2. 进入 `API development tools`。
 3. 创建应用后复制 `api_id` 和 `api_hash`。
 4. 如果只用 bot 基础能力，写入 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`。
 5. 如果启用账号级下载器，同时写入 `TELEGRAM_USER_API_ID` / `TELEGRAM_USER_API_HASH`。
 
-### 3. 生成用户账号 session（可选）
-
-账号级下载器让 Telegram 文件下载由用户账号执行，而不是由 bot 账号执行。它适合大文件下载、私有媒体引用刷新和多人桥接场景。
-
-```bash
-# 首次构建后执行
-cd backend
-npm run build
-npm run login:telegram-user
-```
-
-按提示登录 Telegram 后，把生成的 session 文件路径配置到：
-
-```env
-TELEGRAM_USER_SESSION_FILE=/data/telegram_user_session.txt
-```
-
-启动后端后，在网页设置中开启“账号级下载器”。开启时会检查 session 是否就绪；如果 session 未准备好会拒绝开启，避免静默回退。
-
-### 4. 单人/多人使用建议
+### 3. 单人/多人使用建议
 
 | 场景 | 推荐配置 | 说明 |
 | :--- | :--- | :--- |
@@ -133,7 +141,7 @@ TELEGRAM_USER_SESSION_FILE=/data/telegram_user_session.txt
 | 多人使用 | 配置 `TELEGRAM_DOWNLOAD_BRIDGE_CHAT_ID` | bot 会把私聊收到的文件转发到桥接群/频道，用户账号再从桥接聊天下载 |
 | 频道桥接 | bot 通常需要管理员/发消息权限 | bot 和用户账号都必须能访问该频道 |
 
-### 5. Telegram 并发下载调参
+### 4. Telegram 并发下载调参
 
 `TELEGRAM_DOWNLOAD_WORKERS` 控制并发分片请求数，默认 `4`。
 
@@ -168,14 +176,6 @@ TELEGRAM_USER_SESSION_FILE=/data/telegram_user_session.txt
 ## 📥 yt-dlp 视频下载
 
 通过集成 [yt-dlp](https://github.com/yt-dlp/yt-dlp)，你可以直接在 Telegram Bot 中发送视频链接，让服务器解析并下载到当前存储源。
-
-**环境变量**：
-
-| 变量名 | 说明 | 默认值 |
-| :--- | :--- | :--- |
-| `YTDLP_BIN` | yt-dlp 可执行文件路径 | `yt-dlp` |
-| `YTDLP_WORK_DIR` | 下载临时目录 | `./data/uploads/ytdlp` |
-| `YTDLP_MAX_CONCURRENT` | 并发下载任务数 | `1` |
 
 **使用方法**：
 
@@ -234,19 +234,13 @@ FlClouds 内置支持 TOTP 双重验证（如 Google Authenticator）：
 
 ## 📦 Docker 镜像说明
 
-当前 fork 推荐**从源码本地构建镜像**：
-
-```bash
-docker compose up -d --build
-```
-
-`docker-compose.yml` 会构建并使用以下本地镜像 tag：
+默认从源码本地构建并使用以下镜像 tag：
 
 - `foomclous-frontend:latest`
 - `foomclous-backend:latest`
 - `postgres:16-alpine`
 
-暂不建议直接使用原项目旧 Docker Hub 镜像，因为它们不包含本 fork 的账号级 Telegram 下载器、桥接转发、并发下载调参和授权刷新改动。
+如果你修改了前端 API 地址或前端源码，请重新执行前端构建步骤。
 
 ---
 
@@ -257,7 +251,18 @@ cd /root/FlClouds
 
 git pull origin main
 
-docker compose up -d --build
+set -a
+source .env
+set +a
+
+docker build \
+  --build-arg VITE_API_URL="${VITE_API_URL}" \
+  -t foomclous-frontend:latest \
+  ./frontend
+
+docker build -t foomclous-backend:latest ./backend
+
+docker compose up -d
 ```
 
 清理无用 Docker 资源：
@@ -279,7 +284,7 @@ docker system prune -f
 - 📥 yt-dlp 视频链接下载到当前存储源
 - 🔐 Web / Bot 双重验证与访问密码保护
 - 🧩 Google Drive 等存储源配置与授权刷新
-- 🐳 单一 `docker-compose.yml` 容器化部署
+- 🐳 Docker Compose 容器化部署
 
 ---
 
