@@ -29,7 +29,7 @@ import {
     type ConsolidatedBatchEntry,
 } from '../utils/telegramMessages.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
-import { buildStorageFolderWithRules, getStoragePathRules, getTelegramChatName } from '../utils/storagePath.js';
+import { buildStorageFolderWithRules, getStoragePathRules, getTelegramBatchFolderName, getTelegramChatName, isOpaqueTelegramIdentifier } from '../utils/storagePath.js';
 import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
@@ -775,9 +775,30 @@ function getEstimatedFileSize(message: Api.Message): number {
 
 // 进度条函数已移至 telegramMessages.ts (generateProgressBar)
 
+function getDownloadableMedia(message: Api.Message): any | null {
+    if (!message.media) return null;
+    const media: any = message.media;
+    if (message.document || message.photo || message.video || message.audio || message.voice || message.sticker) {
+        return message.media;
+    }
+    if (media.document || media.photo) {
+        return media.document || media.photo;
+    }
+    if (media.webpage?.document || media.webpage?.photo) {
+        return media.webpage.document || media.webpage.photo;
+    }
+    return null;
+}
+
+function getDocumentFilename(document: any, fallback: string): string {
+    const fileNameAttr = document.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
+    return fileNameAttr?.fileName || fallback;
+}
+
 // 提取文件信息
 function extractFileInfo(message: Api.Message): { fileName: string; mimeType: string } | null {
-    if (!message.media) return null;
+    const downloadableMedia = getDownloadableMedia(message);
+    if (!downloadableMedia) return null;
 
     let fileName = 'unknown';
     let mimeType = 'application/octet-stream';
@@ -825,7 +846,19 @@ function extractFileInfo(message: Api.Message): { fileName: string; mimeType: st
                 fileName = fileNameAttr?.fileName || `file_${message.id}`;
                 mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
             } else {
-                return null;
+                const document = (downloadableMedia as any).document || (downloadableMedia as any);
+                const photo = (downloadableMedia as any).photo || (downloadableMedia as any);
+                if (document?.className === 'Document' || document?.attributes) {
+                    fileName = getDocumentFilename(document, `file_${message.id}`);
+                    mimeType = document.mimeType || getMimeTypeFromFilename(fileName);
+                } else if (photo?.className === 'Photo' || photo?.sizes) {
+                    const date = new Date((message.date || Math.floor(Date.now() / 1000)) * 1000);
+                    const timestamp = date.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+                    fileName = `Img_${timestamp}_${message.id}.jpg`;
+                    mimeType = 'image/jpeg';
+                } else {
+                    return null;
+                }
             }
         }
     } catch (e) {
@@ -867,6 +900,10 @@ async function downloadAndSaveFile(
     try {
         if (signal?.aborted) throw new Error('下载任务已停止');
         const configuredWorkers = await getTelegramDownloadWorkers();
+        const media = getDownloadableMedia(message);
+        if (!media) {
+            throw new Error('该图文消息未包含可下载媒体');
+        }
         const workers = totalSize > TELEGRAM_DOWNLOAD_PART_SIZE
             ? Math.min(configuredWorkers, Math.ceil(totalSize / TELEGRAM_DOWNLOAD_PART_SIZE))
             : 1;
@@ -880,7 +917,7 @@ async function downloadAndSaveFile(
                 await Promise.all(Array.from({ length: workers }, async (_, workerIndex) => {
                     let writeOffset = workerIndex * TELEGRAM_DOWNLOAD_PART_SIZE;
                     for await (const chunk of client.iterDownload({
-                        file: message.media!,
+                        file: media,
                         offset: bigInt(writeOffset),
                         stride: TELEGRAM_DOWNLOAD_PART_SIZE * workers,
                         chunkSize: TELEGRAM_DOWNLOAD_PART_SIZE,
@@ -907,7 +944,7 @@ async function downloadAndSaveFile(
             const writeStream = fs.createWriteStream(filePath);
 
             for await (const chunk of client.iterDownload({
-                file: message.media!,
+                file: media,
                 requestSize: TELEGRAM_DOWNLOAD_PART_SIZE,
             })) {
                 if (signal?.aborted) throw new Error('下载任务已停止');
@@ -1076,20 +1113,6 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
         } else if (!firstAttemptSuccess) {
             file.status = 'failed';
         }
-
-        // 静默模式：批量任务的每个文件完成后计数，并在全部完成时更新最终静默提示
-        if (queue?.chatId) {
-            const chatId = queue.chatId;
-            const chatIdStr = chatId.toString();
-            if (silentSessionMap.has(chatIdStr)) {
-                const sess = getSilentSession(chatIdStr);
-                sess.completed += 1;
-                if (file.status === 'failed') {
-                    sess.failed += 1;
-                }
-                await finalizeSilentSessionIfDone(client, chatId);
-            }
-        }
     };
 
     const taskDisplayName = queue?.folderName ? `${queue.folderName}/${file.fileName}` : file.fileName;
@@ -1118,8 +1141,8 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
     const chatId = queue.chatId!;
     const batchId = mediaGroupId;
 
-    if (!folderName) {
-        folderName = mediaGroupId;
+    if (!folderName || isOpaqueTelegramIdentifier(folderName)) {
+        folderName = await getTelegramBatchFolderName(firstMessage, mediaGroupId);
     }
 
     // 新会话重置检查
@@ -1182,6 +1205,18 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
         }
     };
 
+    const refreshBatchProgressAndFinalizeSilent = async () => {
+        await onBatchProgress();
+        const chatIdStr = chatId.toString();
+        if (silentSessionMap.has(chatIdStr)) {
+            const sess = getSilentSession(chatIdStr);
+            const failedFiles = getConsolidatedFiles(chatIdStr).filter(f => f.phase === 'failed').length;
+            const failedBatches = getConsolidatedBatches(chatIdStr).reduce((sum, b) => sum + (b.failed || 0), 0);
+            sess.failed = Math.max(sess.failed, failedFiles + failedBatches);
+            await finalizeSilentSessionIfDone(client, chatId);
+        }
+    };
+
     // 定时更新状态（作为补充，防止回调太频繁或丢失）
     let lastTime = 0;
     const statusUpdater = setInterval(async () => {
@@ -1211,7 +1246,7 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
                 file.fileName = `${baseName}_${index + 1}${ext}`;
             }
 
-            return processFileUpload(client, file, queue);
+            return processFileUpload(client, file, queue).finally(refreshBatchProgressAndFinalizeSilent);
         }));
 
         // 最后一次更新状态

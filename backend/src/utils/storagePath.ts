@@ -120,6 +120,12 @@ export function getForwardedSourceName(fwdFrom: any): string | null {
     return fwdFrom?.postAuthor || fwdFrom?.fromName || fwdFrom?.savedFromName || null;
 }
 
+export function isOpaqueTelegramIdentifier(value: string | null | undefined): boolean {
+    if (!value) return false;
+    const trimmed = value.trim();
+    return /^\d{8,}$/.test(trimmed) || /^\d{8,}[-_]\d{8,}$/.test(trimmed);
+}
+
 export function buildStorageFolder(options: StoragePathOptions): string | null {
     return buildStorageFolderWithRules(options, {
         bySource: true,
@@ -178,4 +184,23 @@ export async function getTelegramChatName(message: Api.Message): Promise<string>
     const title = getEntityDisplayName(chat);
     const chatId = message.chatId?.toString();
     return normalizeSegment(title || chatId || 'telegram', 'telegram');
+}
+
+export async function getTelegramBatchFolderName(message: Api.Message, fallback: string): Promise<string> {
+    const fwdFrom = (message as any).fwdFrom;
+    const forwardedPeer = fwdFrom?.savedFromPeer || fwdFrom?.fromId;
+    if (forwardedPeer) {
+        const sourceEntity: any = await (message.client as any)?.getEntity?.(forwardedPeer).catch(() => null);
+        const sourceName = getEntityDisplayName(sourceEntity) || getForwardedSourceName(fwdFrom);
+        if (sourceName) return normalizeSegment(sourceName, 'telegram');
+    }
+
+    const forwardedName = getForwardedSourceName(fwdFrom);
+    if (forwardedName) return normalizeSegment(forwardedName, 'telegram');
+
+    const chat: any = await message.getChat().catch(() => null);
+    const title = getEntityDisplayName(chat);
+    if (title) return normalizeSegment(title, 'telegram');
+
+    return normalizeSegment(fallback, 'telegram-batch');
 }

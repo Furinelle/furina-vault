@@ -2466,6 +2466,11 @@ function getEntityDisplayName(entity) {
 function getForwardedSourceName(fwdFrom) {
   return fwdFrom?.postAuthor || fwdFrom?.fromName || fwdFrom?.savedFromName || null;
 }
+function isOpaqueTelegramIdentifier(value) {
+  if (!value) return false;
+  const trimmed = value.trim();
+  return /^\d{8,}$/.test(trimmed) || /^\d{8,}[-_]\d{8,}$/.test(trimmed);
+}
 function buildStorageFolderWithRules(options, rules) {
   if (!shouldClassifyStoragePath()) {
     return options.folder ? normalizeSegment(options.folder, "folder") : null;
@@ -2503,6 +2508,21 @@ async function getTelegramChatName(message) {
   const title = getEntityDisplayName(chat);
   const chatId = message.chatId?.toString();
   return normalizeSegment(title || chatId || "telegram", "telegram");
+}
+async function getTelegramBatchFolderName(message, fallback) {
+  const fwdFrom = message.fwdFrom;
+  const forwardedPeer = fwdFrom?.savedFromPeer || fwdFrom?.fromId;
+  if (forwardedPeer) {
+    const sourceEntity = await message.client?.getEntity?.(forwardedPeer).catch(() => null);
+    const sourceName = getEntityDisplayName(sourceEntity) || getForwardedSourceName(fwdFrom);
+    if (sourceName) return normalizeSegment(sourceName, "telegram");
+  }
+  const forwardedName = getForwardedSourceName(fwdFrom);
+  if (forwardedName) return normalizeSegment(forwardedName, "telegram");
+  const chat = await message.getChat().catch(() => null);
+  const title = getEntityDisplayName(chat);
+  if (title) return normalizeSegment(title, "telegram");
+  return normalizeSegment(fallback, "telegram-batch");
 }
 
 // src/utils/duplicatePolicy.ts
@@ -3062,8 +3082,27 @@ function getEstimatedFileSize(message) {
   }
   return 0;
 }
-function extractFileInfo(message) {
+function getDownloadableMedia(message) {
   if (!message.media) return null;
+  const media = message.media;
+  if (message.document || message.photo || message.video || message.audio || message.voice || message.sticker) {
+    return message.media;
+  }
+  if (media.document || media.photo) {
+    return media.document || media.photo;
+  }
+  if (media.webpage?.document || media.webpage?.photo) {
+    return media.webpage.document || media.webpage.photo;
+  }
+  return null;
+}
+function getDocumentFilename(document, fallback) {
+  const fileNameAttr = document.attributes?.find((a) => a.className === "DocumentAttributeFilename");
+  return fileNameAttr?.fileName || fallback;
+}
+function extractFileInfo(message) {
+  const downloadableMedia = getDownloadableMedia(message);
+  if (!downloadableMedia) return null;
   let fileName = "unknown";
   let mimeType = "application/octet-stream";
   try {
@@ -3107,7 +3146,19 @@ function extractFileInfo(message) {
         fileName = fileNameAttr?.fileName || `file_${message.id}`;
         mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
       } else {
-        return null;
+        const document = downloadableMedia.document || downloadableMedia;
+        const photo = downloadableMedia.photo || downloadableMedia;
+        if (document?.className === "Document" || document?.attributes) {
+          fileName = getDocumentFilename(document, `file_${message.id}`);
+          mimeType = document.mimeType || getMimeTypeFromFilename(fileName);
+        } else if (photo?.className === "Photo" || photo?.sizes) {
+          const date = new Date((message.date || Math.floor(Date.now() / 1e3)) * 1e3);
+          const timestamp = date.toISOString().replace(/[-:T]/g, "").slice(0, 14);
+          fileName = `Img_${timestamp}_${message.id}.jpg`;
+          mimeType = "image/jpeg";
+        } else {
+          return null;
+        }
       }
     }
   } catch (e) {
@@ -3135,6 +3186,10 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
   try {
     if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
     const configuredWorkers = await getTelegramDownloadWorkers();
+    const media = getDownloadableMedia(message);
+    if (!media) {
+      throw new Error("\u8BE5\u56FE\u6587\u6D88\u606F\u672A\u5305\u542B\u53EF\u4E0B\u8F7D\u5A92\u4F53");
+    }
     const workers = totalSize > TELEGRAM_DOWNLOAD_PART_SIZE ? Math.min(configuredWorkers, Math.ceil(totalSize / TELEGRAM_DOWNLOAD_PART_SIZE)) : 1;
     console.log(`\u{1F916} Telegram \u4E0B\u8F7D\u53C2\u6570: workers=${workers}, part=${TELEGRAM_DOWNLOAD_PART_SIZE} bytes, size=${totalSize || "unknown"}`);
     if (workers > 1 && totalSize > 0) {
@@ -3144,7 +3199,7 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
         await Promise.all(Array.from({ length: workers }, async (_, workerIndex) => {
           let writeOffset = workerIndex * TELEGRAM_DOWNLOAD_PART_SIZE;
           for await (const chunk of client2.iterDownload({
-            file: message.media,
+            file: media,
             offset: bigInt(writeOffset),
             stride: TELEGRAM_DOWNLOAD_PART_SIZE * workers,
             chunkSize: TELEGRAM_DOWNLOAD_PART_SIZE,
@@ -3170,7 +3225,7 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
     } else {
       const writeStream = fs6.createWriteStream(filePath);
       for await (const chunk of client2.iterDownload({
-        file: message.media,
+        file: media,
         requestSize: TELEGRAM_DOWNLOAD_PART_SIZE
       })) {
         if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
@@ -3293,18 +3348,6 @@ async function processFileUpload(client2, file, queue) {
     } else if (!firstAttemptSuccess) {
       file.status = "failed";
     }
-    if (queue?.chatId) {
-      const chatId = queue.chatId;
-      const chatIdStr = chatId.toString();
-      if (silentSessionMap.has(chatIdStr)) {
-        const sess = getSilentSession(chatIdStr);
-        sess.completed += 1;
-        if (file.status === "failed") {
-          sess.failed += 1;
-        }
-        await finalizeSilentSessionIfDone(client2, chatId);
-      }
-    }
   };
   const taskDisplayName = queue?.folderName ? `${queue.folderName}/${file.fileName}` : file.fileName;
   return downloadQueue.add(taskDisplayName, queueTask);
@@ -3325,8 +3368,8 @@ async function processBatchUpload(client2, mediaGroupId) {
   }
   const chatId = queue.chatId;
   const batchId = mediaGroupId;
-  if (!folderName) {
-    folderName = mediaGroupId;
+  if (!folderName || isOpaqueTelegramIdentifier(folderName)) {
+    folderName = await getTelegramBatchFolderName(firstMessage, mediaGroupId);
   }
   await checkAndResetSession(client2, chatId);
   registerBatch(chatId.toString(), batchId, {
@@ -3371,6 +3414,17 @@ async function processBatchUpload(client2, mediaGroupId) {
       });
     }
   };
+  const refreshBatchProgressAndFinalizeSilent = async () => {
+    await onBatchProgress();
+    const chatIdStr = chatId.toString();
+    if (silentSessionMap.has(chatIdStr)) {
+      const sess = getSilentSession(chatIdStr);
+      const failedFiles = getConsolidatedFiles(chatIdStr).filter((f) => f.phase === "failed").length;
+      const failedBatches = getConsolidatedBatches(chatIdStr).reduce((sum, b) => sum + (b.failed || 0), 0);
+      sess.failed = Math.max(sess.failed, failedFiles + failedBatches);
+      await finalizeSilentSessionIfDone(client2, chatId);
+    }
+  };
   let lastTime = 0;
   const statusUpdater = setInterval(async () => {
     const now = Date.now();
@@ -3386,7 +3440,7 @@ async function processBatchUpload(client2, mediaGroupId) {
       if (!isDefaultFolder) {
         file.fileName = `${baseName}_${index + 1}${ext}`;
       }
-      return processFileUpload(client2, file, queue);
+      return processFileUpload(client2, file, queue).finally(refreshBatchProgressAndFinalizeSilent);
     }));
     await onBatchProgress();
   } finally {
