@@ -7,10 +7,10 @@ import path from 'path';
 import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticated, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleStorage, handleList, handleDelete, handleTasks, handleStopTasks, handleDownloadWorkers, handleDownloadWorkersCallback } from './telegramCommands.js';
+import { handleStart, handleHelp, handleStorage, handleList, handleDelete, handleTasks, handleStopTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handlePathRules, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
 import { handleFileUpload, handleCleanupCallback } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
-import { cleanupOrphanFiles, startPeriodicCleanup } from './orphanCleanup.js';
+import { cleanupOrphanFiles, isAutoCleanupEnabled, startPeriodicCleanup } from './orphanCleanup.js';
 import { verifyPassword } from '../utils/telegramUtils.js';
 import { MSG, buildStartPrompt, buildAuthSuccess, build2FASetupCaption, buildCleanupNotice } from '../utils/telegramMessages.js';
 import { query } from '../db/index.js';
@@ -297,6 +297,9 @@ export async function initTelegramBot(): Promise<void> {
                     new Api.BotCommand({ command: 'tasks', description: '查看任务状态' }),
                     new Api.BotCommand({ command: 'stop_tasks', description: '强制停止下载任务' }),
                     new Api.BotCommand({ command: 'download_workers', description: '设置 Telegram 并发下载' }),
+                    new Api.BotCommand({ command: 'path_rules', description: '设置保存路径规则' }),
+                    new Api.BotCommand({ command: 'duplicate_mode', description: '设置重复文件处理' }),
+                    new Api.BotCommand({ command: 'cleanup_settings', description: '设置自动清理开关' }),
                     new Api.BotCommand({ command: 'help', description: '显示预览帮助' }),
                 ]
             }));
@@ -305,25 +308,38 @@ export async function initTelegramBot(): Promise<void> {
             console.error('🤖 更新 Bot 命令菜单失败:', e);
         }
 
-        // 启动时清理孤儿文件
         try {
-            const stats = await cleanupOrphanFiles();
-            if (stats.deletedCount > 0) {
-                console.log(`🧹 启动清理: 删除了 ${stats.deletedCount} 个孤儿文件，释放 ${stats.freedSpace}`);
-
-                // 向所有已认证用户发送清理通知
-                for (const userId of authenticatedUsers.keys()) {
-                    try {
-                        await client.sendMessage(userId, {
-                            message: buildCleanupNotice(stats.deletedCount, stats.freedSpace)
-                        });
-                    } catch (e) {
-                        // 用户可能已删除对话或阻止了 Bot
-                    }
-                }
+            const cleanupSetting = await query('SELECT value FROM system_settings WHERE key = $1', ['auto_cleanup_orphans']);
+            if (cleanupSetting.rows[0]?.value !== undefined) {
+                process.env.AUTO_CLEANUP_ORPHANS = String(cleanupSetting.rows[0].value);
             }
         } catch (e) {
-            console.error('🧹 启动清理失败:', e);
+            console.warn('🧹 读取自动清理设置失败，使用环境变量默认值:', e);
+        }
+
+        // 启动时清理孤儿文件（默认开启，可通过 /cleanup_settings 关闭）
+        if (isAutoCleanupEnabled()) {
+            try {
+                const stats = await cleanupOrphanFiles();
+                if (stats.deletedCount > 0) {
+                    console.log(`🧹 启动清理: 删除了 ${stats.deletedCount} 个孤儿文件，释放 ${stats.freedSpace}`);
+
+                    // 向所有已认证用户发送清理通知
+                    for (const userId of authenticatedUsers.keys()) {
+                        try {
+                            await client.sendMessage(userId, {
+                                message: buildCleanupNotice(stats.deletedCount, stats.freedSpace)
+                            });
+                        } catch (e) {
+                            // 用户可能已删除对话或阻止了 Bot
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('🧹 启动清理失败:', e);
+            }
+        } else {
+            console.log('🧹 启动孤儿清理已跳过：AUTO_CLEANUP_ORPHANS=false');
         }
 
         // 启动定期清理（每小时）
@@ -489,6 +505,33 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
+                if (text === '/path_rules' || text === '/path' || text === '/save_rules') {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handlePathRules(message);
+                    return;
+                }
+
+                if (text === '/duplicate_mode' || text === '/duplicate' || text === '/dup') {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleDuplicateMode(message);
+                    return;
+                }
+
+                if (text === '/cleanup_settings' || text === '/cleanup') {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleCleanupSettings(message);
+                    return;
+                }
+
                 // Handle 2FA Verification (Setup or Login)
                 const userState = userStates.get(senderId);
                 if (userState && (userState.state === TelegramUserState.WAITING_2FA_SETUP || userState.state === TelegramUserState.WAITING_2FA_LOGIN)) {
@@ -549,6 +592,8 @@ export async function initTelegramBot(): Promise<void> {
         // Handle Callbacks
         client.addEventHandler(async (update: Api.TypeUpdate) => {
             if (update.className === 'UpdateBotCallbackQuery') {
+                if (!client) return;
+                const activeClient = client;
                 const callbackUpdate = update as Api.UpdateBotCallbackQuery;
                 const data = Buffer.from(callbackUpdate.data || []).toString('utf-8');
 
@@ -566,7 +611,25 @@ export async function initTelegramBot(): Promise<void> {
 
                 // 处理并发下载 worker 设置回调
                 if (data.startsWith('dw_')) {
-                    await handleDownloadWorkersCallback(client, callbackUpdate, data);
+                    await handleDownloadWorkersCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
+                // 处理保存路径规则回调
+                if (data.startsWith('pr_')) {
+                    await handlePathRulesCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
+                // 处理重复文件策略回调
+                if (data.startsWith('dm_')) {
+                    await handleDuplicateModeCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
+                // 处理自动清理设置回调
+                if (data.startsWith('cs_')) {
+                    await handleCleanupSettingsCallback(activeClient, callbackUpdate, data);
                     return;
                 }
             }

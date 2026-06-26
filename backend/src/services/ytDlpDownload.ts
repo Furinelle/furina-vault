@@ -8,6 +8,8 @@ import { storageManager } from './storage.js';
 import { formatBytes, getFileType, getMimeTypeFromFilename, sanitizeFilename } from '../utils/telegramUtils.js';
 import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
+import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/storagePath.js';
+import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 
 type YtDlpTaskStatus = 'pending' | 'active' | 'success' | 'failed';
 
@@ -138,14 +140,23 @@ async function uploadDownloadedFile(localFilePath: string, originalFileName: str
     const safeName = sanitizeFilename(originalFileName);
     const ext = path.extname(safeName) || path.extname(localFilePath) || '';
 
-    // 获取唯一的存储文件名
-    const storedName = await getUniqueStoredName(safeName, 'ytdlp', activeAccountId);
-
     const mimeType = getMimeTypeFromFilename(safeName);
     const fileType = getFileType(mimeType);
+    const storageRules = await getStoragePathRules();
+    const folder = buildStorageFolderWithRules({ source: 'ytdlp', mimeType, fileName: safeName }, storageRules) || 'ytdlp';
+
+    // 获取唯一的存储文件名
+    const storedName = await getUniqueStoredName(safeName, folder, activeAccountId);
 
     const stats = await fs.promises.stat(localFilePath);
     const size = stats.size;
+    const duplicateMode = await getDuplicateMode();
+    if (duplicateMode === 'skip') {
+        const duplicate = await findDuplicateFile(safeName, folder, size, activeAccountId);
+        if (duplicate) {
+            return { finalPath: duplicate.path || '', providerName: provider.name, size, storedName: duplicate.name, folder };
+        }
+    }
 
     let thumbnailPath: string | null = null;
     let dimensions: { width?: number; height?: number } = {};
@@ -155,16 +166,11 @@ async function uploadDownloadedFile(localFilePath: string, originalFileName: str
     } catch {
     }
 
-    let finalPath = localFilePath;
-    if (provider.name !== 'local') {
-        finalPath = await provider.saveFile(localFilePath, storedName, mimeType);
-        try {
-            if (fs.existsSync(localFilePath)) await fs.promises.unlink(localFilePath);
-        } catch {
-        }
+    let finalPath = await provider.saveFile(localFilePath, storedName, mimeType, folder);
+    try {
+        if (fs.existsSync(localFilePath)) await fs.promises.unlink(localFilePath);
+    } catch {
     }
-
-    const folder = 'ytdlp';
 
     await query(`
         INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)

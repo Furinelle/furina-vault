@@ -141,8 +141,12 @@ var init_storage = __esm({
           fs2.mkdirSync(this.uploadDir, { recursive: true });
         }
       }
-      async saveFile(tempPath, fileName) {
-        const destPath = path2.join(this.uploadDir, fileName);
+      async saveFile(tempPath, fileName, _mimeType, folder) {
+        const destDir = folder ? path2.join(this.uploadDir, folder) : this.uploadDir;
+        if (!fs2.existsSync(destDir)) {
+          fs2.mkdirSync(destDir, { recursive: true });
+        }
+        const destPath = path2.join(destDir, fileName);
         try {
           await fs2.promises.rename(tempPath, destPath);
         } catch (error) {
@@ -195,9 +199,10 @@ var init_storage = __esm({
         }
         return r;
       }
-      async saveFile(tempPath, fileName) {
+      async saveFile(tempPath, fileName, _mimeType, folder) {
         try {
-          const result = await this.client.put(fileName, tempPath);
+          const objectKey = folder ? `${folder}/${fileName}` : fileName;
+          const result = await this.client.put(objectKey, tempPath);
           console.log("[AliyunOSS] Upload successful:", result.name);
           return result.name;
         } catch (error) {
@@ -263,17 +268,18 @@ var init_storage = __esm({
       }
       name = "s3";
       client;
-      async saveFile(tempPath, fileName, mimeType) {
+      async saveFile(tempPath, fileName, mimeType, folder) {
         try {
           const fileBuffer = fs2.readFileSync(tempPath);
+          const objectKey = folder ? `${folder}/${fileName}` : fileName;
           const command = new PutObjectCommand({
             Bucket: this.bucket,
-            Key: fileName,
+            Key: objectKey,
             Body: fileBuffer,
             ContentType: mimeType
           });
           await this.client.send(command);
-          return fileName;
+          return objectKey;
         } catch (error) {
           console.error("[S3] Upload failed:", error.message);
           throw new Error(`S3 upload failed: ${error.message}`);
@@ -343,12 +349,16 @@ var init_storage = __esm({
       }
       name = "webdav";
       client;
-      async saveFile(tempPath, fileName) {
+      async saveFile(tempPath, fileName, _mimeType, folder) {
         try {
           const fileBuffer = fs2.readFileSync(tempPath);
-          await this.client.putFileContents(`/${fileName}`, fileBuffer);
-          console.log("[WebDAV] Upload successful:", fileName);
-          return fileName;
+          const remotePath = folder ? `${folder}/${fileName}` : fileName;
+          if (folder) {
+            await this.client.createDirectory(`/${folder}`, { recursive: true });
+          }
+          await this.client.putFileContents(`/${remotePath}`, fileBuffer);
+          console.log("[WebDAV] Upload successful:", remotePath);
+          return remotePath;
         } catch (error) {
           console.error("[WebDAV] Upload failed:", error.message);
           throw new Error(`WebDAV upload failed: ${error.message}`);
@@ -475,41 +485,51 @@ var init_storage = __esm({
         }
         throw new Error(`Failed to refresh OneDrive token after 3 attempts: ${lastError?.response?.data?.error_description || lastError?.message}`);
       }
+      encodeOneDrivePath(rawPath) {
+        return rawPath.split("/").filter(Boolean).map((part) => encodeURIComponent(part)).join("/");
+      }
       /**
        * 确保存储文件夹存在
        */
-      async ensureFolderExists(token) {
+      async ensureFolderExists(token, folder) {
+        const fullFolderPath = [this.ONEDRIVE_FOLDER, folder].filter(Boolean).join("/");
         try {
-          const endpoint = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(this.ONEDRIVE_FOLDER)}:`;
+          const endpoint = `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(fullFolderPath)}:`;
           await axios.get(endpoint, {
             headers: { "Authorization": `Bearer ${token}` },
             timeout: 3e4
           });
+          return fullFolderPath;
         } catch (error) {
           if (error.response?.status === 404) {
-            console.log("[OneDrive] Creating storage folder:", this.ONEDRIVE_FOLDER);
-            try {
-              await axios.post(
-                `https://graph.microsoft.com/v1.0/me/drive/root/children`,
-                {
-                  name: this.ONEDRIVE_FOLDER,
-                  folder: {},
-                  "@microsoft.graph.conflictBehavior": "fail"
-                },
-                {
-                  headers: {
-                    "Authorization": `Bearer ${token}`,
-                    "Content-Type": "application/json"
-                  },
+            const segments = fullFolderPath.split("/").filter(Boolean);
+            let currentPath = "";
+            for (const segment of segments) {
+              const parentPath = currentPath;
+              currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+              try {
+                await axios.get(`https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(currentPath)}:`, {
+                  headers: { "Authorization": `Bearer ${token}` },
                   timeout: 3e4
-                }
-              );
-              console.log("[OneDrive] Storage folder created successfully");
-            } catch (postError) {
-              const errorDetails = postError.response?.data?.error || postError.message;
-              console.error("[OneDrive] Create folder failed:", errorDetails);
-              throw new Error(`OneDrive failed to create folder: ${JSON.stringify(errorDetails)}`);
+                });
+              } catch (getError) {
+                if (getError.response?.status !== 404) throw getError;
+                const parentEndpoint = parentPath ? `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(parentPath)}:/children` : "https://graph.microsoft.com/v1.0/me/drive/root/children";
+                await axios.post(
+                  parentEndpoint,
+                  { name: segment, folder: {}, "@microsoft.graph.conflictBehavior": "fail" },
+                  {
+                    headers: {
+                      "Authorization": `Bearer ${token}`,
+                      "Content-Type": "application/json"
+                    },
+                    timeout: 3e4
+                  }
+                );
+              }
             }
+            console.log("[OneDrive] Storage folder created successfully:", fullFolderPath);
+            return fullFolderPath;
           } else {
             const errorDetails = error.response?.data?.error || error.message;
             console.error("[OneDrive] Check folder failed:", errorDetails);
@@ -520,19 +540,19 @@ var init_storage = __esm({
       /**
        * 保存文件到 OneDrive
        */
-      async saveFile(tempPath, fileName, mimeType) {
+      async saveFile(tempPath, fileName, mimeType, folder) {
         const token = await this.getAccessToken();
         const stats = await fs2.promises.stat(tempPath);
         const fileSize = stats.size;
         console.log(`[OneDrive] Uploading file: ${fileName}, size: ${fileSize} bytes, type: ${mimeType}`);
-        await this.ensureFolderExists(token);
+        const uploadFolder = await this.ensureFolderExists(token, folder);
         const encodedFileName = encodeURIComponent(fileName);
         try {
           if (fileSize < 4 * 1024 * 1024) {
             console.log("[OneDrive] Using simple upload for small file");
             const fileBuffer = await fs2.promises.readFile(tempPath);
             const response = await axios.put(
-              `https://graph.microsoft.com/v1.0/me/drive/root:/${this.ONEDRIVE_FOLDER}/${encodedFileName}:/content`,
+              `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}:/content`,
               fileBuffer,
               {
                 headers: {
@@ -550,7 +570,7 @@ var init_storage = __esm({
           } else {
             console.log("[OneDrive] Using chunked upload session for large file");
             const sessionRes = await axios.post(
-              `https://graph.microsoft.com/v1.0/me/drive/root:/${this.ONEDRIVE_FOLDER}/${encodedFileName}:/createUploadSession`,
+              `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}:/createUploadSession`,
               {
                 item: {
                   "@microsoft.graph.conflictBehavior": "rename",
@@ -608,7 +628,7 @@ var init_storage = __esm({
               return lastResponse.data.id;
             }
             const itemRes = await axios.get(
-              `https://graph.microsoft.com/v1.0/me/drive/root:/${this.ONEDRIVE_FOLDER}/${encodedFileName}`,
+              `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}`,
               {
                 headers: { "Authorization": `Bearer ${token}` },
                 timeout: 3e4
@@ -829,29 +849,41 @@ var init_storage = __esm({
           this.tokenExpiresAt = credentials.res?.data?.expiry_date || 0;
         }
       }
-      async ensureFolderExists() {
-        await this.ensureAuthenticated();
-        const response = await this.drive.files.list({
-          q: `name = '${this.GOOGLE_DRIVE_FOLDER}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-          fields: "files(id)",
-          spaces: "drive"
-        });
-        if (response.data.files && response.data.files.length > 0) {
-          return response.data.files[0].id;
-        }
-        const folderMetadata = {
-          name: this.GOOGLE_DRIVE_FOLDER,
-          mimeType: "application/vnd.google-apps.folder"
-        };
-        const folder = await this.drive.files.create({
-          resource: folderMetadata,
-          fields: "id"
-        });
-        return folder.data.id;
+      escapeDriveQuery(value) {
+        return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       }
-      async saveFile(tempPath, fileName, mimeType) {
+      async ensureFolderExists(folder) {
         await this.ensureAuthenticated();
-        const folderId = await this.ensureFolderExists();
+        const segments = [this.GOOGLE_DRIVE_FOLDER, ...folder ? folder.split("/").filter(Boolean) : []];
+        let parentId = null;
+        for (const segment of segments) {
+          const parentClause = parentId ? `'${parentId}' in parents` : `'root' in parents`;
+          const response = await this.drive.files.list({
+            q: `name = '${this.escapeDriveQuery(segment)}' and mimeType = 'application/vnd.google-apps.folder' and ${parentClause} and trashed = false`,
+            fields: "files(id)",
+            spaces: "drive"
+          });
+          const existingFolderId = response.data.files?.[0]?.id;
+          if (existingFolderId) {
+            parentId = existingFolderId;
+            continue;
+          }
+          const folderMetadata = {
+            name: segment,
+            mimeType: "application/vnd.google-apps.folder"
+          };
+          if (parentId) folderMetadata.parents = [parentId];
+          const createdFolder = await this.drive.files.create({
+            resource: folderMetadata,
+            fields: "id"
+          });
+          parentId = createdFolder.data.id;
+        }
+        return parentId;
+      }
+      async saveFile(tempPath, fileName, mimeType, folder) {
+        await this.ensureAuthenticated();
+        const folderId = await this.ensureFolderExists(folder);
         const fileMetadata = {
           name: fileName,
           parents: [folderId]
@@ -1268,14 +1300,14 @@ var init_storage = __esm({
 import express from "express";
 import cors from "cors";
 import dotenv3 from "dotenv";
-import path15 from "path";
+import path16 from "path";
 import fs14 from "fs";
 
 // src/routes/files.ts
 init_db();
 import { Router as Router2 } from "express";
 import fs10 from "fs";
-import path11 from "path";
+import path12 from "path";
 
 // src/middleware/signedUrl.ts
 import crypto6 from "crypto";
@@ -1403,7 +1435,7 @@ import { StringSession as StringSession2 } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { Raw } from "telegram/events/index.js";
 import fs9 from "fs";
-import path10 from "path";
+import path11 from "path";
 
 // src/services/telegramState.ts
 init_db();
@@ -1572,128 +1604,6 @@ function sanitizeFilename(name) {
   return result || "unknown";
 }
 
-// src/services/orphanCleanup.ts
-init_db();
-import fs3 from "fs";
-import path4 from "path";
-var UPLOAD_DIR = process.env.UPLOAD_DIR || "./data/uploads";
-var THUMBNAIL_DIR = process.env.THUMBNAIL_DIR || "./data/thumbnails";
-function formatBytes2(bytes) {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-}
-function getAllFiles(dirPath, arrayOfFiles = []) {
-  if (!fs3.existsSync(dirPath)) {
-    return arrayOfFiles;
-  }
-  try {
-    const files = fs3.readdirSync(dirPath);
-    for (const file of files) {
-      const fullPath = path4.join(dirPath, file);
-      try {
-        const stat = fs3.statSync(fullPath);
-        if (stat.isDirectory()) {
-          getAllFiles(fullPath, arrayOfFiles);
-        } else {
-          arrayOfFiles.push({
-            name: file,
-            path: fullPath,
-            size: stat.size
-          });
-        }
-      } catch (e) {
-        console.warn(`\u{1F9F9} \u65E0\u6CD5\u8BFB\u53D6\u6587\u4EF6\u72B6\u6001: ${fullPath}`, e);
-      }
-    }
-  } catch (e) {
-    console.error(`\u{1F9F9} \u65E0\u6CD5\u8BFB\u53D6\u76EE\u5F55: ${dirPath}`, e);
-  }
-  return arrayOfFiles;
-}
-function removeEmptyDirectories(dirPath) {
-  if (!fs3.existsSync(dirPath)) return;
-  try {
-    const files = fs3.readdirSync(dirPath);
-    for (const file of files) {
-      const fullPath = path4.join(dirPath, file);
-      try {
-        if (fs3.statSync(fullPath).isDirectory()) {
-          removeEmptyDirectories(fullPath);
-        }
-      } catch (e) {
-      }
-    }
-    const remainingFiles = fs3.readdirSync(dirPath);
-    if (remainingFiles.length === 0 && dirPath !== UPLOAD_DIR) {
-      fs3.rmdirSync(dirPath);
-      console.log(`\u{1F9F9} \u5220\u9664\u7A7A\u6587\u4EF6\u5939: ${dirPath}`);
-    }
-  } catch (e) {
-    console.warn(`\u{1F9F9} \u5220\u9664\u7A7A\u6587\u4EF6\u5939\u5931\u8D25: ${dirPath}`, e);
-  }
-}
-async function cleanupOrphanFiles() {
-  const stats = {
-    deletedCount: 0,
-    freedBytes: 0,
-    freedSpace: "0 B",
-    deletedFiles: []
-  };
-  console.log("\u{1F9F9} \u5F00\u59CB\u626B\u63CF\u5B64\u513F\u6587\u4EF6...");
-  try {
-    const dbResult = await query("SELECT stored_name FROM files");
-    const dbFileSet = new Set(dbResult.rows.map((row) => row.stored_name));
-    console.log(`\u{1F9F9} \u6570\u636E\u5E93\u4E2D\u5DF2\u6CE8\u518C\u6587\u4EF6\u6570: ${dbFileSet.size}`);
-    const diskFiles = getAllFiles(UPLOAD_DIR);
-    console.log(`\u{1F9F9} \u78C1\u76D8\u4E0A\u6587\u4EF6\u6570: ${diskFiles.length}`);
-    for (const file of diskFiles) {
-      if (!dbFileSet.has(file.name)) {
-        try {
-          fs3.unlinkSync(file.path);
-          stats.deletedCount++;
-          stats.freedBytes += file.size;
-          stats.deletedFiles.push(file.name);
-          console.log(`\u{1F9F9} \u5220\u9664\u5B64\u513F\u6587\u4EF6: ${file.path} (${formatBytes2(file.size)})`);
-        } catch (e) {
-          console.error(`\u{1F9F9} \u5220\u9664\u6587\u4EF6\u5931\u8D25: ${file.path}`, e);
-        }
-      }
-    }
-    removeEmptyDirectories(UPLOAD_DIR);
-    stats.freedSpace = formatBytes2(stats.freedBytes);
-    if (stats.deletedCount > 0) {
-      console.log(`\u{1F9F9} \u6E05\u7406\u5B8C\u6210: \u5220\u9664 ${stats.deletedCount} \u4E2A\u5B64\u513F\u6587\u4EF6\uFF0C\u91CA\u653E ${stats.freedSpace}`);
-    } else {
-      console.log("\u{1F9F9} \u626B\u63CF\u5B8C\u6210: \u6CA1\u6709\u53D1\u73B0\u5B64\u513F\u6587\u4EF6");
-    }
-  } catch (error) {
-    console.error("\u{1F9F9} \u5B64\u513F\u6587\u4EF6\u6E05\u7406\u5931\u8D25:", error);
-    throw error;
-  }
-  return stats;
-}
-var cleanupInterval = null;
-function startPeriodicCleanup(intervalMs = 60 * 60 * 1e3) {
-  if (cleanupInterval) {
-    clearInterval(cleanupInterval);
-  }
-  cleanupInterval = setInterval(async () => {
-    console.log("\u{1F9F9} \u6267\u884C\u5B9A\u671F\u5B64\u513F\u6587\u4EF6\u6E05\u7406...");
-    try {
-      const stats = await cleanupOrphanFiles();
-      if (stats.deletedCount > 0) {
-        console.log(`\u{1F9F9} \u5B9A\u671F\u6E05\u7406\u5B8C\u6210: \u5220\u9664 ${stats.deletedCount} \u4E2A\u6587\u4EF6\uFF0C\u91CA\u653E ${stats.freedSpace}`);
-      }
-    } catch (e) {
-      console.error("\u{1F9F9} \u5B9A\u671F\u6E05\u7406\u5931\u8D25:", e);
-    }
-  }, intervalMs);
-  console.log(`\u{1F9F9} \u5DF2\u542F\u52A8\u5B9A\u671F\u6E05\u7406\u4EFB\u52A1 (\u95F4\u9694: ${intervalMs / 1e3 / 60} \u5206\u949F)`);
-}
-
 // src/utils/telegramMessages.ts
 var PROVIDER_DISPLAY_MAP = {
   onedrive: "\u2601\uFE0F OneDrive",
@@ -1761,9 +1671,16 @@ function buildWelcomeBack() {
     `\u60A8\u5DF2\u901A\u8FC7\u9A8C\u8BC1\uFF0C\u53EF\u4EE5\u76F4\u63A5\u4F7F\u7528\uFF1A`,
     ``,
     `\u{1F4E4}  \u53D1\u9001/\u8F6C\u53D1\u6587\u4EF6\u5373\u53EF\u4E0A\u4F20 (\u6700\u5927 2GB)`,
+    `\u{1F510}  /setup_2fa \u2014 \u914D\u7F6E\u53CC\u91CD\u9A8C\u8BC1`,
+    `\u{1F4E5}  /ytdlp \u2014 \u89E3\u6790\u5E76\u4E0B\u8F7D\u94FE\u63A5`,
     `\u{1F4CA}  /storage \u2014 \u5B58\u50A8\u7A7A\u95F4\u6982\u89C8`,
     `\u{1F4CB}  /list \u2014 \u6700\u8FD1\u4E0A\u4F20\u8BB0\u5F55`,
     `\u{1F527}  /tasks \u2014 \u5B9E\u65F6\u4EFB\u52A1\u961F\u5217`,
+    `\u{1F6D1}  /stop_tasks \u2014 \u5F3A\u5236\u505C\u6B62\u4E0B\u8F7D\u4EFB\u52A1`,
+    `\u2699\uFE0F  /download_workers \u2014 \u4E0B\u8F7D\u5E76\u53D1\u8BBE\u7F6E`,
+    `\u{1F4C1}  /path_rules \u2014 \u4FDD\u5B58\u8DEF\u5F84\u89C4\u5219`,
+    `\u{1F9EC}  /duplicate_mode \u2014 \u91CD\u590D\u6587\u4EF6\u5904\u7406`,
+    `\u{1F9F9}  /cleanup_settings \u2014 \u81EA\u52A8\u6E05\u7406\u8BBE\u7F6E`,
     `\u2753  /help \u2014 \u5B8C\u6574\u5E2E\u52A9`
   ].join("\n");
 }
@@ -1793,11 +1710,17 @@ function buildHelp() {
     ``,
     `**\u{1F6E0} \u53EF\u7528\u547D\u4EE4**`,
     `  /start \u2014 \u8EAB\u4EFD\u8BA4\u8BC1 / \u5F00\u59CB\u4F7F\u7528`,
+    `  /setup\\_2fa \u2014 \u914D\u7F6E\u53CC\u91CD\u9A8C\u8BC1 (TOTP)`,
+    `  /ytdlp <url> \u2014 \u4E0B\u8F7D\u89C6\u9891\u94FE\u63A5\u5230\u5B58\u50A8`,
     `  /storage \u2014 \u670D\u52A1\u5668 & \u5B58\u50A8\u7EDF\u8BA1`,
     `  /list [n] \u2014 \u6700\u8FD1\u4E0A\u4F20 (\u9ED8\u8BA4 10 \u6761)`,
-    `  /delete <ID> \u2014 \u5220\u9664\u6307\u5B9A\u6587\u4EF6`,
     `  /tasks \u2014 \u5B9E\u65F6\u4F20\u8F93\u4EFB\u52A1\u961F\u5217`,
-    `  /setup\\_2fa \u2014 \u914D\u7F6E\u53CC\u91CD\u9A8C\u8BC1 (TOTP)`,
+    `  /stop_tasks \u2014 \u505C\u6B62\u6240\u6709\u4E0B\u8F7D\u4EFB\u52A1`,
+    `  /download_workers \u2014 \u8BBE\u7F6E\u4E0B\u8F7D\u5E76\u53D1`,
+    `  /path_rules \u2014 \u8BBE\u7F6E\u4FDD\u5B58\u8DEF\u5F84\u89C4\u5219`,
+    `  /duplicate_mode \u2014 \u8BBE\u7F6E\u91CD\u590D\u6587\u4EF6\u5904\u7406`,
+    `  /cleanup_settings \u2014 \u8BBE\u7F6E\u81EA\u52A8\u6E05\u7406\u5F00\u5173`,
+    `  /delete <ID\u6216\u5E8F\u53F7> \u2014 \u5220\u9664\u6307\u5B9A\u6587\u4EF6`,
     `  /help \u2014 \u663E\u793A\u6B64\u5E2E\u52A9`,
     ``,
     LINE,
@@ -1859,7 +1782,9 @@ function buildFileList(files, total) {
     lines.push(`    ID: \`${file.id.substring(0, 8)}\``);
   });
   lines.push("");
-  lines.push(`\u{1F4A1} \u5220\u9664\u6587\u4EF6: /delete <ID\u524D8\u4F4D>`);
+  lines.push(`\u{1F4A1} \u5220\u9664\u6587\u4EF6: \u590D\u5236\u4E0A\u65B9 ID \u540E\u53D1\u9001 /delete <ID>`);
+  lines.push(`   \u4F8B\uFF1A/delete ${files[0]?.id?.substring(0, 8) || "a1b2c3d4"}`);
+  lines.push(`\u{1F4C4} \u66F4\u591A\u8BB0\u5F55: /list 20 \u6216 /list 20 2`);
   return lines.join("\n");
 }
 function buildTasksReport(active, pending, history) {
@@ -1904,7 +1829,7 @@ function buildTasksReport(active, pending, history) {
   }
   return lines.join("\n");
 }
-function buildUploadSuccess(fileName, size, fileType, providerName) {
+function buildUploadSuccess(fileName, size, fileType, providerName, folder) {
   const typeEmoji = getTypeEmoji(
     fileType === "image" ? "image/" : fileType === "video" ? "video/" : fileType === "audio" ? "audio/" : "other"
   );
@@ -1915,7 +1840,8 @@ function buildUploadSuccess(fileName, size, fileType, providerName) {
     ``,
     `${typeEmoji} ${fileName}`,
     `\u{1F4E6} ${formatBytes(size)}`,
-    `\u{1F4CD} ${getProviderDisplayName(providerName)}`
+    `\u{1F4CD} ${getProviderDisplayName(providerName)}`,
+    ...folder ? [`\u{1F4C1} ${folder}`] : []
   ].join("\n");
 }
 function buildUploadFail(fileName, error) {
@@ -1923,7 +1849,21 @@ function buildUploadFail(fileName, error) {
     `\u274C **\u4E0A\u4F20\u5931\u8D25**`,
     ``,
     `\u{1F4C4} ${fileName}`,
-    `\u539F\u56E0: ${error}`
+    `\u539F\u56E0: ${error}`,
+    ``,
+    `\u{1F504} \u5927\u6587\u4EF6\u53EF\u80FD\u56E0\u7F51\u7EDC\u6CE2\u52A8\u3001Telegram \u9650\u6D41\u6216\u4E34\u65F6\u65AD\u6D41\u5931\u8D25\uFF1BBot \u5DF2\u81EA\u52A8\u91CD\u8BD5\u4E00\u6B21\u3002`,
+    `\u{1F4A1} \u53EF\u91CD\u65B0\u53D1\u9001\u8BE5\u6587\u4EF6\uFF0C\u6216\u7528 /download_workers \u964D\u4F4E\u5E76\u53D1\u540E\u518D\u8BD5\u3002`
+  ].join("\n");
+}
+function buildDuplicateSkipped(fileName, folder, existingId) {
+  return [
+    `\u23ED\uFE0F **\u5DF2\u8DF3\u8FC7\u91CD\u590D\u6587\u4EF6**`,
+    ``,
+    `\u{1F4C4} ${fileName}`,
+    ...folder ? [`\u{1F4C1} ${folder}`] : [],
+    ...existingId ? [`\u{1F194} \u5DF2\u5B58\u5728: ${existingId.substring(0, 8)}`] : [],
+    ``,
+    `\u5982\u9700\u4FDD\u7559\u526F\u672C\uFF0C\u8BF7\u53D1\u9001 /duplicate_mode \u5207\u6362\u4E3A\u201C\u751F\u6210\u526F\u672C\u201D\u3002`
   ].join("\n");
 }
 function buildDownloadProgress(fileName, downloaded, total, typeEmoji, startTime) {
@@ -2020,20 +1960,6 @@ async function buildConsolidatedStatus(singleFiles, batches) {
     const totalSuccessful = successfulSingles + successfulBatches;
     const totalFailed = failedSingles + failedBatches;
     const totalSize = [...singleFiles.filter((f) => f.phase === "success"), ...batches.flatMap((b) => [])].reduce((sum, f) => sum + (f.size || 0), 0);
-    let cleanupStats = null;
-    if (totalFailed > 0) {
-      try {
-        const stats = await cleanupOrphanFiles();
-        if (stats.deletedCount > 0) {
-          cleanupStats = {
-            deletedCount: stats.deletedCount,
-            freedSpace: stats.freedSpace
-          };
-        }
-      } catch (error) {
-        console.error("\u{1F9F9} \u81EA\u52A8\u6E05\u7406\u5931\u8D25:", error);
-      }
-    }
     lines.push("\u{1F4CA} **\u5B8C\u6210\u6458\u8981**");
     lines.push(LINE);
     lines.push(`\u2705 \u6210\u529F: ${totalSuccessful} \u4E2A\u6587\u4EF6`);
@@ -2058,21 +1984,16 @@ async function buildConsolidatedStatus(singleFiles, batches) {
     })}`);
     if (totalFailed > 0) {
       lines.push("");
-      lines.push("\u{1F9F9} **\u81EA\u52A8\u6E05\u7406\u5B8C\u6210**");
-      lines.push("  \u5DF2\u6E05\u7406\u670D\u52A1\u5668\u7F13\u5B58\u5783\u573E\u6587\u4EF6");
-      if (cleanupStats && cleanupStats.deletedCount > 0) {
-        lines.push(`  \u{1F5D1}\uFE0F \u5220\u9664 ${cleanupStats.deletedCount} \u4E2A\u5B64\u513F\u6587\u4EF6`);
-        lines.push(`  \u{1F4BE} \u91CA\u653E\u7A7A\u95F4 ${cleanupStats.freedSpace}`);
-      } else {
-        lines.push("  \u2705 \u6CA1\u6709\u53D1\u73B0\u9700\u8981\u6E05\u7406\u7684\u5783\u573E\u6587\u4EF6");
-      }
+      lines.push("\u{1F9F9} **\u81EA\u52A8\u6E05\u7406\u5DF2\u5173\u95ED**");
+      lines.push("  \u5931\u8D25\u4EA7\u751F\u7684\u672C\u5730\u4E34\u65F6\u6587\u4EF6\u4E0D\u4F1A\u5728\u8FD9\u91CC\u81EA\u52A8\u5220\u9664\u3002");
+      lines.push("  \u5982\u9700\u6E05\u7406\uFF0C\u8BF7\u5148\u786E\u8BA4\u6587\u4EF6\u72B6\u6001\u540E\u624B\u52A8\u5904\u7406\u3002");
     }
     lines.push("");
     if (totalFailed === 0) {
       lines.push("\u{1F38A} \u6240\u6709\u6587\u4EF6\u5DF2\u5B89\u5168\u4E0A\u4F20\u5230\u4E91\u7AEF\uFF01");
       lines.push("\u{1F4A1} \u60A8\u53EF\u4EE5\u968F\u65F6\u4F7F\u7528 /list \u67E5\u770B\u4E0A\u4F20\u8BB0\u5F55");
     } else {
-      lines.push("\u{1F4A1} \u90E8\u5206\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF0C\u5DF2\u81EA\u52A8\u6E05\u7406\u670D\u52A1\u5668\u7F13\u5B58");
+      lines.push("\u{1F4A1} \u90E8\u5206\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF0C\u672A\u81EA\u52A8\u6E05\u7406\u670D\u52A1\u5668\u7F13\u5B58");
       lines.push("\u{1F504} \u60A8\u53EF\u4EE5\u91CD\u65B0\u53D1\u9001\u5931\u8D25\u7684\u6587\u4EF6");
     }
     lines.push("");
@@ -2105,6 +2026,7 @@ async function buildConsolidatedStatus(singleFiles, batches) {
           icon = "\u2705";
           const parts = [];
           if (file.size) parts.push(formatBytes(file.size));
+          if (file.folder) parts.push(`\u{1F4C1} ${file.folder}`);
           detail = parts.join(" \xB7 ") || "\u5B8C\u6210";
           break;
         case "failed":
@@ -2162,6 +2084,7 @@ async function buildConsolidatedStatus(singleFiles, batches) {
           icon = "\u2705";
           const parts = [];
           if (file.size) parts.push(formatBytes(file.size));
+          if (file.folder) parts.push(`\u{1F4C1} ${file.folder}`);
           detail = parts.join(" \xB7 ") || "\u5B8C\u6210";
           break;
         case "failed":
@@ -2191,30 +2114,30 @@ function buildCleanupNotice(deletedCount, freedSpace) {
 // src/services/telegramUpload.ts
 init_db();
 import { Api } from "telegram";
-import fs6 from "fs";
+import fs5 from "fs";
 import path8 from "path";
 import crypto4 from "crypto";
 import bigInt from "big-integer";
 
 // src/utils/thumbnail.ts
-import path5 from "path";
+import path4 from "path";
 import sharp from "sharp";
 import ffmpeg from "fluent-ffmpeg";
-import fs4 from "fs";
+import fs3 from "fs";
 import crypto3 from "crypto";
-var THUMBNAIL_DIR2 = path5.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
-if (!fs4.existsSync(THUMBNAIL_DIR2)) {
-  fs4.mkdirSync(THUMBNAIL_DIR2, { recursive: true });
+var THUMBNAIL_DIR = path4.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+if (!fs3.existsSync(THUMBNAIL_DIR)) {
+  fs3.mkdirSync(THUMBNAIL_DIR, { recursive: true });
 }
 async function generateThumbnail(filePath, storedName, mimeType) {
-  const absFilePath = path5.resolve(filePath);
+  const absFilePath = path4.resolve(filePath);
   const thumbName = `thumb_${crypto3.randomUUID()}.webp`;
-  const thumbPath = path5.join(THUMBNAIL_DIR2, thumbName);
+  const thumbPath = path4.join(THUMBNAIL_DIR, thumbName);
   console.log(`[Thumbnail] \u{1F680} Starting generation for: ${storedName}`);
   console.log(`[Thumbnail] Source: ${absFilePath}`);
   console.log(`[Thumbnail] Target: ${thumbPath}`);
   console.log(`[Thumbnail] MIME: ${mimeType}`);
-  if (!fs4.existsSync(absFilePath)) {
+  if (!fs3.existsSync(absFilePath)) {
     console.error(`[Thumbnail] \u274C Source file does not exist: ${absFilePath}`);
     return null;
   }
@@ -2235,12 +2158,12 @@ async function generateThumbnail(filePath, storedName, mimeType) {
           console.log(`[Thumbnail] \u{1F4F8} Attempting screenshot at ${timestamp}`);
           ffmpeg(absFilePath).screenshots({
             count: 1,
-            folder: THUMBNAIL_DIR2,
+            folder: THUMBNAIL_DIR,
             filename: thumbName,
             size: "400x300",
             timestamps: [timestamp]
           }).on("start", (cmd) => console.log(`[Thumbnail] FFmpeg CMD: ${cmd}`)).on("end", () => {
-            if (fs4.existsSync(thumbPath)) {
+            if (fs3.existsSync(thumbPath)) {
               console.log(`[Thumbnail] \u2705 Video thumbnail created at ${timestamp}`);
               resolve(true);
             } else {
@@ -2268,7 +2191,7 @@ async function generateThumbnail(filePath, storedName, mimeType) {
   return null;
 }
 async function getImageDimensions(filePath, mimeType) {
-  const absFilePath = path5.resolve(filePath);
+  const absFilePath = path4.resolve(filePath);
   console.log(`[Dimensions] \u{1F4CF} Getting dimensions for: ${absFilePath} (${mimeType})`);
   try {
     if (mimeType.startsWith("image/")) {
@@ -2304,8 +2227,8 @@ async function getImageDimensions(filePath, mimeType) {
 init_storage();
 
 // src/services/telegramUserClient.ts
-import fs5 from "fs";
-import path6 from "path";
+import fs4 from "fs";
+import path5 from "path";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 var userClient = null;
@@ -2327,11 +2250,11 @@ async function initTelegramUserClient() {
     return;
   }
   userSessionFilePath = getSessionFilePath();
-  const sessionDir = path6.dirname(userSessionFilePath);
-  if (!fs5.existsSync(sessionDir)) {
-    fs5.mkdirSync(sessionDir, { recursive: true, mode: 448 });
+  const sessionDir = path5.dirname(userSessionFilePath);
+  if (!fs4.existsSync(sessionDir)) {
+    fs4.mkdirSync(sessionDir, { recursive: true, mode: 448 });
   }
-  const sessionString = fs5.existsSync(userSessionFilePath) ? fs5.readFileSync(userSessionFilePath, "utf-8").trim() : "";
+  const sessionString = fs4.existsSync(userSessionFilePath) ? fs4.readFileSync(userSessionFilePath, "utf-8").trim() : "";
   if (!sessionString) {
     console.log("\u26A0\uFE0F Telegram \u7528\u6237 session \u4E3A\u7A7A\uFF0C\u5148\u8FD0\u884C\u767B\u5F55\u811A\u672C\u751F\u6210 session \u540E\u518D\u542F\u7528 user client");
     return;
@@ -2351,8 +2274,8 @@ async function initTelegramUserClient() {
     userClient = null;
     return;
   }
-  fs5.writeFileSync(userSessionFilePath, userClient.session.save(), { mode: 384 });
-  fs5.chmodSync(userSessionFilePath, 384);
+  fs4.writeFileSync(userSessionFilePath, userClient.session.save(), { mode: 384 });
+  fs4.chmodSync(userSessionFilePath, 384);
   console.log("\u{1F916} Telegram \u7528\u6237\u8D26\u53F7\u4E0B\u8F7D\u5668\u5DF2\u8FDE\u63A5");
 }
 function getTelegramUserClient() {
@@ -2367,10 +2290,10 @@ function getTelegramUserSessionFilePath() {
 
 // src/utils/fileUtils.ts
 init_db();
-import path7 from "path";
+import path6 from "path";
 async function getUniqueStoredName(originalName, folder = null, storageAccountId = null) {
   const sanitizedName = sanitizeFilename(originalName);
-  const ext = path7.extname(sanitizedName);
+  const ext = path6.extname(sanitizedName);
   const baseName = ext ? sanitizedName.slice(0, -ext.length) : sanitizedName;
   let currentName = sanitizedName;
   let counter = 1;
@@ -2379,11 +2302,11 @@ async function getUniqueStoredName(originalName, folder = null, storageAccountId
     let checkQuery = "";
     let params = [];
     if (storageAccountId) {
-      checkQuery = "SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND storage_account_id = $2";
-      params = [currentName, storageAccountId];
+      checkQuery = "SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND folder IS NOT DISTINCT FROM $2 AND storage_account_id = $3";
+      params = [currentName, folder, storageAccountId];
     } else {
-      checkQuery = "SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND source = 'local'";
-      params = [currentName];
+      checkQuery = "SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND folder IS NOT DISTINCT FROM $2 AND source = 'local'";
+      params = [currentName, folder];
     }
     const result = await query(checkQuery, params);
     const count = result.rows[0]?.cnt || 0;
@@ -2397,8 +2320,119 @@ async function getUniqueStoredName(originalName, folder = null, storageAccountId
   return currentName;
 }
 
+// src/utils/storagePath.ts
+import path7 from "path";
+function isEnabled(value, defaultValue) {
+  if (value === void 0 || value === "") return defaultValue;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+function shouldClassifyStoragePath() {
+  return isEnabled(process.env.STORAGE_CLASSIFY_BY_PATH, true);
+}
+function getTypeFolder(mimeType) {
+  const type = getFileType(mimeType || "");
+  const map = {
+    image: "images",
+    video: "videos",
+    audio: "audio",
+    document: "documents",
+    other: "others"
+  };
+  return map[type] || "others";
+}
+function getDetailedTypeFolder(mimeType, fileName) {
+  const lowerMime = (mimeType || "").toLowerCase();
+  const ext = path7.extname(fileName || "").toLowerCase();
+  if (lowerMime.includes("epub") || lowerMime.includes("mobi") || [".epub", ".mobi"].includes(ext)) return "ebooks";
+  if (lowerMime.includes("pdf") || ext === ".pdf") return "pdfs";
+  if (lowerMime.includes("zip") || lowerMime.includes("rar") || lowerMime.includes("7z") || lowerMime.includes("tar") || lowerMime.includes("gzip") || lowerMime.includes("compressed") || [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"].includes(ext)) return "archives";
+  if (lowerMime.includes("spreadsheet") || lowerMime.includes("excel") || [".xls", ".xlsx", ".csv"].includes(ext)) return "spreadsheets";
+  if (lowerMime.includes("presentation") || lowerMime.includes("powerpoint") || [".ppt", ".pptx"].includes(ext)) return "presentations";
+  if (lowerMime.includes("word") || [".doc", ".docx"].includes(ext)) return "word-docs";
+  if (lowerMime.includes("javascript") || lowerMime.includes("typescript") || lowerMime.includes("python") || lowerMime.includes("json") || lowerMime.includes("xml") || lowerMime.includes("sql") || [".js", ".ts", ".py", ".json", ".xml", ".sql", ".html", ".css"].includes(ext)) return "code";
+  return getTypeFolder(mimeType);
+}
+async function getStoragePathRules() {
+  const bySource = await getSetting("storage_path_by_source", process.env.STORAGE_PATH_BY_SOURCE ?? "true");
+  const byType = await getSetting("storage_path_by_type", process.env.STORAGE_PATH_BY_TYPE ?? "true");
+  return {
+    bySource: isEnabled(String(bySource ?? "true"), true),
+    byType: isEnabled(String(byType ?? "true"), true)
+  };
+}
+function normalizeSegment(value, fallback) {
+  const cleaned = sanitizeFilename((value || fallback).trim()).replace(/^\.+/, "_");
+  return cleaned.replace(/^\.+$/, fallback) || fallback;
+}
+function getEntityDisplayName(entity) {
+  if (!entity) return null;
+  return entity.title || entity.username || [entity.firstName, entity.lastName].filter(Boolean).join(" ") || null;
+}
+function getForwardedSourceName(fwdFrom) {
+  return fwdFrom?.postAuthor || fwdFrom?.fromName || fwdFrom?.savedFromName || null;
+}
+function buildStorageFolderWithRules(options, rules) {
+  if (!shouldClassifyStoragePath()) {
+    return options.folder ? normalizeSegment(options.folder, "folder") : null;
+  }
+  const segments = [];
+  if (rules.bySource) {
+    segments.push(normalizeSegment(options.source, "uploads"));
+    if (options.chatName) {
+      segments.push(normalizeSegment(options.chatName, "chat"));
+    }
+  }
+  if (options.folder) {
+    segments.push(normalizeSegment(options.folder, "folder"));
+  }
+  if (rules.byType) {
+    segments.push(getDetailedTypeFolder(options.mimeType, options.fileName));
+  }
+  if (segments.length === 0) return null;
+  return segments.join("/");
+}
+async function getTelegramChatName(message) {
+  const fwdFrom = message.fwdFrom;
+  const forwardedPeer = fwdFrom?.savedFromPeer || fwdFrom?.fromId;
+  if (forwardedPeer) {
+    const sourceEntity = await message.client?.getEntity?.(forwardedPeer).catch(() => null);
+    const sourceName = getEntityDisplayName(sourceEntity) || getForwardedSourceName(fwdFrom);
+    if (sourceName) return normalizeSegment(sourceName, "telegram");
+  }
+  const forwardedName = getForwardedSourceName(fwdFrom);
+  if (forwardedName) return normalizeSegment(forwardedName, "telegram");
+  const chat = await message.getChat().catch(() => null);
+  const title = getEntityDisplayName(chat);
+  const chatId = message.chatId?.toString();
+  return normalizeSegment(title || chatId || "telegram", "telegram");
+}
+
+// src/utils/duplicatePolicy.ts
+init_db();
+function normalizeDuplicateMode(value) {
+  return value === "skip" ? "skip" : "copy";
+}
+async function getDuplicateMode() {
+  const value = await getSetting("duplicate_file_mode", process.env.DUPLICATE_FILE_MODE || "copy");
+  return normalizeDuplicateMode(value);
+}
+async function findDuplicateFile(name, folder, size, storageAccountId) {
+  const result = await query(
+    `SELECT id, name, path, folder, size, created_at
+         FROM files
+         WHERE name = $1
+           AND folder IS NOT DISTINCT FROM $2
+           AND size = $3
+           AND storage_account_id IS NOT DISTINCT FROM $4
+         ORDER BY created_at DESC
+         LIMIT 1`,
+    [name, folder, size, storageAccountId]
+  );
+  return result.rows[0] || null;
+}
+
 // src/services/telegramUpload.ts
-var UPLOAD_DIR2 = process.env.UPLOAD_DIR || "./data/uploads";
+var UPLOAD_DIR = process.env.UPLOAD_DIR || "./data/uploads";
 var DEFAULT_TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TELEGRAM_DOWNLOAD_WORKERS || "4", 10) || 4));
 var TELEGRAM_DOWNLOAD_PART_SIZE = 512 * 1024;
 function clampDownloadWorkers(value) {
@@ -2721,7 +2755,7 @@ function getBackgroundFileCount(chatIdStr) {
 `;
   console.log(logLine.trim());
   try {
-    fs6.appendFileSync("tg_silent_debug.log", logLine);
+    fs5.appendFileSync("tg_silent_debug.log", logLine);
   } catch (e) {
   }
   return count;
@@ -2734,7 +2768,7 @@ async function trySilentMode(client2, chatId, message) {
 `;
   console.log(logLine.trim());
   try {
-    fs6.appendFileSync("tg_silent_debug.log", logLine);
+    fs5.appendFileSync("tg_silent_debug.log", logLine);
   } catch (e) {
   }
   if (fileCount > 3 || isSilent) {
@@ -2880,7 +2914,7 @@ async function refreshConsolidatedMessage(client2, chatId, replyTo) {
   const logLine = `[TG][consolidated][${Date.now()}] check chat=${chatIdStr} silent=${alreadySilent} fileCount=${fileCount} replyTo=${!!replyTo}
 `;
   try {
-    fs6.appendFileSync("tg_silent_debug.log", logLine);
+    fs5.appendFileSync("tg_silent_debug.log", logLine);
   } catch (e) {
   }
   if (alreadySilent || fileCount > 3) {
@@ -2987,14 +3021,14 @@ function extractFileInfo(message) {
 async function downloadAndSaveFile(client2, message, originalFileName, targetDir, onProgress, signal) {
   const ext = path8.extname(originalFileName) || "";
   const tempStoredName = `${crypto4.randomUUID()}${ext}`;
-  let saveDir = targetDir || UPLOAD_DIR2;
-  if (!fs6.existsSync(saveDir)) {
+  let saveDir = targetDir || UPLOAD_DIR;
+  if (!fs5.existsSync(saveDir)) {
     try {
-      fs6.mkdirSync(saveDir, { recursive: true });
+      fs5.mkdirSync(saveDir, { recursive: true });
     } catch (err) {
       console.error(`\u{1F916} \u521B\u5EFA\u4E0B\u8F7D\u76EE\u5F55\u5931\u8D25: ${saveDir}`, err);
-      if (saveDir === UPLOAD_DIR2) throw err;
-      saveDir = UPLOAD_DIR2;
+      if (saveDir === UPLOAD_DIR) throw err;
+      saveDir = UPLOAD_DIR;
     }
   }
   const filePath = path8.join(saveDir, tempStoredName);
@@ -3006,7 +3040,7 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
     const workers = totalSize > TELEGRAM_DOWNLOAD_PART_SIZE ? Math.min(configuredWorkers, Math.ceil(totalSize / TELEGRAM_DOWNLOAD_PART_SIZE)) : 1;
     console.log(`\u{1F916} Telegram \u4E0B\u8F7D\u53C2\u6570: workers=${workers}, part=${TELEGRAM_DOWNLOAD_PART_SIZE} bytes, size=${totalSize || "unknown"}`);
     if (workers > 1 && totalSize > 0) {
-      const fileHandle = await fs6.promises.open(filePath, "w");
+      const fileHandle = await fs5.promises.open(filePath, "w");
       try {
         await fileHandle.truncate(totalSize);
         await Promise.all(Array.from({ length: workers }, async (_, workerIndex) => {
@@ -3036,7 +3070,7 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
         await fileHandle.close();
       }
     } else {
-      const writeStream = fs6.createWriteStream(filePath);
+      const writeStream = fs5.createWriteStream(filePath);
       for await (const chunk of client2.iterDownload({
         file: message.media,
         requestSize: TELEGRAM_DOWNLOAD_PART_SIZE
@@ -3054,15 +3088,15 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
         writeStream.on("error", reject);
       });
     }
-    const stats = fs6.statSync(filePath);
+    const stats = fs5.statSync(filePath);
     if (totalSize > 0 && stats.size !== totalSize) {
       throw new Error(`\u4E0B\u8F7D\u6587\u4EF6\u5927\u5C0F\u4E0D\u4E00\u81F4: expected=${totalSize}, actual=${stats.size}`);
     }
     return { filePath, actualSize: stats.size, tempStoredName };
   } catch (error) {
     console.error("\u{1F916} \u4E0B\u8F7D\u6587\u4EF6\u5931\u8D25:", error);
-    if (fs6.existsSync(filePath)) {
-      fs6.unlinkSync(filePath);
+    if (fs5.existsSync(filePath)) {
+      fs5.unlinkSync(filePath);
     }
     return null;
   }
@@ -3073,9 +3107,17 @@ async function processFileUpload(client2, file, queue) {
     let localFilePath;
     let storedName;
     try {
-      const targetDir = file.targetDir || UPLOAD_DIR2;
       const activeAccountId = storageManager.getActiveAccountId();
-      storedName = await getUniqueStoredName(file.fileName, queue?.folderName || null, activeAccountId);
+      const chatName = await getTelegramChatName(file.message);
+      const storageRules = await getStoragePathRules();
+      const storageFolder = buildStorageFolderWithRules({
+        source: "telegram",
+        chatName,
+        folder: queue?.folderName || null,
+        mimeType: file.mimeType,
+        fileName: file.fileName
+      }, storageRules);
+      storedName = await getUniqueStoredName(file.fileName, storageFolder, activeAccountId);
       const downloadSource = await resolveDownloadSource(client2, file.message);
       const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, file.fileName, file.targetDir, void 0, signal);
       if (!result) {
@@ -3085,6 +3127,17 @@ async function processFileUpload(client2, file, queue) {
       localFilePath = result.filePath;
       const actualSize = result.actualSize;
       const fileType = getFileType(file.mimeType);
+      const duplicateMode = await getDuplicateMode();
+      if (duplicateMode === "skip") {
+        const duplicate = await findDuplicateFile(file.fileName, storageFolder, actualSize, activeAccountId);
+        if (duplicate) {
+          file.status = "success";
+          file.size = actualSize;
+          file.fileType = fileType;
+          if (localFilePath && fs5.existsSync(localFilePath)) fs5.unlinkSync(localFilePath);
+          return true;
+        }
+      }
       let thumbnailPath = null;
       let dimensions = {};
       try {
@@ -3096,22 +3149,20 @@ async function processFileUpload(client2, file, queue) {
       const provider = storageManager.getProvider();
       let finalPath = localFilePath;
       let sourceRef = provider.name;
-      if (provider.name !== "local") {
-        try {
-          finalPath = await provider.saveFile(localFilePath, storedName, file.mimeType);
-          if (fs6.existsSync(localFilePath)) {
-            fs6.unlinkSync(localFilePath);
-          }
-        } catch (err) {
-          console.error("\u4FDD\u5B58\u6587\u4EF6\u5230\u5B58\u50A8\u63D0\u4F9B\u5546\u5931\u8D25:", err);
-          throw err;
+      try {
+        finalPath = await provider.saveFile(localFilePath, storedName, file.mimeType, storageFolder);
+        if (fs5.existsSync(localFilePath)) {
+          fs5.unlinkSync(localFilePath);
         }
+        localFilePath = void 0;
+      } catch (err) {
+        console.error("\u4FDD\u5B58\u6587\u4EF6\u5230\u5B58\u50A8\u63D0\u4F9B\u5546\u5931\u8D25:", err);
+        throw err;
       }
-      const folderName = queue?.folderName || null;
       await query(`
                 INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            `, [file.fileName, storedName, fileType, file.mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, folderName, activeAccountId]);
+            `, [file.fileName, storedName, fileType, file.mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
       file.status = "success";
       file.size = actualSize;
       file.fileType = fileType;
@@ -3119,9 +3170,9 @@ async function processFileUpload(client2, file, queue) {
     } catch (error) {
       console.error("\u{1F916} \u6587\u4EF6\u4E0A\u4F20\u5931\u8D25:", error);
       file.error = error.message;
-      if (localFilePath && fs6.existsSync(localFilePath)) {
+      if (localFilePath && fs5.existsSync(localFilePath)) {
         try {
-          fs6.unlinkSync(localFilePath);
+          fs5.unlinkSync(localFilePath);
           console.log(`\u{1F916} \u4E0A\u4F20\u5C1D\u8BD5\u5931\u8D25\uFF0C\u5DF2\u81EA\u52A8\u6E05\u7406\u672C\u5730\u5783\u573E\u7F13\u5B58: ${localFilePath}`);
         } catch (e) {
           console.error("\u{1F916} \u81EA\u52A8\u6E05\u7406\u5783\u573E\u7F13\u5B58\u5931\u8D25:", e);
@@ -3191,9 +3242,9 @@ async function processBatchUpload(client2, mediaGroupId) {
     queuePending: 0
   });
   const sanitizedFolderName = sanitizeFilename(folderName);
-  const targetDir = path8.join(UPLOAD_DIR2, sanitizedFolderName);
-  if (!fs6.existsSync(targetDir)) {
-    fs6.mkdirSync(targetDir, { recursive: true });
+  const targetDir = path8.join(UPLOAD_DIR, sanitizedFolderName);
+  if (!fs5.existsSync(targetDir)) {
+    fs5.mkdirSync(targetDir, { recursive: true });
   }
   queue.folderName = sanitizedFolderName;
   for (const file of queue.files) {
@@ -3255,8 +3306,8 @@ async function handleCleanupCallback(cleanupId) {
     return { success: false, message: "\u8BE5\u6E05\u7406\u4EFB\u52A1\u5DF2\u8FC7\u671F\u6216\u4E0D\u5B58\u5728" };
   }
   try {
-    if (cleanupInfo.localPath && fs6.existsSync(cleanupInfo.localPath)) {
-      fs6.unlinkSync(cleanupInfo.localPath);
+    if (cleanupInfo.localPath && fs5.existsSync(cleanupInfo.localPath)) {
+      fs5.unlinkSync(cleanupInfo.localPath);
     }
     pendingCleanups.delete(cleanupId);
     return {
@@ -3413,7 +3464,15 @@ async function handleFileUpload(client2, event) {
       try {
         if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         const activeAccountId = storageManager.getActiveAccountId();
-        const storedName = await getUniqueStoredName(finalFileName, null, activeAccountId);
+        const chatName = await getTelegramChatName(message);
+        const storageRules = await getStoragePathRules();
+        const storageFolder = buildStorageFolderWithRules({
+          source: "telegram",
+          chatName,
+          mimeType,
+          fileName: finalFileName
+        }, storageRules);
+        const storedName = await getUniqueStoredName(finalFileName, storageFolder, activeAccountId);
         const downloadSource = await resolveDownloadSource(client2, message);
         const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, fileName, void 0, onProgress, signal);
         if (!result) {
@@ -3424,6 +3483,24 @@ async function handleFileUpload(client2, event) {
         lastLocalPath = localFilePath;
         const { actualSize } = result;
         const fileType = getFileType(mimeType);
+        const duplicateMode = await getDuplicateMode();
+        if (duplicateMode === "skip") {
+          const duplicate = await findDuplicateFile(finalFileName, storageFolder, actualSize, activeAccountId);
+          if (duplicate) {
+            if (fs5.existsSync(localFilePath)) fs5.unlinkSync(localFilePath);
+            lastLocalPath = void 0;
+            updateUploadPhase(chatIdStr, uploadId, { phase: "success", size: actualSize, providerName: storageManager.getProvider().name, fileType, folder: storageFolder });
+            if (statusMsg && !silentSessionMap.has(chatIdStr)) {
+              await runStatusAction(chatId, async () => {
+                await client2.editMessage(chatId, {
+                  message: statusMsg.id,
+                  text: buildDuplicateSkipped(finalFileName, storageFolder, duplicate.id)
+                });
+              });
+            }
+            return true;
+          }
+        }
         updateUploadPhase(chatIdStr, uploadId, { phase: "saving" });
         if (useConsolidated()) {
           await runStatusAction(chatId, async () => {
@@ -3447,23 +3524,22 @@ async function handleFileUpload(client2, event) {
         const provider = storageManager.getProvider();
         let finalPath = localFilePath;
         let sourceRef = provider.name;
-        if (provider.name !== "local") {
-          try {
-            finalPath = await provider.saveFile(localFilePath, storedName, mimeType);
-            if (fs6.existsSync(localFilePath)) {
-              fs6.unlinkSync(localFilePath);
-            }
-            lastLocalPath = void 0;
-          } catch (err) {
-            lastError = err.message;
-            throw err;
+        try {
+          finalPath = await provider.saveFile(localFilePath, storedName, mimeType, storageFolder);
+          if (fs5.existsSync(localFilePath)) {
+            fs5.unlinkSync(localFilePath);
           }
+          lastLocalPath = void 0;
+          localFilePath = void 0;
+        } catch (err) {
+          lastError = err.message;
+          throw err;
         }
         await query(`
                     INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                `, [finalFileName, storedName, fileType, mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, null, activeAccountId]);
-        updateUploadPhase(chatIdStr, uploadId, { phase: "success", size: actualSize, providerName: provider.name, fileType });
+                `, [finalFileName, storedName, fileType, mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+        updateUploadPhase(chatIdStr, uploadId, { phase: "success", size: actualSize, providerName: provider.name, fileType, folder: storageFolder });
         if (useConsolidated()) {
           await runStatusAction(chatId, async () => {
             await refreshConsolidatedMessage(client2, chatId);
@@ -3472,16 +3548,16 @@ async function handleFileUpload(client2, event) {
           await runStatusAction(chatId, async () => {
             await client2.editMessage(chatId, {
               message: statusMsg.id,
-              text: buildUploadSuccess(finalFileName, actualSize, fileType, provider.name)
+              text: buildUploadSuccess(finalFileName, actualSize, fileType, provider.name, storageFolder)
             });
           });
         }
         return true;
       } catch (error) {
         lastError = error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF";
-        if (localFilePath && fs6.existsSync(localFilePath)) {
+        if (localFilePath && fs5.existsSync(localFilePath)) {
           try {
-            fs6.unlinkSync(localFilePath);
+            fs5.unlinkSync(localFilePath);
           } catch (e) {
           }
         }
@@ -3493,9 +3569,9 @@ async function handleFileUpload(client2, event) {
       let success = await attemptSingleUpload(signal);
       if (!success && !signal.aborted && retryCount < maxRetries) {
         retryCount++;
-        if (lastLocalPath && fs6.existsSync(lastLocalPath)) {
+        if (lastLocalPath && fs5.existsSync(lastLocalPath)) {
           try {
-            fs6.unlinkSync(lastLocalPath);
+            fs5.unlinkSync(lastLocalPath);
           } catch (e) {
           }
         }
@@ -3572,8 +3648,147 @@ async function handleFileUpload(client2, event) {
 
 // src/services/telegramCommands.ts
 init_storage();
+
+// src/services/orphanCleanup.ts
+init_db();
+import fs6 from "fs";
+import path9 from "path";
+var UPLOAD_DIR2 = process.env.UPLOAD_DIR || "./data/uploads";
+var THUMBNAIL_DIR2 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
+function isAutoCleanupEnabled() {
+  return ["1", "true", "yes", "on"].includes((process.env.AUTO_CLEANUP_ORPHANS || "true").toLowerCase());
+}
+function formatBytes2(bytes) {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+function getAllFiles(dirPath, arrayOfFiles = []) {
+  if (!fs6.existsSync(dirPath)) {
+    return arrayOfFiles;
+  }
+  try {
+    const files = fs6.readdirSync(dirPath);
+    for (const file of files) {
+      const fullPath = path9.join(dirPath, file);
+      try {
+        const stat = fs6.statSync(fullPath);
+        if (stat.isDirectory()) {
+          getAllFiles(fullPath, arrayOfFiles);
+        } else {
+          arrayOfFiles.push({
+            name: file,
+            path: fullPath,
+            size: stat.size
+          });
+        }
+      } catch (e) {
+        console.warn(`\u{1F9F9} \u65E0\u6CD5\u8BFB\u53D6\u6587\u4EF6\u72B6\u6001: ${fullPath}`, e);
+      }
+    }
+  } catch (e) {
+    console.error(`\u{1F9F9} \u65E0\u6CD5\u8BFB\u53D6\u76EE\u5F55: ${dirPath}`, e);
+  }
+  return arrayOfFiles;
+}
+function removeEmptyDirectories(dirPath) {
+  if (!fs6.existsSync(dirPath)) return;
+  try {
+    const files = fs6.readdirSync(dirPath);
+    for (const file of files) {
+      const fullPath = path9.join(dirPath, file);
+      try {
+        if (fs6.statSync(fullPath).isDirectory()) {
+          removeEmptyDirectories(fullPath);
+        }
+      } catch (e) {
+      }
+    }
+    const remainingFiles = fs6.readdirSync(dirPath);
+    if (remainingFiles.length === 0 && dirPath !== UPLOAD_DIR2) {
+      fs6.rmdirSync(dirPath);
+      console.log(`\u{1F9F9} \u5220\u9664\u7A7A\u6587\u4EF6\u5939: ${dirPath}`);
+    }
+  } catch (e) {
+    console.warn(`\u{1F9F9} \u5220\u9664\u7A7A\u6587\u4EF6\u5939\u5931\u8D25: ${dirPath}`, e);
+  }
+}
+async function cleanupOrphanFiles() {
+  const stats = {
+    deletedCount: 0,
+    freedBytes: 0,
+    freedSpace: "0 B",
+    deletedFiles: []
+  };
+  console.log("\u{1F9F9} \u5F00\u59CB\u626B\u63CF\u5B64\u513F\u6587\u4EF6...");
+  try {
+    const dbResult = await query("SELECT stored_name FROM files");
+    const dbFileSet = new Set(dbResult.rows.map((row) => row.stored_name));
+    console.log(`\u{1F9F9} \u6570\u636E\u5E93\u4E2D\u5DF2\u6CE8\u518C\u6587\u4EF6\u6570: ${dbFileSet.size}`);
+    const diskFiles = getAllFiles(UPLOAD_DIR2);
+    console.log(`\u{1F9F9} \u78C1\u76D8\u4E0A\u6587\u4EF6\u6570: ${diskFiles.length}`);
+    for (const file of diskFiles) {
+      if (!dbFileSet.has(file.name)) {
+        try {
+          fs6.unlinkSync(file.path);
+          stats.deletedCount++;
+          stats.freedBytes += file.size;
+          stats.deletedFiles.push(file.name);
+          console.log(`\u{1F9F9} \u5220\u9664\u5B64\u513F\u6587\u4EF6: ${file.path} (${formatBytes2(file.size)})`);
+        } catch (e) {
+          console.error(`\u{1F9F9} \u5220\u9664\u6587\u4EF6\u5931\u8D25: ${file.path}`, e);
+        }
+      }
+    }
+    removeEmptyDirectories(UPLOAD_DIR2);
+    stats.freedSpace = formatBytes2(stats.freedBytes);
+    if (stats.deletedCount > 0) {
+      console.log(`\u{1F9F9} \u6E05\u7406\u5B8C\u6210: \u5220\u9664 ${stats.deletedCount} \u4E2A\u5B64\u513F\u6587\u4EF6\uFF0C\u91CA\u653E ${stats.freedSpace}`);
+    } else {
+      console.log("\u{1F9F9} \u626B\u63CF\u5B8C\u6210: \u6CA1\u6709\u53D1\u73B0\u5B64\u513F\u6587\u4EF6");
+    }
+  } catch (error) {
+    console.error("\u{1F9F9} \u5B64\u513F\u6587\u4EF6\u6E05\u7406\u5931\u8D25:", error);
+    throw error;
+  }
+  return stats;
+}
+var cleanupInterval = null;
+function startPeriodicCleanup(intervalMs = 60 * 60 * 1e3) {
+  if (!isAutoCleanupEnabled()) {
+    console.log("\u{1F9F9} \u81EA\u52A8\u5B64\u513F\u6587\u4EF6\u6E05\u7406\u5DF2\u5173\u95ED (AUTO_CLEANUP_ORPHANS=false)");
+    return;
+  }
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+  }
+  cleanupInterval = setInterval(async () => {
+    console.log("\u{1F9F9} \u6267\u884C\u5B9A\u671F\u5B64\u513F\u6587\u4EF6\u6E05\u7406...");
+    try {
+      const stats = await cleanupOrphanFiles();
+      if (stats.deletedCount > 0) {
+        console.log(`\u{1F9F9} \u5B9A\u671F\u6E05\u7406\u5B8C\u6210: \u5220\u9664 ${stats.deletedCount} \u4E2A\u6587\u4EF6\uFF0C\u91CA\u653E ${stats.freedSpace}`);
+      }
+    } catch (e) {
+      console.error("\u{1F9F9} \u5B9A\u671F\u6E05\u7406\u5931\u8D25:", e);
+    }
+  }, intervalMs);
+  console.log(`\u{1F9F9} \u5DF2\u542F\u52A8\u5B9A\u671F\u6E05\u7406\u4EFB\u52A1 (\u95F4\u9694: ${intervalMs / 1e3 / 60} \u5206\u949F)`);
+}
+function stopPeriodicCleanup() {
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+    cleanupInterval = null;
+    console.log("\u{1F9F9} \u5DF2\u505C\u6B62\u5B9A\u671F\u6E05\u7406\u4EFB\u52A1");
+  }
+}
+
+// src/services/telegramCommands.ts
 var checkDiskSpace = checkDiskSpaceModule.default || checkDiskSpaceModule;
 var DOWNLOAD_WORKER_OPTIONS = [4, 8, 12, 16];
+var ON_VALUES = /* @__PURE__ */ new Set(["1", "true", "yes", "on"]);
 function normalizeDownloadWorkers(value) {
   const parsed = parseInt(String(value ?? "4"), 10);
   return DOWNLOAD_WORKER_OPTIONS.includes(parsed) ? parsed : 4;
@@ -3626,6 +3841,92 @@ function buildDownloadWorkersText(current) {
     "- `12` / `16`\uFF1A\u6FC0\u8FDB\u6A21\u5F0F\uFF0C\u53EF\u80FD\u89E6\u53D1\u98CE\u63A7\u3001\u65AD\u6D41\u3001\u9650\u901F\uFF0C\u751A\u81F3\u8D26\u53F7\u98CE\u9669\uFF0C\u9700\u8981\u4E8C\u6B21\u786E\u8BA4"
   ].join("\n");
 }
+function isOn(value, defaultValue = true) {
+  if (value === void 0 || value === null || value === "") return defaultValue;
+  return ON_VALUES.has(String(value).toLowerCase());
+}
+async function getPathRuleSettings() {
+  const bySource = await getSetting("storage_path_by_source", process.env.STORAGE_PATH_BY_SOURCE || "true");
+  const byType = await getSetting("storage_path_by_type", process.env.STORAGE_PATH_BY_TYPE || "true");
+  return { bySource: isOn(bySource), byType: isOn(byType) };
+}
+function buildPathRulesKeyboard(rules) {
+  return new Api2.ReplyInlineMarkup({
+    rows: [
+      new Api2.KeyboardButtonRow({
+        buttons: [
+          new Api2.KeyboardButtonCallback({ text: `${rules.bySource ? "\u2705" : "\u2B1C"} \u6309\u6765\u6E90/\u9891\u9053`, data: Buffer.from("pr_toggle_source") }),
+          new Api2.KeyboardButtonCallback({ text: `${rules.byType ? "\u2705" : "\u2B1C"} \u6309\u7C7B\u578B`, data: Buffer.from("pr_toggle_type") })
+        ]
+      })
+    ]
+  });
+}
+function buildPathRulesText(rules) {
+  const example = [rules.bySource ? "telegram/\u8D44\u6E90\u4E0B\u8F7D" : null, rules.byType ? "archives" : null].filter(Boolean).join("/") || "\u6587\u4EF6\u540D\u76F4\u63A5\u4FDD\u5B58";
+  return [
+    "\u{1F4C1} **\u4FDD\u5B58\u8DEF\u5F84\u89C4\u5219**",
+    "",
+    `\u6309\u6765\u6E90/\u9891\u9053\uFF1A${rules.bySource ? "\u2705 \u5F00\u542F" : "\u2B1C \u5173\u95ED"}`,
+    `\u6309\u6587\u4EF6\u7C7B\u578B\uFF1A${rules.byType ? "\u2705 \u5F00\u542F" : "\u2B1C \u5173\u95ED"}`,
+    "",
+    `\u793A\u4F8B\uFF1A${example}`,
+    "",
+    "\u8BF4\u660E\uFF1A\u4FEE\u6539\u540E\u53EA\u5F71\u54CD\u540E\u7EED\u65B0\u4E0A\u4F20/\u8F6C\u5B58\u6587\u4EF6\u3002"
+  ].join("\n");
+}
+function buildDuplicateModeKeyboard(mode) {
+  return new Api2.ReplyInlineMarkup({
+    rows: [
+      new Api2.KeyboardButtonRow({
+        buttons: [
+          new Api2.KeyboardButtonCallback({ text: `${mode === "skip" ? "\u2705" : "\u2B1C"} \u8DF3\u8FC7\u91CD\u590D`, data: Buffer.from("dm_set_skip") }),
+          new Api2.KeyboardButtonCallback({ text: `${mode === "copy" ? "\u2705" : "\u2B1C"} \u751F\u6210\u526F\u672C`, data: Buffer.from("dm_set_copy") })
+        ]
+      })
+    ]
+  });
+}
+function buildDuplicateModeText(mode) {
+  return [
+    "\u{1F9EC} **\u91CD\u590D\u6587\u4EF6\u5904\u7406**",
+    "",
+    `\u5F53\u524D\u6A21\u5F0F\uFF1A${mode === "skip" ? "\u8DF3\u8FC7\u91CD\u590D" : "\u751F\u6210\u526F\u672C"}`,
+    "",
+    "- \u8DF3\u8FC7\u91CD\u590D\uFF1A\u540C\u540D + \u540C\u76EE\u5F55 + \u540C\u5927\u5C0F\u65F6\u4E0D\u518D\u4FDD\u5B58",
+    "- \u751F\u6210\u526F\u672C\uFF1A\u81EA\u52A8\u6539\u540D\u4E3A `\u6587\u4EF6 (1).ext` \u4FDD\u7559\u526F\u672C",
+    "",
+    "\u8BF4\u660E\uFF1A\u4FEE\u6539\u540E\u53EA\u5F71\u54CD\u540E\u7EED\u65B0\u4E0A\u4F20/\u8F6C\u5B58\u6587\u4EF6\u3002"
+  ].join("\n");
+}
+async function getCleanupEnabledSetting() {
+  const value = await getSetting("auto_cleanup_orphans", process.env.AUTO_CLEANUP_ORPHANS || "true");
+  return isOn(value, true);
+}
+function buildCleanupSettingsKeyboard(enabled) {
+  return new Api2.ReplyInlineMarkup({
+    rows: [
+      new Api2.KeyboardButtonRow({
+        buttons: [
+          new Api2.KeyboardButtonCallback({ text: `${!enabled ? "\u2705" : "\u2B1C"} \u5173\u95ED\u81EA\u52A8\u6E05\u7406`, data: Buffer.from("cs_set_off") }),
+          new Api2.KeyboardButtonCallback({ text: `${enabled ? "\u2705" : "\u2B1C"} \u5F00\u542F\u81EA\u52A8\u6E05\u7406`, data: Buffer.from("cs_set_on") })
+        ]
+      })
+    ]
+  });
+}
+function buildCleanupSettingsText(enabled) {
+  return [
+    "\u{1F9F9} **\u81EA\u52A8\u6E05\u7406\u8BBE\u7F6E**",
+    "",
+    `\u5F53\u524D\u72B6\u6001\uFF1A${enabled ? "\u2705 \u5F00\u542F" : "\u2B1C \u5173\u95ED"}`,
+    "",
+    "\u5F00\u542F\u540E\u4F1A\u81EA\u52A8\u6E05\u7406\u672C\u5730 uploads \u4E2D\u672A\u767B\u8BB0\u5230\u6570\u636E\u5E93\u7684\u5B64\u513F\u6587\u4EF6\u3002",
+    "\u5982\u679C\u4F60\u4E3B\u8981\u4F7F\u7528\u672C\u5730\u5B58\u50A8\uFF0C\u5EFA\u8BAE\u70B9\u201C\u5173\u95ED\u81EA\u52A8\u6E05\u7406\u201D\uFF0C\u9632\u6B62\u9ED8\u8BA4\u5220\u9664\u6587\u4EF6\u3002",
+    "",
+    "\u8BF4\u660E\uFF1A\u53EA\u5F71\u54CD\u672C\u5730 uploads \u5B64\u513F\u6587\u4EF6\uFF0C\u4E0D\u4F1A\u4E3B\u52A8\u6E05\u7406\u7B2C\u4E09\u65B9\u4E91\u5B58\u50A8\u3002"
+  ].join("\n");
+}
 async function handleStart(message, senderId) {
   if (isAuthenticated(senderId)) {
     await message.reply({ message: buildWelcomeBack() });
@@ -3669,20 +3970,28 @@ async function handleStorage(message) {
 async function handleList(message, args) {
   try {
     let limit = 10;
+    let page = 1;
     if (args.length > 0) {
       const parsed = parseInt(args[0]);
       if (!isNaN(parsed) && parsed > 0 && parsed <= 50) {
         limit = parsed;
       }
     }
+    if (args.length > 1) {
+      const parsedPage = parseInt(args[1]);
+      if (!isNaN(parsedPage) && parsedPage > 0) {
+        page = parsedPage;
+      }
+    }
     const activeAccountId = storageManager.getActiveAccountId();
+    const offset = (page - 1) * limit;
     const result = await query(`
             SELECT id, name, type, size, folder, created_at 
             FROM files 
-            WHERE storage_account_id IS NOT DISTINCT FROM $2
+            WHERE storage_account_id IS NOT DISTINCT FROM $3
             ORDER BY created_at DESC 
-            LIMIT $1
-        `, [limit, activeAccountId]);
+            LIMIT $1 OFFSET $2
+        `, [limit, offset, activeAccountId]);
     if (result.rows.length === 0) {
       await message.reply({ message: MSG.EMPTY_FILES });
       return;
@@ -3697,25 +4006,36 @@ async function handleList(message, args) {
 async function handleDelete(message, args) {
   if (args.length === 0) {
     await message.reply({
-      message: "\u274C \u8BF7\u63D0\u4F9B\u81F3\u5C11 4 \u4F4D\u6587\u4EF6 ID\n\n\u7528\u6CD5: /delete <ID\u524D\u7F00>\n\u793A\u4F8B: /delete a1b2c3d4"
+      message: "\u274C \u8BF7\u63D0\u4F9B\u8981\u5220\u9664\u7684\u6587\u4EF6\n\n\u7528\u6CD5\uFF1A\n/delete <\u5217\u8868\u5E8F\u53F7>  \u4F8B\u5982 /delete 1\n/delete <ID\u524D\u7F00>  \u4F8B\u5982 /delete a1b2c3d4\n\n\u63D0\u793A\uFF1A\u5148\u53D1\u9001 /list \u67E5\u770B\u6587\u4EF6 ID \u548C\u5E8F\u53F7\u3002"
     });
     return;
   }
-  const fileIdPrefix = args[0].trim();
-  if (fileIdPrefix.length < 4) {
-    await message.reply({ message: "\u274C \u8BF7\u63D0\u4F9B\u81F3\u5C11 4 \u4F4D\u6587\u4EF6 ID" });
-    return;
-  }
+  const selector = args[0].trim();
   try {
     const activeAccountId = storageManager.getActiveAccountId();
-    const result = await query(`
-            SELECT id, name, path, thumbnail_path, source, storage_account_id 
-            FROM files 
-            WHERE id::text LIKE $1 AND storage_account_id IS NOT DISTINCT FROM $2
-            LIMIT 1
-        `, [fileIdPrefix + "%", activeAccountId]);
+    let result;
+    if (/^\d+$/.test(selector) && Number(selector) >= 1 && Number(selector) <= 50) {
+      result = await query(`
+                SELECT id, name, path, thumbnail_path, source, storage_account_id
+                FROM files
+                WHERE storage_account_id IS NOT DISTINCT FROM $2
+                ORDER BY created_at DESC
+                LIMIT 1 OFFSET $1
+            `, [Number(selector) - 1, activeAccountId]);
+    } else {
+      if (selector.length < 4) {
+        await message.reply({ message: "\u274C ID \u524D\u7F00\u81F3\u5C11\u9700\u8981 4 \u4F4D\u3002\u4E5F\u53EF\u4EE5\u7528 /delete 1 \u5220\u9664 /list \u4E2D\u7B2C 1 \u4E2A\u6587\u4EF6\u3002" });
+        return;
+      }
+      result = await query(`
+                SELECT id, name, path, thumbnail_path, source, storage_account_id
+                FROM files
+                WHERE id::text LIKE $1 AND storage_account_id IS NOT DISTINCT FROM $2
+                LIMIT 1
+            `, [selector + "%", activeAccountId]);
+    }
     if (result.rows.length === 0) {
-      await message.reply({ message: `\u274C \u672A\u627E\u5230 ID \u4EE5 "${fileIdPrefix}" \u5F00\u5934\u7684\u6587\u4EF6` });
+      await message.reply({ message: /^\d+$/.test(selector) ? `\u274C \u672A\u627E\u5230\u5217\u8868\u5E8F\u53F7 ${selector} \u5BF9\u5E94\u7684\u6587\u4EF6` : `\u274C \u672A\u627E\u5230 ID \u4EE5 "${selector}" \u5F00\u5934\u7684\u6587\u4EF6` });
       return;
     }
     const file = result.rows[0];
@@ -3787,6 +4107,101 @@ async function handleDownloadWorkers(message) {
   } catch (error) {
     console.error("\u{1F916} \u83B7\u53D6\u5E76\u53D1\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25:", error);
     await message.reply({ message: `\u274C \u83B7\u53D6\u5E76\u53D1\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25: ${error.message}` });
+  }
+}
+async function handlePathRules(message) {
+  const rules = await getPathRuleSettings();
+  await message.reply({
+    message: buildPathRulesText(rules),
+    buttons: buildPathRulesKeyboard(rules)
+  });
+}
+async function handlePathRulesCallback(client2, update, data) {
+  const userId = update.userId.toJSNumber();
+  if (!isAuthenticated(userId)) {
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+    return;
+  }
+  try {
+    const rules = await getPathRuleSettings();
+    if (data === "pr_toggle_source") {
+      rules.bySource = !rules.bySource;
+      await setSetting("storage_path_by_source", String(rules.bySource));
+    } else if (data === "pr_toggle_type") {
+      rules.byType = !rules.byType;
+      await setSetting("storage_path_by_type", String(rules.byType));
+    }
+    await client2.editMessage(update.peer, {
+      message: update.msgId,
+      text: buildPathRulesText(rules),
+      buttons: buildPathRulesKeyboard(rules)
+    });
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u4FDD\u5B58\u8DEF\u5F84\u89C4\u5219\u5DF2\u66F4\u65B0" }));
+  } catch (error) {
+    console.error("\u{1F916} \u8BBE\u7F6E\u4FDD\u5B58\u8DEF\u5F84\u89C4\u5219\u5931\u8D25:", error);
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u8BBE\u7F6E\u5931\u8D25: ${error.message}`, alert: true }));
+  }
+}
+async function handleDuplicateMode(message) {
+  const mode = await getDuplicateMode();
+  await message.reply({
+    message: buildDuplicateModeText(mode),
+    buttons: buildDuplicateModeKeyboard(mode)
+  });
+}
+async function handleDuplicateModeCallback(client2, update, data) {
+  const userId = update.userId.toJSNumber();
+  if (!isAuthenticated(userId)) {
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+    return;
+  }
+  try {
+    const match = data.match(/^dm_set_(skip|copy)$/);
+    if (!match) return;
+    const mode = match[1];
+    await setSetting("duplicate_file_mode", mode);
+    await client2.editMessage(update.peer, {
+      message: update.msgId,
+      text: buildDuplicateModeText(mode),
+      buttons: buildDuplicateModeKeyboard(mode)
+    });
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u5DF2\u8BBE\u7F6E\u4E3A${mode === "skip" ? "\u8DF3\u8FC7\u91CD\u590D" : "\u751F\u6210\u526F\u672C"}` }));
+  } catch (error) {
+    console.error("\u{1F916} \u8BBE\u7F6E\u91CD\u590D\u6587\u4EF6\u5904\u7406\u5931\u8D25:", error);
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u8BBE\u7F6E\u5931\u8D25: ${error.message}`, alert: true }));
+  }
+}
+async function handleCleanupSettings(message) {
+  const enabled = await getCleanupEnabledSetting();
+  await message.reply({
+    message: buildCleanupSettingsText(enabled),
+    buttons: buildCleanupSettingsKeyboard(enabled)
+  });
+}
+async function handleCleanupSettingsCallback(client2, update, data) {
+  const userId = update.userId.toJSNumber();
+  if (!isAuthenticated(userId)) {
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+    return;
+  }
+  try {
+    const enabled = data === "cs_set_on";
+    await setSetting("auto_cleanup_orphans", String(enabled));
+    process.env.AUTO_CLEANUP_ORPHANS = String(enabled);
+    if (enabled) {
+      startPeriodicCleanup();
+    } else {
+      stopPeriodicCleanup();
+    }
+    await client2.editMessage(update.peer, {
+      message: update.msgId,
+      text: buildCleanupSettingsText(enabled),
+      buttons: buildCleanupSettingsKeyboard(enabled)
+    });
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: enabled ? "\u5DF2\u5F00\u542F\u81EA\u52A8\u6E05\u7406" : "\u5DF2\u5173\u95ED\u81EA\u52A8\u6E05\u7406" }));
+  } catch (error) {
+    console.error("\u{1F916} \u8BBE\u7F6E\u81EA\u52A8\u6E05\u7406\u5931\u8D25:", error);
+    await client2.invoke(new Api2.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u8BBE\u7F6E\u5931\u8D25: ${error.message}`, alert: true }));
   }
 }
 async function handleDownloadWorkersCallback(client2, update, data) {
@@ -3869,7 +4284,7 @@ async function handleDownloadWorkersCallback(client2, update, data) {
 init_db();
 init_storage();
 import fs8 from "fs";
-import path9 from "path";
+import path10 from "path";
 import { spawn } from "child_process";
 import os2 from "os";
 var YtDlpQueue = class {
@@ -3914,7 +4329,7 @@ function selectPrimaryOutputFile(taskDir) {
   const entries = fs8.readdirSync(taskDir, { withFileTypes: true });
   const files = entries.filter((e) => e.isFile()).map((e) => ({
     name: e.name,
-    fullPath: path9.join(taskDir, e.name)
+    fullPath: path10.join(taskDir, e.name)
   })).filter((f) => !f.name.endsWith(".part") && !f.name.endsWith(".ytdl") && !f.name.endsWith(".json") && !f.name.endsWith(".tmp")).map((f) => ({
     ...f,
     size: fs8.existsSync(f.fullPath) ? fs8.statSync(f.fullPath).size : 0
@@ -3924,7 +4339,7 @@ function selectPrimaryOutputFile(taskDir) {
 }
 async function runYtDlpDownload(url, taskDir) {
   ensureDir(taskDir);
-  const outputTemplate = path9.join(taskDir, "%(title).200s-%(id)s.%(ext)s");
+  const outputTemplate = path10.join(taskDir, "%(title).200s-%(id)s.%(ext)s");
   const args = [
     "--no-playlist",
     "--newline",
@@ -3965,12 +4380,21 @@ async function uploadDownloadedFile(localFilePath, originalFileName) {
   const provider = storageManager.getProvider();
   const activeAccountId = storageManager.getActiveAccountId();
   const safeName = sanitizeFilename(originalFileName);
-  const ext = path9.extname(safeName) || path9.extname(localFilePath) || "";
-  const storedName = await getUniqueStoredName(safeName, "ytdlp", activeAccountId);
+  const ext = path10.extname(safeName) || path10.extname(localFilePath) || "";
   const mimeType = getMimeTypeFromFilename(safeName);
   const fileType = getFileType(mimeType);
+  const storageRules = await getStoragePathRules();
+  const folder = buildStorageFolderWithRules({ source: "ytdlp", mimeType, fileName: safeName }, storageRules) || "ytdlp";
+  const storedName = await getUniqueStoredName(safeName, folder, activeAccountId);
   const stats = await fs8.promises.stat(localFilePath);
   const size = stats.size;
+  const duplicateMode = await getDuplicateMode();
+  if (duplicateMode === "skip") {
+    const duplicate = await findDuplicateFile(safeName, folder, size, activeAccountId);
+    if (duplicate) {
+      return { finalPath: duplicate.path || "", providerName: provider.name, size, storedName: duplicate.name, folder };
+    }
+  }
   let thumbnailPath = null;
   let dimensions = {};
   try {
@@ -3978,15 +4402,11 @@ async function uploadDownloadedFile(localFilePath, originalFileName) {
     dimensions = await getImageDimensions(localFilePath, mimeType);
   } catch {
   }
-  let finalPath = localFilePath;
-  if (provider.name !== "local") {
-    finalPath = await provider.saveFile(localFilePath, storedName, mimeType);
-    try {
-      if (fs8.existsSync(localFilePath)) await fs8.promises.unlink(localFilePath);
-    } catch {
-    }
+  let finalPath = await provider.saveFile(localFilePath, storedName, mimeType, folder);
+  try {
+    if (fs8.existsSync(localFilePath)) await fs8.promises.unlink(localFilePath);
+  } catch {
   }
-  const folder = "ytdlp";
   await query(`
         INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -4000,9 +4420,9 @@ async function handleYtDlpCommand(message, url) {
     status: "pending",
     createdAt: Date.now()
   };
-  const workBaseDir = path9.isAbsolute(YTDLP_WORK_DIR) ? YTDLP_WORK_DIR : path9.join(process.cwd(), YTDLP_WORK_DIR);
+  const workBaseDir = path10.isAbsolute(YTDLP_WORK_DIR) ? YTDLP_WORK_DIR : path10.join(process.cwd(), YTDLP_WORK_DIR);
   ensureDir(workBaseDir);
-  const taskDir = path9.join(workBaseDir, task.id);
+  const taskDir = path10.join(workBaseDir, task.id);
   await message.reply({ message: `\u23EC \u5F00\u59CB\u89E3\u6790\u5E76\u4E0B\u8F7D...
 Task: ${task.id}` });
   ytDlpQueue.add(async () => {
@@ -4214,7 +4634,7 @@ async function initTelegramBot() {
     console.error("\u{1F916} Telegram Bot \u540C\u6B65\u5B58\u50A8\u914D\u7F6E\u5931\u8D25:", e);
   }
   try {
-    const sessionDir = path10.dirname(SESSION_FILE);
+    const sessionDir = path11.dirname(SESSION_FILE);
     if (!fs9.existsSync(sessionDir)) {
       fs9.mkdirSync(sessionDir, { recursive: true });
     }
@@ -4263,6 +4683,9 @@ async function initTelegramBot() {
           new Api3.BotCommand({ command: "tasks", description: "\u67E5\u770B\u4EFB\u52A1\u72B6\u6001" }),
           new Api3.BotCommand({ command: "stop_tasks", description: "\u5F3A\u5236\u505C\u6B62\u4E0B\u8F7D\u4EFB\u52A1" }),
           new Api3.BotCommand({ command: "download_workers", description: "\u8BBE\u7F6E Telegram \u5E76\u53D1\u4E0B\u8F7D" }),
+          new Api3.BotCommand({ command: "path_rules", description: "\u8BBE\u7F6E\u4FDD\u5B58\u8DEF\u5F84\u89C4\u5219" }),
+          new Api3.BotCommand({ command: "duplicate_mode", description: "\u8BBE\u7F6E\u91CD\u590D\u6587\u4EF6\u5904\u7406" }),
+          new Api3.BotCommand({ command: "cleanup_settings", description: "\u8BBE\u7F6E\u81EA\u52A8\u6E05\u7406\u5F00\u5173" }),
           new Api3.BotCommand({ command: "help", description: "\u663E\u793A\u9884\u89C8\u5E2E\u52A9" })
         ]
       }));
@@ -4271,20 +4694,32 @@ async function initTelegramBot() {
       console.error("\u{1F916} \u66F4\u65B0 Bot \u547D\u4EE4\u83DC\u5355\u5931\u8D25:", e);
     }
     try {
-      const stats = await cleanupOrphanFiles();
-      if (stats.deletedCount > 0) {
-        console.log(`\u{1F9F9} \u542F\u52A8\u6E05\u7406: \u5220\u9664\u4E86 ${stats.deletedCount} \u4E2A\u5B64\u513F\u6587\u4EF6\uFF0C\u91CA\u653E ${stats.freedSpace}`);
-        for (const userId of authenticatedUsers.keys()) {
-          try {
-            await client.sendMessage(userId, {
-              message: buildCleanupNotice(stats.deletedCount, stats.freedSpace)
-            });
-          } catch (e) {
-          }
-        }
+      const cleanupSetting = await query("SELECT value FROM system_settings WHERE key = $1", ["auto_cleanup_orphans"]);
+      if (cleanupSetting.rows[0]?.value !== void 0) {
+        process.env.AUTO_CLEANUP_ORPHANS = String(cleanupSetting.rows[0].value);
       }
     } catch (e) {
-      console.error("\u{1F9F9} \u542F\u52A8\u6E05\u7406\u5931\u8D25:", e);
+      console.warn("\u{1F9F9} \u8BFB\u53D6\u81EA\u52A8\u6E05\u7406\u8BBE\u7F6E\u5931\u8D25\uFF0C\u4F7F\u7528\u73AF\u5883\u53D8\u91CF\u9ED8\u8BA4\u503C:", e);
+    }
+    if (isAutoCleanupEnabled()) {
+      try {
+        const stats = await cleanupOrphanFiles();
+        if (stats.deletedCount > 0) {
+          console.log(`\u{1F9F9} \u542F\u52A8\u6E05\u7406: \u5220\u9664\u4E86 ${stats.deletedCount} \u4E2A\u5B64\u513F\u6587\u4EF6\uFF0C\u91CA\u653E ${stats.freedSpace}`);
+          for (const userId of authenticatedUsers.keys()) {
+            try {
+              await client.sendMessage(userId, {
+                message: buildCleanupNotice(stats.deletedCount, stats.freedSpace)
+              });
+            } catch (e) {
+            }
+          }
+        }
+      } catch (e) {
+        console.error("\u{1F9F9} \u542F\u52A8\u6E05\u7406\u5931\u8D25:", e);
+      }
+    } else {
+      console.log("\u{1F9F9} \u542F\u52A8\u5B64\u513F\u6E05\u7406\u5DF2\u8DF3\u8FC7\uFF1AAUTO_CLEANUP_ORPHANS=false");
     }
     startPeriodicCleanup();
     client.addEventHandler(async (event) => {
@@ -4319,7 +4754,7 @@ async function initTelegramBot() {
             const qrDataUrl = await generateOTPAuthUrl();
             const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, "");
             const buffer = Buffer.from(base64Data, "base64");
-            const tempPath = path10.join(process.cwd(), `temp_qr_${chatId}.png`);
+            const tempPath = path11.join(process.cwd(), `temp_qr_${chatId}.png`);
             fs9.writeFileSync(tempPath, buffer);
             const qrMessage = await client.sendFile(chatId, {
               file: tempPath,
@@ -4417,6 +4852,30 @@ async function initTelegramBot() {
           await handleDownloadWorkers(message);
           return;
         }
+        if (text === "/path_rules" || text === "/path" || text === "/save_rules") {
+          if (!isAuthenticated(senderId)) {
+            await message.reply({ message: MSG.AUTH_REQUIRED });
+            return;
+          }
+          await handlePathRules(message);
+          return;
+        }
+        if (text === "/duplicate_mode" || text === "/duplicate" || text === "/dup") {
+          if (!isAuthenticated(senderId)) {
+            await message.reply({ message: MSG.AUTH_REQUIRED });
+            return;
+          }
+          await handleDuplicateMode(message);
+          return;
+        }
+        if (text === "/cleanup_settings" || text === "/cleanup") {
+          if (!isAuthenticated(senderId)) {
+            await message.reply({ message: MSG.AUTH_REQUIRED });
+            return;
+          }
+          await handleCleanupSettings(message);
+          return;
+        }
         const userState = userStates.get(senderId);
         if (userState && (userState.state === "WAITING_2FA_SETUP" /* WAITING_2FA_SETUP */ || userState.state === "WAITING_2FA_LOGIN" /* WAITING_2FA_LOGIN */)) {
           const cleanText = text.replace(/[\s-]/g, "");
@@ -4462,6 +4921,8 @@ async function initTelegramBot() {
     }, new NewMessage({ incoming: true }));
     client.addEventHandler(async (update) => {
       if (update.className === "UpdateBotCallbackQuery") {
+        if (!client) return;
+        const activeClient = client;
         const callbackUpdate = update;
         const data = Buffer.from(callbackUpdate.data || []).toString("utf-8");
         if (data.startsWith("pwd_")) {
@@ -4473,7 +4934,19 @@ async function initTelegramBot() {
           return;
         }
         if (data.startsWith("dw_")) {
-          await handleDownloadWorkersCallback(client, callbackUpdate, data);
+          await handleDownloadWorkersCallback(activeClient, callbackUpdate, data);
+          return;
+        }
+        if (data.startsWith("pr_")) {
+          await handlePathRulesCallback(activeClient, callbackUpdate, data);
+          return;
+        }
+        if (data.startsWith("dm_")) {
+          await handleDuplicateModeCallback(activeClient, callbackUpdate, data);
+          return;
+        }
+        if (data.startsWith("cs_")) {
+          await handleCleanupSettingsCallback(activeClient, callbackUpdate, data);
           return;
         }
       }
@@ -4755,8 +5228,8 @@ function requireAuthOrSignedUrl(req, res, next) {
 
 // src/routes/files.ts
 var router2 = Router2();
-var UPLOAD_DIR3 = path11.resolve(process.env.UPLOAD_DIR || "./data/uploads");
-var THUMBNAIL_DIR3 = path11.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var UPLOAD_DIR3 = path12.resolve(process.env.UPLOAD_DIR || "./data/uploads");
+var THUMBNAIL_DIR3 = path12.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
 router2.get("/", async (_req, res) => {
   try {
     const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
@@ -4934,7 +5407,7 @@ router2.get("/:id([0-9a-fA-F-]{36})/preview", async (req, res) => {
         return res.status(500).json({ error: "\u83B7\u53D6\u9884\u89C8\u5931\u8D25" });
       }
     }
-    const filePath = file.path || path11.join(UPLOAD_DIR3, file.stored_name);
+    const filePath = file.path || path12.join(UPLOAD_DIR3, file.stored_name);
     if (!fs10.existsSync(filePath)) {
       return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728\u4E8E\u670D\u52A1\u5668" });
     }
@@ -5028,7 +5501,7 @@ router2.get("/:id([0-9a-fA-F-]{36})/download", async (req, res) => {
         return res.status(500).json({ error: "\u65E0\u6CD5\u4E0B\u8F7D\u6587\u4EF6" });
       }
     }
-    const filePath = file.path || path11.join(UPLOAD_DIR3, file.stored_name);
+    const filePath = file.path || path12.join(UPLOAD_DIR3, file.stored_name);
     console.log(`[Download] Serving local file: ${filePath}`);
     if (!fs10.existsSync(filePath)) {
       console.log(`[Download] File system path not found: ${filePath}`);
@@ -5055,7 +5528,7 @@ router2.get("/:id([0-9a-fA-F-]{36})/thumbnail", async (req, res) => {
     if (!file.thumbnail_path) {
       return res.status(404).json({ error: "\u65E0\u7F29\u7565\u56FE" });
     }
-    const thumbPath = path11.join(THUMBNAIL_DIR3, path11.basename(file.thumbnail_path));
+    const thumbPath = path12.join(THUMBNAIL_DIR3, path12.basename(file.thumbnail_path));
     if (!fs10.existsSync(thumbPath)) {
       return res.status(404).json({ error: "\u7F29\u7565\u56FE\u6587\u4EF6\u4E0D\u5B58\u5728" });
     }
@@ -5087,13 +5560,13 @@ router2.delete("/:id([0-9a-fA-F-]{36})", async (req, res) => {
         console.error(`${file.source} \u6587\u4EF6\u5220\u9664\u5931\u8D25 (\u53EF\u80FD\u5DF2\u4E0D\u5B58\u5728):`, err);
       }
     } else {
-      const filePath = file.path || path11.join(UPLOAD_DIR3, file.stored_name);
+      const filePath = file.path || path12.join(UPLOAD_DIR3, file.stored_name);
       if (fs10.existsSync(filePath)) {
         fs10.unlinkSync(filePath);
       }
     }
     if (file.thumbnail_path) {
-      const thumbPath = path11.join(THUMBNAIL_DIR3, path11.basename(file.thumbnail_path));
+      const thumbPath = path12.join(THUMBNAIL_DIR3, path12.basename(file.thumbnail_path));
       if (fs10.existsSync(thumbPath)) {
         fs10.unlinkSync(thumbPath);
       }
@@ -5134,13 +5607,13 @@ router2.post("/batch-delete", async (req, res) => {
           const provider = storageManager2.getProvider(`${file.source}:${file.storage_account_id}`);
           await provider.deleteFile(file.path);
         } else {
-          const filePath = file.path || path11.join(UPLOAD_DIR3, file.stored_name);
+          const filePath = file.path || path12.join(UPLOAD_DIR3, file.stored_name);
           if (fs10.existsSync(filePath)) {
             fs10.unlinkSync(filePath);
           }
         }
         if (file.thumbnail_path) {
-          const thumbPath = path11.join(THUMBNAIL_DIR3, path11.basename(file.thumbnail_path));
+          const thumbPath = path12.join(THUMBNAIL_DIR3, path12.basename(file.thumbnail_path));
           if (fs10.existsSync(thumbPath)) {
             fs10.unlinkSync(thumbPath);
           }
@@ -5365,7 +5838,7 @@ init_db();
 import { Router as Router3 } from "express";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
-import path12 from "path";
+import path13 from "path";
 import fs11 from "fs";
 
 // src/middleware/apiKey.ts
@@ -5423,7 +5896,7 @@ function decodeFilename(filename) {
   }
   return filename;
 }
-var TEMP_DIR = path12.join(process.cwd(), "data", "temp");
+var TEMP_DIR = path13.join(process.cwd(), "data", "temp");
 if (!fs11.existsSync(TEMP_DIR)) {
   fs11.mkdirSync(TEMP_DIR, { recursive: true });
 }
@@ -5432,7 +5905,7 @@ var storage = multer.diskStorage({
     cb(null, TEMP_DIR);
   },
   filename: (_req, file, cb) => {
-    const ext = path12.extname(file.originalname);
+    const ext = path13.extname(file.originalname);
     const storedName = `${uuidv4()}${ext}`;
     cb(null, storedName);
   }
@@ -5453,9 +5926,11 @@ var handleUpload = async (req, res, source = "web") => {
   const originalName = decodeFilename(file.originalname);
   const mimeType = file.mimetype;
   const size = file.size;
-  const tempPath = path12.resolve(file.path);
+  const tempPath = path13.resolve(file.path);
   const activeAccountId = storageManager.getActiveAccountId();
-  const storedName = await getUniqueStoredName(originalName, folder || null, activeAccountId);
+  const storageRules = await getStoragePathRules();
+  const storageFolder = buildStorageFolderWithRules({ source, folder: folder || null, mimeType, fileName: originalName }, storageRules);
+  const storedName = await getUniqueStoredName(originalName, storageFolder, activeAccountId);
   console.log(`[Upload] \u{1F4C1} Received file: ${originalName} (${mimeType}, ${size} bytes)`);
   console.log(`[Upload] \u{1F3E0} Local temp path: ${tempPath}`);
   try {
@@ -5464,11 +5939,30 @@ var handleUpload = async (req, res, source = "web") => {
     let thumbnailPath = null;
     let width = null;
     let height = null;
+    const duplicateMode = await getDuplicateMode();
+    if (duplicateMode === "skip") {
+      const duplicate = await findDuplicateFile(originalName, storageFolder, size, activeAccountId);
+      if (duplicate) {
+        if (fs11.existsSync(tempPath)) fs11.unlinkSync(tempPath);
+        return res.json({
+          success: true,
+          skipped: true,
+          reason: "duplicate",
+          file: {
+            id: duplicate.id,
+            name: duplicate.name,
+            size: duplicate.size,
+            folder: duplicate.folder,
+            date: duplicate.created_at
+          }
+        });
+      }
+    }
     if (mimeType.startsWith("image/") || mimeType.startsWith("video/")) {
       try {
         const thumbResult = await generateThumbnail(tempPath, storedName, mimeType);
         if (thumbResult) {
-          thumbnailPath = path12.basename(thumbResult);
+          thumbnailPath = path13.basename(thumbResult);
           console.log(`[Upload] \u2728 Thumbnail generated: ${thumbnailPath}`);
           const dims = await getImageDimensions(tempPath, mimeType);
           width = dims.width;
@@ -5482,7 +5976,7 @@ var handleUpload = async (req, res, source = "web") => {
     }
     let storedPath = "";
     try {
-      storedPath = await provider.saveFile(tempPath, storedName, mimeType);
+      storedPath = await provider.saveFile(tempPath, storedName, mimeType, storageFolder);
     } catch (err) {
       if (fs11.existsSync(tempPath)) fs11.unlinkSync(tempPath);
       throw err;
@@ -5504,7 +5998,7 @@ var handleUpload = async (req, res, source = "web") => {
             (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id) 
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
             RETURNING id, created_at, name, type, size`,
-      [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, width, height, provider.name, folder || null, activeAccountId]
+      [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, width, height, provider.name, storageFolder, activeAccountId]
     );
     const newFile = result.rows[0];
     res.json({
@@ -5539,7 +6033,7 @@ init_db();
 import { Router as Router4 } from "express";
 import checkDiskSpaceModule2 from "check-disk-space";
 import os3 from "os";
-import path13 from "path";
+import path14 from "path";
 import fs12 from "fs";
 import axios3 from "axios";
 var checkDiskSpace2 = checkDiskSpaceModule2.default || checkDiskSpaceModule2;
@@ -5565,7 +6059,7 @@ function getGoogleDriveRedirectUri(req) {
 }
 router4.get("/stats", requireAuth, async (_req, res) => {
   try {
-    const diskPath = os3.platform() === "win32" ? "C:" : path13.resolve(UPLOAD_DIR4);
+    const diskPath = os3.platform() === "win32" ? "C:" : path14.resolve(UPLOAD_DIR4);
     const diskSpace = await checkDiskSpace2(diskPath);
     const result = await query(`
             SELECT 
@@ -5958,7 +6452,7 @@ var storage_default = router4;
 init_db();
 import { Router as Router5 } from "express";
 import { v4 as uuidv42 } from "uuid";
-import path14 from "path";
+import path15 from "path";
 import fs13 from "fs";
 init_storage();
 var router5 = Router5();
@@ -5975,7 +6469,7 @@ setInterval(() => {
   const now = /* @__PURE__ */ new Date();
   uploadSessions.forEach((session, uploadId) => {
     if (now.getTime() - session.createdAt.getTime() > 24 * 60 * 60 * 1e3) {
-      const chunkDir = path14.join(CHUNK_DIR, uploadId);
+      const chunkDir = path15.join(CHUNK_DIR, uploadId);
       if (fs13.existsSync(chunkDir)) {
         fs13.rmSync(chunkDir, { recursive: true });
       }
@@ -6008,7 +6502,7 @@ router5.post("/init", (req, res) => {
       return res.status(400).json({ error: "\u7F3A\u5C11\u5FC5\u8981\u53C2\u6570" });
     }
     const uploadId = uuidv42();
-    const chunkDir = path14.join(CHUNK_DIR, uploadId);
+    const chunkDir = path15.join(CHUNK_DIR, uploadId);
     fs13.mkdirSync(chunkDir, { recursive: true });
     uploadSessions.set(uploadId, {
       uploadId,
@@ -6043,7 +6537,7 @@ router5.post("/chunk", async (req, res) => {
     if (!session) {
       return res.status(404).json({ error: "\u4E0A\u4F20\u4F1A\u8BDD\u4E0D\u5B58\u5728\u6216\u5DF2\u8FC7\u671F" });
     }
-    const chunkPath = path14.join(CHUNK_DIR, uploadId, `chunk_${chunkIndex}`);
+    const chunkPath = path15.join(CHUNK_DIR, uploadId, `chunk_${chunkIndex}`);
     const writeStream = fs13.createWriteStream(chunkPath);
     await new Promise((resolve, reject) => {
       req.pipe(writeStream);
@@ -6086,12 +6580,12 @@ router5.post("/complete", async (req, res) => {
     }
     const activeAccountId = storageManager.getActiveAccountId();
     const storedName = await getUniqueStoredName(session.filename, session.folder || null, activeAccountId);
-    const finalPath = path14.resolve(path14.join(UPLOAD_DIR5, storedName));
+    const finalPath = path15.resolve(path15.join(UPLOAD_DIR5, storedName));
     const writeStream = fs13.createWriteStream(finalPath);
     console.log(`[ChunkedComplete] \u{1F9E9} Merging ${session.totalChunks} chunks for: ${session.filename}`);
     console.log(`[ChunkedComplete] \u{1F3E0} Final temp path: ${finalPath}`);
     for (let i = 0; i < session.totalChunks; i++) {
-      const chunkPath = path14.join(CHUNK_DIR, uploadId, `chunk_${i}`);
+      const chunkPath = path15.join(CHUNK_DIR, uploadId, `chunk_${i}`);
       const chunkData = fs13.readFileSync(chunkPath);
       writeStream.write(chunkData);
     }
@@ -6100,7 +6594,7 @@ router5.post("/complete", async (req, res) => {
       writeStream.on("finish", resolve);
       writeStream.on("error", reject);
     });
-    const chunkDir = path14.join(CHUNK_DIR, uploadId);
+    const chunkDir = path15.join(CHUNK_DIR, uploadId);
     fs13.rmSync(chunkDir, { recursive: true });
     uploadSessions.delete(uploadId);
     let thumbnailPath = null;
@@ -6111,7 +6605,7 @@ router5.post("/complete", async (req, res) => {
         console.log(`[ChunkedComplete] \u{1F5BC}\uFE0F  MIME: ${session.mimeType}, starting generation...`);
         const thumbResult = await generateThumbnail(finalPath, storedName, session.mimeType);
         if (thumbResult) {
-          thumbnailPath = path14.basename(thumbResult);
+          thumbnailPath = path15.basename(thumbResult);
           console.log(`[ChunkedComplete] \u2728 Thumbnail generated: ${thumbnailPath}`);
           const dims = await getImageDimensions(finalPath, session.mimeType);
           width = dims.width;
@@ -6170,7 +6664,7 @@ router5.delete("/:uploadId", (req, res) => {
     const uploadId = req.params.uploadId;
     const session = uploadSessions.get(uploadId);
     if (session) {
-      const chunkDir = path14.join(CHUNK_DIR, uploadId);
+      const chunkDir = path15.join(CHUNK_DIR, uploadId);
       if (fs13.existsSync(chunkDir)) {
         fs13.rmSync(chunkDir, { recursive: true });
       }
@@ -6281,8 +6775,8 @@ app.listen(PORT, async () => {
   console.log(`
 \u{1F680} FlClouds \u540E\u7AEF\u670D\u52A1\u5DF2\u542F\u52A8
 \u{1F4CD} \u7AEF\u53E3: ${PORT}
-\u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path15.resolve(UPLOAD_DIR6)}
-\u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path15.resolve(THUMBNAIL_DIR5)}
+\u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path16.resolve(UPLOAD_DIR6)}
+\u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path16.resolve(THUMBNAIL_DIR5)}
 \u{1F510} \u5BC6\u7801\u4FDD\u62A4: ${passwordProtected ? "\u5DF2\u542F\u7528" : "\u672A\u542F\u7528"}
 \u{1F916} Telegram Bot: ${telegramEnabled ? "\u5DF2\u542F\u7528 (\u652F\u63012GB\u6587\u4EF6)" : "\u672A\u542F\u7528"}
 \u{1F464} Telegram User Download: ${isTelegramUserClientReady() ? "\u5DF2\u542F\u7528" : "\u672A\u542F\u7528"}

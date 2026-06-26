@@ -31,6 +31,11 @@ services:
       - UPLOAD_DIR=/data/uploads
       - THUMBNAIL_DIR=/data/thumbnails
       - CHUNK_DIR=/data/chunks
+      - STORAGE_CLASSIFY_BY_PATH=${STORAGE_CLASSIFY_BY_PATH:-true}
+      - STORAGE_PATH_BY_SOURCE=${STORAGE_PATH_BY_SOURCE:-true}
+      - STORAGE_PATH_BY_TYPE=${STORAGE_PATH_BY_TYPE:-true}
+      - DUPLICATE_FILE_MODE=${DUPLICATE_FILE_MODE:-copy}
+      - AUTO_CLEANUP_ORPHANS=${AUTO_CLEANUP_ORPHANS:-true}
       - VITE_API_URL=${VITE_API_URL:-https://api.example.com}
       - CORS_ORIGIN=${CORS_ORIGIN:-https://cloud.example.com}
       - ACCESS_PASSWORD_HASH=${ACCESS_PASSWORD_HASH:-}

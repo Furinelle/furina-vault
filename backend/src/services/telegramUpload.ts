@@ -19,6 +19,7 @@ import {
     buildSavingFile,
     buildQueuedMessage,
     buildRetryMessage,
+    buildDuplicateSkipped,
     buildSilentModeNotice,
     buildSilentAllTasksComplete,
     buildBatchStatus,
@@ -28,6 +29,8 @@ import {
     type ConsolidatedBatchEntry,
 } from '../utils/telegramMessages.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
+import { buildStorageFolderWithRules, getStoragePathRules, getTelegramChatName } from '../utils/storagePath.js';
+import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const DEFAULT_TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TELEGRAM_DOWNLOAD_WORKERS || '4', 10) || 4));
@@ -543,6 +546,7 @@ interface ActiveUploadEntry {
     error?: string;
     providerName?: string;
     fileType?: string;
+    folder?: string | null;
 }
 
 // 每个 chat 的当前活跃单文件上传列表
@@ -965,10 +969,18 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
         let storedName: string | undefined; // This will hold the unique name for final storage
 
         try {
-            const targetDir = file.targetDir || UPLOAD_DIR; // 使用 file.targetDir
             // 获取唯一的存储文件名
             const activeAccountId = storageManager.getActiveAccountId();
-            storedName = await getUniqueStoredName(file.fileName, queue?.folderName || null, activeAccountId);
+            const chatName = await getTelegramChatName(file.message);
+            const storageRules = await getStoragePathRules();
+            const storageFolder = buildStorageFolderWithRules({
+                source: 'telegram',
+                chatName,
+                folder: queue?.folderName || null,
+                mimeType: file.mimeType,
+                fileName: file.fileName,
+            }, storageRules);
+            storedName = await getUniqueStoredName(file.fileName, storageFolder, activeAccountId);
 
             const downloadSource = await resolveDownloadSource(client, file.message);
             const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, file.fileName, file.targetDir, undefined, signal);
@@ -981,6 +993,17 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
             // storedName 已在上方生成，结果中的 storedName 是原始名，由于我们已手动生成唯一名，忽略
             const actualSize = result.actualSize;
             const fileType = getFileType(file.mimeType);
+            const duplicateMode = await getDuplicateMode();
+            if (duplicateMode === 'skip') {
+                const duplicate = await findDuplicateFile(file.fileName, storageFolder, actualSize, activeAccountId);
+                if (duplicate) {
+                    file.status = 'success';
+                    file.size = actualSize;
+                    file.fileType = fileType;
+                    if (localFilePath && fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+                    return true;
+                }
+            }
 
             // 生成缩略图和获取尺寸
             let thumbnailPath: string | null = null;
@@ -996,24 +1019,21 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
             let finalPath = localFilePath;
             let sourceRef = provider.name;
 
-            if (provider.name !== 'local') {
-                try {
-                    finalPath = await provider.saveFile(localFilePath, storedName, file.mimeType);
-                    if (fs.existsSync(localFilePath)) {
-                        fs.unlinkSync(localFilePath);
-                    }
-                } catch (err) {
-                    console.error('保存文件到存储提供商失败:', err);
-                    throw err;
+            try {
+                finalPath = await provider.saveFile(localFilePath, storedName, file.mimeType, storageFolder);
+                if (fs.existsSync(localFilePath)) {
+                    fs.unlinkSync(localFilePath);
                 }
+                localFilePath = undefined;
+            } catch (err) {
+                console.error('保存文件到存储提供商失败:', err);
+                throw err;
             }
-
-            const folderName = queue?.folderName || null;
 
             await query(`
                 INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            `, [file.fileName, storedName, fileType, file.mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, folderName, activeAccountId]);
+            `, [file.fileName, storedName, fileType, file.mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
 
             file.status = 'success';
             file.size = actualSize;
@@ -1413,8 +1433,16 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
             try {
                 if (signal?.aborted) throw new Error('下载任务已停止');
                 const activeAccountId = storageManager.getActiveAccountId();
+                const chatName = await getTelegramChatName(message);
+                const storageRules = await getStoragePathRules();
+                const storageFolder = buildStorageFolderWithRules({
+                    source: 'telegram',
+                    chatName,
+                    mimeType,
+                    fileName: finalFileName,
+                }, storageRules);
                 // 关键在这里：获取唯一文件名
-                const storedName = await getUniqueStoredName(finalFileName, null, activeAccountId);
+                const storedName = await getUniqueStoredName(finalFileName, storageFolder, activeAccountId);
 
                 const downloadSource = await resolveDownloadSource(client, message);
                 const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, fileName, undefined, onProgress, signal);
@@ -1426,6 +1454,24 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
                 lastLocalPath = localFilePath;
                 const { actualSize } = result;
                 const fileType = getFileType(mimeType);
+                const duplicateMode = await getDuplicateMode();
+                if (duplicateMode === 'skip') {
+                    const duplicate = await findDuplicateFile(finalFileName, storageFolder, actualSize, activeAccountId);
+                    if (duplicate) {
+                        if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+                        lastLocalPath = undefined;
+                        updateUploadPhase(chatIdStr, uploadId, { phase: 'success', size: actualSize, providerName: storageManager.getProvider().name, fileType, folder: storageFolder });
+                        if (statusMsg && !silentSessionMap.has(chatIdStr)) {
+                            await runStatusAction(chatId, async () => {
+                                await client.editMessage(chatId, {
+                                    message: statusMsg!.id,
+                                    text: buildDuplicateSkipped(finalFileName, storageFolder, duplicate.id),
+                                });
+                            });
+                        }
+                        return true;
+                    }
+                }
 
                 updateUploadPhase(chatIdStr, uploadId, { phase: 'saving' });
                 if (useConsolidated()) {
@@ -1452,25 +1498,24 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
                 let finalPath = localFilePath;
                 let sourceRef = provider.name;
 
-                if (provider.name !== 'local') {
-                    try {
-                        finalPath = await provider.saveFile(localFilePath, storedName, mimeType);
-                        if (fs.existsSync(localFilePath)) {
-                            fs.unlinkSync(localFilePath);
-                        }
-                        lastLocalPath = undefined;
-                    } catch (err) {
-                        lastError = (err as Error).message;
-                        throw err;
+                try {
+                    finalPath = await provider.saveFile(localFilePath, storedName, mimeType, storageFolder);
+                    if (fs.existsSync(localFilePath)) {
+                        fs.unlinkSync(localFilePath);
                     }
+                    lastLocalPath = undefined;
+                    localFilePath = undefined;
+                } catch (err) {
+                    lastError = (err as Error).message;
+                    throw err;
                 }
 
                 await query(`
                     INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                `, [finalFileName, storedName, fileType, mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, null, activeAccountId]);
+                `, [finalFileName, storedName, fileType, mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
 
-                updateUploadPhase(chatIdStr, uploadId, { phase: 'success', size: actualSize, providerName: provider.name, fileType });
+                updateUploadPhase(chatIdStr, uploadId, { phase: 'success', size: actualSize, providerName: provider.name, fileType, folder: storageFolder });
 
                 if (useConsolidated()) {
                     await runStatusAction(chatId, async () => {
@@ -1480,7 +1525,7 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
                     await runStatusAction(chatId, async () => {
                         await client.editMessage(chatId, {
                             message: statusMsg!.id,
-                            text: buildUploadSuccess(finalFileName, actualSize, fileType, provider.name),
+                            text: buildUploadSuccess(finalFileName, actualSize, fileType, provider.name, storageFolder),
                         });
                     });
                 }

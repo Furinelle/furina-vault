@@ -12,6 +12,10 @@ import { query } from '../db/index.js';
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const THUMBNAIL_DIR = process.env.THUMBNAIL_DIR || './data/thumbnails';
 
+export function isAutoCleanupEnabled(): boolean {
+    return ['1', 'true', 'yes', 'on'].includes((process.env.AUTO_CLEANUP_ORPHANS || 'true').toLowerCase());
+}
+
 // 清理统计结果
 export interface CleanupStats {
     deletedCount: number;
@@ -158,6 +162,11 @@ let cleanupInterval: NodeJS.Timeout | null = null;
  * 默认每小时执行一次
  */
 export function startPeriodicCleanup(intervalMs: number = 60 * 60 * 1000): void {
+    if (!isAutoCleanupEnabled()) {
+        console.log('🧹 自动孤儿文件清理已关闭 (AUTO_CLEANUP_ORPHANS=false)');
+        return;
+    }
+
     if (cleanupInterval) {
         clearInterval(cleanupInterval);
     }

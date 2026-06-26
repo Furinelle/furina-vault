@@ -19,7 +19,7 @@ export interface IStorageProvider {
      * @param mimeType 文件类型
      * @returns 存储后的路径或标识符
      */
-    saveFile(tempPath: string, fileName: string, mimeType: string): Promise<string>;
+    saveFile(tempPath: string, fileName: string, mimeType: string, folder?: string | null): Promise<string>;
 
     /**
      * 获取文件流（用于下载）
@@ -66,8 +66,12 @@ export class LocalStorageProvider implements IStorageProvider {
         }
     }
 
-    async saveFile(tempPath: string, fileName: string): Promise<string> {
-        const destPath = path.join(this.uploadDir, fileName);
+    async saveFile(tempPath: string, fileName: string, _mimeType?: string, folder?: string | null): Promise<string> {
+        const destDir = folder ? path.join(this.uploadDir, folder) : this.uploadDir;
+        if (!fs.existsSync(destDir)) {
+            fs.mkdirSync(destDir, { recursive: true });
+        }
+        const destPath = path.join(destDir, fileName);
         try {
             await fs.promises.rename(tempPath, destPath);
         } catch (error: any) {
@@ -145,9 +149,10 @@ export class AliyunOSSStorageProvider implements IStorageProvider {
         return r;
     }
 
-    async saveFile(tempPath: string, fileName: string): Promise<string> {
+    async saveFile(tempPath: string, fileName: string, _mimeType?: string, folder?: string | null): Promise<string> {
         try {
-            const result = await this.client.put(fileName, tempPath);
+            const objectKey = folder ? `${folder}/${fileName}` : fileName;
+            const result = await this.client.put(objectKey, tempPath);
             console.log('[AliyunOSS] Upload successful:', result.name);
             return result.name;
         } catch (error: any) {
@@ -223,17 +228,18 @@ export class S3StorageProvider implements IStorageProvider {
         });
     }
 
-    async saveFile(tempPath: string, fileName: string, mimeType: string): Promise<string> {
+    async saveFile(tempPath: string, fileName: string, mimeType: string, folder?: string | null): Promise<string> {
         try {
             const fileBuffer = fs.readFileSync(tempPath);
+            const objectKey = folder ? `${folder}/${fileName}` : fileName;
             const command = new PutObjectCommand({
                 Bucket: this.bucket,
-                Key: fileName,
+                Key: objectKey,
                 Body: fileBuffer,
                 ContentType: mimeType,
             });
             await this.client.send(command);
-            return fileName;
+            return objectKey;
         } catch (error: any) {
             console.error('[S3] Upload failed:', error.message);
             throw new Error(`S3 upload failed: ${error.message}`);
@@ -314,12 +320,16 @@ export class WebDAVStorageProvider implements IStorageProvider {
         });
     }
 
-    async saveFile(tempPath: string, fileName: string): Promise<string> {
+    async saveFile(tempPath: string, fileName: string, _mimeType?: string, folder?: string | null): Promise<string> {
         try {
             const fileBuffer = fs.readFileSync(tempPath);
-            await this.client.putFileContents(`/${fileName}`, fileBuffer);
-            console.log('[WebDAV] Upload successful:', fileName);
-            return fileName;
+            const remotePath = folder ? `${folder}/${fileName}` : fileName;
+            if (folder) {
+                await this.client.createDirectory(`/${folder}`, { recursive: true });
+            }
+            await this.client.putFileContents(`/${remotePath}`, fileBuffer);
+            console.log('[WebDAV] Upload successful:', remotePath);
+            return remotePath;
         } catch (error: any) {
             console.error('[WebDAV] Upload failed:', error.message);
             throw new Error(`WebDAV upload failed: ${error.message}`);
@@ -477,42 +487,55 @@ export class OneDriveStorageProvider implements IStorageProvider {
         throw new Error(`Failed to refresh OneDrive token after 3 attempts: ${lastError?.response?.data?.error_description || lastError?.message}`);
     }
 
+    private encodeOneDrivePath(rawPath: string): string {
+        return rawPath.split('/').filter(Boolean).map(part => encodeURIComponent(part)).join('/');
+    }
+
     /**
      * 确保存储文件夹存在
      */
-    private async ensureFolderExists(token: string): Promise<void> {
+    private async ensureFolderExists(token: string, folder?: string | null): Promise<string> {
+        const fullFolderPath = [this.ONEDRIVE_FOLDER, folder].filter(Boolean).join('/');
         try {
             // 使用标准的路径寻址格式，并在末尾添加冒号确保路径闭合
-            const endpoint = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(this.ONEDRIVE_FOLDER)}:`;
+            const endpoint = `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(fullFolderPath)}:`;
             await axios.get(endpoint, {
                 headers: { 'Authorization': `Bearer ${token}` },
                 timeout: 30000
             });
+            return fullFolderPath;
         } catch (error: any) {
             if (error.response?.status === 404) {
-                console.log('[OneDrive] Creating storage folder:', this.ONEDRIVE_FOLDER);
-                try {
-                    await axios.post(
-                        `https://graph.microsoft.com/v1.0/me/drive/root/children`,
-                        {
-                            name: this.ONEDRIVE_FOLDER,
-                            folder: {},
-                            "@microsoft.graph.conflictBehavior": "fail"
-                        },
-                        {
-                            headers: {
-                                'Authorization': `Bearer ${token}`,
-                                'Content-Type': 'application/json'
-                            },
+                const segments = fullFolderPath.split('/').filter(Boolean);
+                let currentPath = '';
+                for (const segment of segments) {
+                    const parentPath = currentPath;
+                    currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+                    try {
+                        await axios.get(`https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(currentPath)}:`, {
+                            headers: { 'Authorization': `Bearer ${token}` },
                             timeout: 30000
-                        }
-                    );
-                    console.log('[OneDrive] Storage folder created successfully');
-                } catch (postError: any) {
-                    const errorDetails = postError.response?.data?.error || postError.message;
-                    console.error('[OneDrive] Create folder failed:', errorDetails);
-                    throw new Error(`OneDrive failed to create folder: ${JSON.stringify(errorDetails)}`);
+                        });
+                    } catch (getError: any) {
+                        if (getError.response?.status !== 404) throw getError;
+                        const parentEndpoint = parentPath
+                            ? `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(parentPath)}:/children`
+                            : 'https://graph.microsoft.com/v1.0/me/drive/root/children';
+                        await axios.post(
+                            parentEndpoint,
+                            { name: segment, folder: {}, "@microsoft.graph.conflictBehavior": "fail" },
+                            {
+                                headers: {
+                                    'Authorization': `Bearer ${token}`,
+                                    'Content-Type': 'application/json'
+                                },
+                                timeout: 30000
+                            }
+                        );
+                    }
                 }
+                console.log('[OneDrive] Storage folder created successfully:', fullFolderPath);
+                return fullFolderPath;
             } else {
                 const errorDetails = error.response?.data?.error || error.message;
                 console.error('[OneDrive] Check folder failed:', errorDetails);
@@ -524,7 +547,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
     /**
      * 保存文件到 OneDrive
      */
-    async saveFile(tempPath: string, fileName: string, mimeType: string): Promise<string> {
+    async saveFile(tempPath: string, fileName: string, mimeType: string, folder?: string | null): Promise<string> {
         const token = await this.getAccessToken();
         const stats = await fs.promises.stat(tempPath);
         const fileSize = stats.size;
@@ -532,7 +555,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
         console.log(`[OneDrive] Uploading file: ${fileName}, size: ${fileSize} bytes, type: ${mimeType}`);
 
         // 确保文件夹存在
-        await this.ensureFolderExists(token);
+        const uploadFolder = await this.ensureFolderExists(token, folder);
 
         // URL编码文件名，处理特殊字符
         const encodedFileName = encodeURIComponent(fileName);
@@ -544,7 +567,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
                 const fileBuffer = await fs.promises.readFile(tempPath);
 
                 const response = await axios.put(
-                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.ONEDRIVE_FOLDER}/${encodedFileName}:/content`,
+                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}:/content`,
                     fileBuffer,
                     {
                         headers: {
@@ -566,7 +589,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
 
                 // 1. 创建上传会话
                 const sessionRes = await axios.post(
-                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.ONEDRIVE_FOLDER}/${encodedFileName}:/createUploadSession`,
+                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}:/createUploadSession`,
                     {
                         item: {
                             "@microsoft.graph.conflictBehavior": "rename",
@@ -634,7 +657,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
 
                 // 如果最后响应没有ID，查询文件信息
                 const itemRes = await axios.get(
-                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.ONEDRIVE_FOLDER}/${encodedFileName}`,
+                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}`,
                     {
                         headers: { 'Authorization': `Bearer ${token}` },
                         timeout: 30000
@@ -888,34 +911,48 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
         }
     }
 
-    private async ensureFolderExists(): Promise<string> {
-        await this.ensureAuthenticated();
-        const response = await this.drive.files.list({
-            q: `name = '${this.GOOGLE_DRIVE_FOLDER}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-            fields: 'files(id)',
-            spaces: 'drive'
-        });
-
-        if (response.data.files && response.data.files.length > 0) {
-            return response.data.files[0].id;
-        }
-
-        const folderMetadata = {
-            name: this.GOOGLE_DRIVE_FOLDER,
-            mimeType: 'application/vnd.google-apps.folder'
-        };
-
-        const folder = await this.drive.files.create({
-            resource: folderMetadata,
-            fields: 'id'
-        });
-
-        return folder.data.id;
+    private escapeDriveQuery(value: string): string {
+        return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     }
 
-    async saveFile(tempPath: string, fileName: string, mimeType: string): Promise<string> {
+    private async ensureFolderExists(folder?: string | null): Promise<string> {
         await this.ensureAuthenticated();
-        const folderId = await this.ensureFolderExists();
+        const segments = [this.GOOGLE_DRIVE_FOLDER, ...(folder ? folder.split('/').filter(Boolean) : [])];
+        let parentId: string | null = null;
+
+        for (const segment of segments) {
+            const parentClause: string = parentId ? `'${parentId}' in parents` : `'root' in parents`;
+            const response: any = await this.drive.files.list({
+                q: `name = '${this.escapeDriveQuery(segment)}' and mimeType = 'application/vnd.google-apps.folder' and ${parentClause} and trashed = false`,
+                fields: 'files(id)',
+                spaces: 'drive'
+            });
+
+            const existingFolderId = response.data.files?.[0]?.id;
+            if (existingFolderId) {
+                parentId = existingFolderId;
+                continue;
+            }
+
+            const folderMetadata: any = {
+                name: segment,
+                mimeType: 'application/vnd.google-apps.folder'
+            };
+            if (parentId) folderMetadata.parents = [parentId];
+
+            const createdFolder = await this.drive.files.create({
+                resource: folderMetadata,
+                fields: 'id'
+            });
+            parentId = createdFolder.data.id;
+        }
+
+        return parentId!;
+    }
+
+    async saveFile(tempPath: string, fileName: string, mimeType: string, folder?: string | null): Promise<string> {
+        await this.ensureAuthenticated();
+        const folderId = await this.ensureFolderExists(folder);
 
         const fileMetadata = {
             name: fileName,

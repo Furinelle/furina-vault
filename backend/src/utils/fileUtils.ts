@@ -31,13 +31,12 @@ export async function getUniqueStoredName(
 
         if (storageAccountId) {
             // 云存储：在同一个账户下检查
-            checkQuery = 'SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND storage_account_id = $2';
-            params = [currentName, storageAccountId];
+            checkQuery = 'SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND folder IS NOT DISTINCT FROM $2 AND storage_account_id = $3';
+            params = [currentName, folder, storageAccountId];
         } else {
             // 本地存储：在 source = 'local' 且文件夹相同的情况下检查
-            // 注意：本地通常不分账户，但可能有不同文件夹逻辑，目前代码实现中本地存储的 folder 可能是 null
-            checkQuery = 'SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND source = \'local\'';
-            params = [currentName];
+            checkQuery = 'SELECT COUNT(*)::int as cnt FROM files WHERE stored_name = $1 AND folder IS NOT DISTINCT FROM $2 AND source = \'local\'';
+            params = [currentName, folder];
         }
 
         const result = await query(checkQuery, params);

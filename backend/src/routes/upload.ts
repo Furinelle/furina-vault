@@ -10,6 +10,8 @@ import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
+import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/storagePath.js';
+import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 
 const router = Router();
 
@@ -74,9 +76,11 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     const size = file.size;
     const tempPath = path.resolve(file.path);
 
-    // 3. 生成唯一的存储文件名
     const activeAccountId = storageManager.getActiveAccountId();
-    const storedName = await getUniqueStoredName(originalName, folder || null, activeAccountId);
+    const storageRules = await getStoragePathRules();
+    const storageFolder = buildStorageFolderWithRules({ source, folder: folder || null, mimeType, fileName: originalName }, storageRules);
+    // 3. 生成唯一的存储文件名
+    const storedName = await getUniqueStoredName(originalName, storageFolder, activeAccountId);
 
     console.log(`[Upload] 📁 Received file: ${originalName} (${mimeType}, ${size} bytes)`);
     console.log(`[Upload] 🏠 Local temp path: ${tempPath}`);
@@ -90,6 +94,25 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         let thumbnailPath = null;
         let width = null;
         let height = null;
+        const duplicateMode = await getDuplicateMode();
+        if (duplicateMode === 'skip') {
+            const duplicate = await findDuplicateFile(originalName, storageFolder, size, activeAccountId);
+            if (duplicate) {
+                if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+                return res.json({
+                    success: true,
+                    skipped: true,
+                    reason: 'duplicate',
+                    file: {
+                        id: duplicate.id,
+                        name: duplicate.name,
+                        size: duplicate.size,
+                        folder: duplicate.folder,
+                        date: duplicate.created_at,
+                    }
+                });
+            }
+        }
 
         if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
             try {
@@ -111,7 +134,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         // 3. 保存到永久存储
         let storedPath = '';
         try {
-            storedPath = await provider.saveFile(tempPath, storedName, mimeType);
+            storedPath = await provider.saveFile(tempPath, storedName, mimeType, storageFolder);
         } catch (err) {
             if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
             throw err;
@@ -141,7 +164,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id) 
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
             RETURNING id, created_at, name, type, size`,
-            [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, width, height, provider.name, folder || null, activeAccountId]
+            [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, width, height, provider.name, storageFolder, activeAccountId]
         );
 
         const newFile = result.rows[0];

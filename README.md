@@ -109,6 +109,11 @@ docker compose up -d
 | `TELEGRAM_USER_SESSION_FILE` | 可选，用户账号 session 文件路径 | `/data/telegram_user_session.txt` | 运行 `docker compose run --rm --no-deps backend npm run login:telegram-user` 生成 |
 | `TELEGRAM_DOWNLOAD_BRIDGE_CHAT_ID` | 可选，桥接群/频道 ID；多人使用时推荐配置 | `-1001234567890` | 把 bot 和用户账号加入同一群/频道后获取聊天 ID |
 | `TELEGRAM_DOWNLOAD_WORKERS` | 可选，Telegram 并发下载 worker 数，建议 4-8 | `4` | 自行按线路稳定性调整；也可通过 Bot 的 `/download_workers` 菜单调整 |
+| `STORAGE_CLASSIFY_BY_PATH` | 可选，按来源/频道/文件类型自动分层保存 | `true` | 开启后如 `telegram/频道名/images/文件名`、`ytdlp/videos/文件名`；设为 `false` 恢复旧式平铺/手动 folder |
+| `STORAGE_PATH_BY_SOURCE` | 可选，保存路径是否按来源/频道分层 | `true` | 也可通过 Bot 的 `/path_rules` 菜单调整 |
+| `STORAGE_PATH_BY_TYPE` | 可选，保存路径是否按文件类型分层 | `true` | 类型会细分为 `archives`、`pdfs`、`code` 等 |
+| `DUPLICATE_FILE_MODE` | 可选，重复文件处理策略 | `copy` | `copy` 生成副本，`skip` 跳过同名同目录同大小文件；也可用 `/duplicate_mode` 调整 |
+| `AUTO_CLEANUP_ORPHANS` | 可选，是否自动清理本地孤儿文件 | `true` | 只扫描本地 `UPLOAD_DIR`，不清理第三方云存储；可用 `/cleanup_settings` 关闭 |
 | `YTDLP_BIN` | 可选，yt-dlp 可执行文件路径 | `yt-dlp` | 镜像内默认已安装；只有自定义环境找不到命令时才需要改 |
 | `YTDLP_WORK_DIR` | 可选，yt-dlp 下载临时目录 | `./data/uploads/ytdlp` | 默认即可；需要独立磁盘目录时再改 |
 | `YTDLP_MAX_CONCURRENT` | 可选，yt-dlp 并发任务数 | `1` | 按服务器 CPU、带宽和目标站点限速情况调整 |
@@ -166,6 +171,9 @@ docker compose up -d
 | `/tasks` | 查看当前传输任务队列和下载进度 |
 | `/stop_tasks` | 强制停止所有下载任务 |
 | `/download_workers` | 打开并发下载调参面板 (4 / 8 / 12 / 16) |
+| `/path_rules` | 设置保存路径是否按来源/频道、文件类型分层 |
+| `/duplicate_mode` | 设置重复文件跳过或生成副本 |
+| `/cleanup_settings` | 设置自动清理开关，本地存储用户可关闭以防默认删除文件 |
 | `/delete <ID>` | 删除指定文件，支持 ID 前缀 |
 | `/ytdlp <url>` | 解析视频链接并下载到当前存储源 |
 

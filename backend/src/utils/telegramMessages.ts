@@ -6,8 +6,6 @@
  */
 
 import { formatBytes, getTypeEmoji } from './telegramUtils.js';
-import { cleanupOrphanFiles } from '../services/orphanCleanup.js';
-
 // ─── 存储提供商显示名称 ───────────────────────────────────────
 
 const PROVIDER_DISPLAY_MAP: Record<string, string> = {
@@ -102,9 +100,16 @@ export function buildWelcomeBack(): string {
         `您已通过验证，可以直接使用：`,
         ``,
         `📤  发送/转发文件即可上传 (最大 2GB)`,
+        `🔐  /setup_2fa — 配置双重验证`,
+        `📥  /ytdlp — 解析并下载链接`,
         `📊  /storage — 存储空间概览`,
         `📋  /list — 最近上传记录`,
         `🔧  /tasks — 实时任务队列`,
+        `🛑  /stop_tasks — 强制停止下载任务`,
+        `⚙️  /download_workers — 下载并发设置`,
+        `📁  /path_rules — 保存路径规则`,
+        `🧬  /duplicate_mode — 重复文件处理`,
+        `🧹  /cleanup_settings — 自动清理设置`,
         `❓  /help — 完整帮助`,
     ].join('\n');
 }
@@ -138,11 +143,17 @@ export function buildHelp(): string {
         ``,
         `**🛠 可用命令**`,
         `  /start — 身份认证 / 开始使用`,
+        `  /setup\\_2fa — 配置双重验证 (TOTP)`,
+        `  /ytdlp <url> — 下载视频链接到存储`,
         `  /storage — 服务器 & 存储统计`,
         `  /list [n] — 最近上传 (默认 10 条)`,
-        `  /delete <ID> — 删除指定文件`,
         `  /tasks — 实时传输任务队列`,
-        `  /setup\\_2fa — 配置双重验证 (TOTP)`,
+        `  /stop_tasks — 停止所有下载任务`,
+        `  /download_workers — 设置下载并发`,
+        `  /path_rules — 设置保存路径规则`,
+        `  /duplicate_mode — 设置重复文件处理`,
+        `  /cleanup_settings — 设置自动清理开关`,
+        `  /delete <ID或序号> — 删除指定文件`,
         `  /help — 显示此帮助`,
         ``,
         LINE,
@@ -239,7 +250,9 @@ export function buildFileList(files: FileListItem[], total: number): string {
     });
 
     lines.push('');
-    lines.push(`💡 删除文件: /delete <ID前8位>`);
+    lines.push(`💡 删除文件: 复制上方 ID 后发送 /delete <ID>`);
+    lines.push(`   例：/delete ${files[0]?.id?.substring(0, 8) || 'a1b2c3d4'}`);
+    lines.push(`📄 更多记录: /list 20 或 /list 20 2`);
 
     return lines.join('\n');
 }
@@ -312,7 +325,8 @@ export function buildUploadSuccess(
     fileName: string,
     size: number,
     fileType: string,
-    providerName: string
+    providerName: string,
+    folder?: string | null
 ): string {
     const typeEmoji = getTypeEmoji(
         fileType === 'image' ? 'image/' :
@@ -327,6 +341,7 @@ export function buildUploadSuccess(
         `${typeEmoji} ${fileName}`,
         `📦 ${formatBytes(size)}`,
         `📍 ${getProviderDisplayName(providerName)}`,
+        ...(folder ? [`📁 ${folder}`] : []),
     ].join('\n');
 }
 
@@ -337,6 +352,21 @@ export function buildUploadFail(fileName: string, error: string): string {
         ``,
         `📄 ${fileName}`,
         `原因: ${error}`,
+        ``,
+        `🔄 大文件可能因网络波动、Telegram 限流或临时断流失败；Bot 已自动重试一次。`,
+        `💡 可重新发送该文件，或用 /download_workers 降低并发后再试。`,
+    ].join('\n');
+}
+
+export function buildDuplicateSkipped(fileName: string, folder: string | null | undefined, existingId?: string): string {
+    return [
+        `⏭️ **已跳过重复文件**`,
+        ``,
+        `📄 ${fileName}`,
+        ...(folder ? [`📁 ${folder}`] : []),
+        ...(existingId ? [`🆔 已存在: ${existingId.substring(0, 8)}`] : []),
+        ``,
+        `如需保留副本，请发送 /duplicate_mode 切换为“生成副本”。`,
     ].join('\n');
 }
 
@@ -446,6 +476,7 @@ export interface ConsolidatedUploadFile {
     error?: string;
     providerName?: string;
     fileType?: string;
+    folder?: string | null;
 }
 
 export interface ConsolidatedBatchEntry {
@@ -512,22 +543,6 @@ export async function buildConsolidatedStatus(
         const totalSize = [...singleFiles.filter(f => f.phase === 'success'), ...batches.flatMap(b => [])]
             .reduce((sum, f) => sum + (f.size || 0), 0);
 
-        // 如果有失败文件，执行清理
-        let cleanupStats: { deletedCount: number; freedSpace: string } | null = null;
-        if (totalFailed > 0) {
-            try {
-                const stats = await cleanupOrphanFiles();
-                if (stats.deletedCount > 0) {
-                    cleanupStats = {
-                        deletedCount: stats.deletedCount,
-                        freedSpace: stats.freedSpace
-                    };
-                }
-            } catch (error) {
-                console.error('🧹 自动清理失败:', error);
-            }
-        }
-
         lines.push('📊 **完成摘要**');
         lines.push(LINE);
         lines.push(`✅ 成功: ${totalSuccessful} 个文件`);
@@ -554,17 +569,12 @@ export async function buildConsolidatedStatus(
             minute: '2-digit'
         })}`);
 
-        // 添加清理通知（如果有失败文件）
+        // 添加失败提醒（不自动清理，避免误删）
         if (totalFailed > 0) {
             lines.push('');
-            lines.push('🧹 **自动清理完成**');
-            lines.push('  已清理服务器缓存垃圾文件');
-            if (cleanupStats && cleanupStats.deletedCount > 0) {
-                lines.push(`  🗑️ 删除 ${cleanupStats.deletedCount} 个孤儿文件`);
-                lines.push(`  💾 释放空间 ${cleanupStats.freedSpace}`);
-            } else {
-                lines.push('  ✅ 没有发现需要清理的垃圾文件');
-            }
+            lines.push('🧹 **自动清理已关闭**');
+            lines.push('  失败产生的本地临时文件不会在这里自动删除。');
+            lines.push('  如需清理，请先确认文件状态后手动处理。');
         }
 
         lines.push('');
@@ -574,7 +584,7 @@ export async function buildConsolidatedStatus(
             lines.push('🎊 所有文件已安全上传到云端！');
             lines.push('💡 您可以随时使用 /list 查看上传记录');
         } else {
-            lines.push('💡 部分文件上传失败，已自动清理服务器缓存');
+            lines.push('💡 部分文件上传失败，未自动清理服务器缓存');
             lines.push('🔄 您可以重新发送失败的文件');
         }
         lines.push('');
@@ -610,6 +620,7 @@ export async function buildConsolidatedStatus(
                     icon = '✅';
                     const parts: string[] = [];
                     if (file.size) parts.push(formatBytes(file.size));
+                    if (file.folder) parts.push(`📁 ${file.folder}`);
                     detail = parts.join(' · ') || '完成';
                     break;
                 case 'failed':
@@ -671,6 +682,7 @@ export async function buildConsolidatedStatus(
                     icon = '✅';
                     const parts: string[] = [];
                     if (file.size) parts.push(formatBytes(file.size));
+                    if (file.folder) parts.push(`📁 ${file.folder}`);
                     detail = parts.join(' · ') || '完成';
                     break;
                 case 'failed':
