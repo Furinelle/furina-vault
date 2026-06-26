@@ -1966,14 +1966,14 @@ function buildSilentModeNotice(fileCount) {
     `\u{1F4A1} \u53D1\u9001 /tasks \u67E5\u770B\u5B9E\u65F6\u4EFB\u52A1\u72B6\u6001`
   ].join("\n");
 }
-function buildSilentProgress(fileCount, batches, singleFiles = []) {
+function buildSilentProgress(sessionTotal, batches, singleFiles = []) {
   const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
   const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
   const successfulBatchFiles = batches.reduce((sum, batch) => sum + batch.successful, 0);
   const failedBatchFiles = batches.reduce((sum, batch) => sum + batch.failed, 0);
   const completedSingleFiles = singleFiles.filter((file) => file.phase === "success" || file.phase === "failed").length;
   const failedSingleFiles = singleFiles.filter((file) => file.phase === "failed").length;
-  const totalFiles = Math.max(fileCount, totalBatchFiles + singleFiles.length);
+  const totalFiles = Math.max(sessionTotal, totalBatchFiles + singleFiles.length, completedBatchFiles + completedSingleFiles);
   const completedFiles = completedBatchFiles + completedSingleFiles;
   const failedFiles = failedBatchFiles + failedSingleFiles;
   const successfulFiles = successfulBatchFiles + completedSingleFiles - failedSingleFiles;
@@ -1994,13 +1994,18 @@ function buildSilentProgress(fileCount, batches, singleFiles = []) {
     `\u{1F4A1} \u53D1\u9001 /tasks \u67E5\u770B\u5B9E\u65F6\u4EFB\u52A1\u72B6\u6001`
   ].join("\n");
 }
-function buildSilentAllTasksComplete(failedCount) {
+function buildSilentAllTasksComplete(totalCount, failedCount) {
+  const successCount = Math.max(0, totalCount - failedCount);
   if (failedCount > 0) {
     return `\u26A0\uFE0F **\u540E\u53F0\u4EFB\u52A1\u90E8\u5206\u5B8C\u6210**
 
-\u274C \u5931\u8D25\u6587\u4EF6: ${failedCount} \u4E2A`;
+\u2705 \u6210\u529F: ${successCount} \u4E2A\u6587\u4EF6
+\u274C \u5931\u8D25: ${failedCount} \u4E2A\u6587\u4EF6
+\u{1F4CA} \u603B\u8BA1: ${totalCount} \u4E2A\u6587\u4EF6`;
   }
-  return `\u2705 **\u540E\u53F0\u4EFB\u52A1\u5168\u90E8\u5B8C\u6210**`;
+  return `\u2705 **\u540E\u53F0\u4EFB\u52A1\u5168\u90E8\u5B8C\u6210**
+
+\u{1F4CA} \u603B\u8BA1: ${totalCount} \u4E2A\u6587\u4EF6`;
 }
 async function buildConsolidatedStatus(singleFiles, batches) {
   const totalSingle = singleFiles.length;
@@ -2865,13 +2870,13 @@ var silentSessionMap = /* @__PURE__ */ new Map();
 function getSilentSession(chatIdStr) {
   let s = silentSessionMap.get(chatIdStr);
   if (!s) {
-    s = { total: 0, completed: 0, failed: 0 };
+    s = { total: 0, completed: 0, failed: 0, knownTaskKeys: /* @__PURE__ */ new Set() };
     silentSessionMap.set(chatIdStr, s);
   }
   return s;
 }
 function startSilentSession(chatIdStr, total) {
-  const s = { total, completed: 0, failed: 0 };
+  const s = { total, completed: 0, failed: 0, knownTaskKeys: /* @__PURE__ */ new Set() };
   silentSessionMap.set(chatIdStr, s);
   return s;
 }
@@ -2883,7 +2888,7 @@ async function finalizeSilentSessionIfDone(client2, chatId) {
   const s = silentSessionMap.get(chatIdStr);
   const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr);
   if (silentMsgId) {
-    const text = buildSilentAllTasksComplete(s?.failed || 0);
+    const text = buildSilentAllTasksComplete(s?.total || 0, s?.failed || 0);
     await safeEditMessage(client2, chatId, { message: silentMsgId, text });
   }
   silentSessionMap.delete(chatIdStr);
@@ -2920,11 +2925,11 @@ async function trySilentMode(client2, chatId, message) {
   if (fileCount > 3 || isSilent) {
     if (!isSilent) {
       await deleteLastStatusMessage(client2, chatId);
-      startSilentSession(chatIdStr, fileCount);
+      startSilentSession(chatIdStr, 0);
+      syncSilentSessionTotals(chatIdStr);
       console.log(`[TG][silent] ACTIVATED chat=${chatIdStr} files=${fileCount}`);
     } else {
-      const sess = getSilentSession(chatIdStr);
-      sess.total = Math.max(sess.total, fileCount);
+      syncSilentSessionTotals(chatIdStr);
     }
     await ensureSilentNotice(client2, chatId, fileCount, message);
     await refreshSilentProgress(client2, chatId);
@@ -3032,15 +3037,36 @@ function getOutstandingTaskCount(chatIdStr) {
   const outstandingBatches = batches.filter((b) => b.completed < b.totalFiles).length;
   return outstandingFiles + outstandingBatches;
 }
+function syncSilentSessionTotals(chatIdStr) {
+  const session = silentSessionMap.get(chatIdStr);
+  if (!session) return null;
+  const batches = getConsolidatedBatches(chatIdStr);
+  for (const batch of batches) {
+    const key = `batch:${batch.id}`;
+    if (!session.knownTaskKeys.has(key)) {
+      session.knownTaskKeys.add(key);
+      session.total += batch.totalFiles;
+    }
+  }
+  const files = getConsolidatedFiles(chatIdStr);
+  for (const file of files) {
+    const key = `file:${file.fileName}`;
+    if (!session.knownTaskKeys.has(key)) {
+      session.knownTaskKeys.add(key);
+      session.total += 1;
+    }
+  }
+  return session;
+}
 async function refreshSilentProgress(client2, chatId) {
   const chatIdStr = chatId.toString();
   if (!silentSessionMap.has(chatIdStr)) return;
   const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr);
   if (!silentMsgId) return;
-  const fileCount = getBackgroundFileCount(chatIdStr);
+  const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
   const batches = getConsolidatedBatches(chatIdStr);
   const files = getConsolidatedFiles(chatIdStr);
-  const text = buildSilentProgress(fileCount, batches, files);
+  const text = buildSilentProgress(session.total, batches, files);
   await safeEditMessage(client2, chatId, { message: silentMsgId, text });
 }
 async function checkAndResetSession(client2, chatId) {
@@ -3311,11 +3337,12 @@ async function processFileUpload(client2, file, queue) {
     try {
       const activeAccountId = storageManager.getActiveAccountId();
       const chatName = await getTelegramChatName(file.message);
+      const batchFolder = queue?.folderName && queue.folderName !== chatName ? queue.folderName : null;
       const storageRules = await getStoragePathRules();
       const storageFolder = buildStorageFolderWithRules({
         source: "telegram",
         chatName,
-        folder: queue?.folderName || null,
+        folder: batchFolder,
         mimeType: file.mimeType,
         fileName: file.fileName
       }, storageRules);
@@ -3488,13 +3515,7 @@ async function processBatchUpload(client2, mediaGroupId) {
     await onBatchProgress();
   }, 3e3);
   try {
-    await Promise.all(queue.files.map((file, index) => {
-      const ext = path9.extname(file.fileName);
-      const baseName = queue.folderName || "file";
-      const isDefaultFolder = /^[0-9-]+$/.test(baseName);
-      if (!isDefaultFolder) {
-        file.fileName = `${baseName}_${index + 1}${ext}`;
-      }
+    await Promise.all(queue.files.map((file) => {
       return processFileUpload(client2, file, queue).finally(refreshBatchProgressAndFinalizeSilent);
     }));
     await onBatchProgress();

@@ -463,14 +463,14 @@ interface SilentProgressFile {
     total?: number;
 }
 
-export function buildSilentProgress(fileCount: number, batches: SilentProgressBatch[], singleFiles: SilentProgressFile[] = []): string {
+export function buildSilentProgress(sessionTotal: number, batches: SilentProgressBatch[], singleFiles: SilentProgressFile[] = []): string {
     const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
     const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
     const successfulBatchFiles = batches.reduce((sum, batch) => sum + batch.successful, 0);
     const failedBatchFiles = batches.reduce((sum, batch) => sum + batch.failed, 0);
     const completedSingleFiles = singleFiles.filter(file => file.phase === 'success' || file.phase === 'failed').length;
     const failedSingleFiles = singleFiles.filter(file => file.phase === 'failed').length;
-    const totalFiles = Math.max(fileCount, totalBatchFiles + singleFiles.length);
+    const totalFiles = Math.max(sessionTotal, totalBatchFiles + singleFiles.length, completedBatchFiles + completedSingleFiles);
     const completedFiles = completedBatchFiles + completedSingleFiles;
     const failedFiles = failedBatchFiles + failedSingleFiles;
     const successfulFiles = successfulBatchFiles + completedSingleFiles - failedSingleFiles;
@@ -503,11 +503,12 @@ export function buildSilentBatchComplete(types: string, providerName: string): s
     return `✅ **多文件上传完成！**\n🏷️ 类型: ${types}\n📍 ${getProviderDisplayName(providerName)}`;
 }
 
-export function buildSilentAllTasksComplete(failedCount: number): string {
+export function buildSilentAllTasksComplete(totalCount: number, failedCount: number): string {
+    const successCount = Math.max(0, totalCount - failedCount);
     if (failedCount > 0) {
-        return `⚠️ **后台任务部分完成**\n\n❌ 失败文件: ${failedCount} 个`;
+        return `⚠️ **后台任务部分完成**\n\n✅ 成功: ${successCount} 个文件\n❌ 失败: ${failedCount} 个文件\n📊 总计: ${totalCount} 个文件`;
     }
-    return `✅ **后台任务全部完成**`;
+    return `✅ **后台任务全部完成**\n\n📊 总计: ${totalCount} 个文件`;
 }
 
 // ─── 合并状态（单文件 + 批量） ──────────────────────────────

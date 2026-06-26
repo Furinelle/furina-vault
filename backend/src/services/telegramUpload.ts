@@ -404,6 +404,7 @@ interface SilentSession {
     total: number;
     completed: number;
     failed: number;
+    knownTaskKeys: Set<string>;
 }
 
 const silentSessionMap = new Map<string, SilentSession>();
@@ -411,14 +412,14 @@ const silentSessionMap = new Map<string, SilentSession>();
 function getSilentSession(chatIdStr: string): SilentSession {
     let s = silentSessionMap.get(chatIdStr);
     if (!s) {
-        s = { total: 0, completed: 0, failed: 0 };
+        s = { total: 0, completed: 0, failed: 0, knownTaskKeys: new Set() };
         silentSessionMap.set(chatIdStr, s);
     }
     return s;
 }
 
 function startSilentSession(chatIdStr: string, total: number): SilentSession {
-    const s = { total, completed: 0, failed: 0 };
+    const s = { total, completed: 0, failed: 0, knownTaskKeys: new Set<string>() };
     silentSessionMap.set(chatIdStr, s);
     return s;
 }
@@ -436,7 +437,7 @@ async function finalizeSilentSessionIfDone(client: TelegramClient, chatId: Api.T
 
     // 编辑静默通知为完成消息
     if (silentMsgId) {
-        const text = buildSilentAllTasksComplete(s?.failed || 0);
+        const text = buildSilentAllTasksComplete(s?.total || 0, s?.failed || 0);
         await safeEditMessage(client, chatId, { message: silentMsgId, text });
     }
 
@@ -488,12 +489,12 @@ async function trySilentMode(client: TelegramClient, chatId: Api.TypeEntityLike,
         if (!isSilent) {
             // 首次进入静默模式
             await deleteLastStatusMessage(client, chatId);
-            startSilentSession(chatIdStr, fileCount);
+            startSilentSession(chatIdStr, 0);
+            syncSilentSessionTotals(chatIdStr);
             console.log(`[TG][silent] ACTIVATED chat=${chatIdStr} files=${fileCount}`);
         } else {
-            // 已在静默模式，更新计数
-            const sess = getSilentSession(chatIdStr);
-            sess.total = Math.max(sess.total, fileCount);
+            // 已在静默模式，更新已知任务集合，保持总数为会话累计文件数
+            syncSilentSessionTotals(chatIdStr);
         }
         await ensureSilentNotice(client, chatId, fileCount, message);
         await refreshSilentProgress(client, chatId);
@@ -644,16 +645,41 @@ function getOutstandingTaskCount(chatIdStr: string): number {
     return outstandingFiles + outstandingBatches;
 }
 
+function syncSilentSessionTotals(chatIdStr: string): SilentSession | null {
+    const session = silentSessionMap.get(chatIdStr);
+    if (!session) return null;
+
+    const batches = getConsolidatedBatches(chatIdStr);
+    for (const batch of batches) {
+        const key = `batch:${batch.id}`;
+        if (!session.knownTaskKeys.has(key)) {
+            session.knownTaskKeys.add(key);
+            session.total += batch.totalFiles;
+        }
+    }
+
+    const files = getConsolidatedFiles(chatIdStr);
+    for (const file of files) {
+        const key = `file:${file.fileName}`;
+        if (!session.knownTaskKeys.has(key)) {
+            session.knownTaskKeys.add(key);
+            session.total += 1;
+        }
+    }
+
+    return session;
+}
+
 async function refreshSilentProgress(client: TelegramClient, chatId: Api.TypeEntityLike) {
     const chatIdStr = chatId.toString();
     if (!silentSessionMap.has(chatIdStr)) return;
     const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr);
     if (!silentMsgId) return;
 
-    const fileCount = getBackgroundFileCount(chatIdStr);
+    const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
     const batches = getConsolidatedBatches(chatIdStr);
     const files = getConsolidatedFiles(chatIdStr);
-    const text = buildSilentProgress(fileCount, batches, files);
+    const text = buildSilentProgress(session.total, batches, files);
     await safeEditMessage(client, chatId, { message: silentMsgId, text });
 }
 
@@ -1036,11 +1062,12 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
             // 获取唯一的存储文件名
             const activeAccountId = storageManager.getActiveAccountId();
             const chatName = await getTelegramChatName(file.message);
+            const batchFolder = queue?.folderName && queue.folderName !== chatName ? queue.folderName : null;
             const storageRules = await getStoragePathRules();
             const storageFolder = buildStorageFolderWithRules({
                 source: 'telegram',
                 chatName,
-                folder: queue?.folderName || null,
+                folder: batchFolder,
                 mimeType: file.mimeType,
                 fileName: file.fileName,
             }, storageRules);
@@ -1268,18 +1295,8 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
         // 上面的 setInterval 已经负责了轮询状态并更新 UI。
         // 我们只需等待所有 promise 完成。
 
-        // 启动所有文件上传，并根据索引命名
-        await Promise.all(queue.files.map((file, index) => {
-            // 如果文件夹名不是默认的 ID，我们可以给里面的文件加个索引
-            const ext = path.extname(file.fileName);
-            const baseName = queue.folderName || 'file';
-            // 只有当文件夹名比较有意义时才使用文件夹名作为前缀
-            const isDefaultFolder = /^[0-9-]+$/.test(baseName);
-
-            if (!isDefaultFolder) {
-                file.fileName = `${baseName}_${index + 1}${ext}`;
-            }
-
+        // 启动所有文件上传，保留 Telegram 原始文件名，避免频道名重复写入文件名
+        await Promise.all(queue.files.map((file) => {
             return processFileUpload(client, file, queue).finally(refreshBatchProgressAndFinalizeSilent);
         }));
 
