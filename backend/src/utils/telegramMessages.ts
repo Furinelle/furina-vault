@@ -104,6 +104,7 @@ export function buildWelcomeBack(): string {
         `📥  /ytdlp — 解析并下载链接`,
         `📡  /tg_sub — 订阅频道自动同步`,
         `🗓️  /tg_date — 按日期下载频道文件`,
+        `🏷️  /tg_tag — 按标签下载频道文件`,
         `🧾  /tg_jobs — Telegram 后台任务`,
         `📊  /storage — 存储空间概览`,
         `📋  /list — 最近上传记录`,
@@ -152,6 +153,7 @@ export function buildHelp(): string {
         `  /tg_subs — 查看频道订阅`,
         `  /tg_unsub <频道或ID> — 取消订阅`,
         `  /tg_date <频道> <开始日期> <结束日期> — 按日期下载频道文件`,
+        `  /tg_tag <频道> <#标签> — 下载频道内指定标签的全部文件`,
         `  /tg_jobs — 查看 Telegram 后台任务`,
         `  /storage — 服务器 & 存储统计`,
         `  /list [n] — 最近上传 (默认 10 条)`,
@@ -444,13 +446,19 @@ export function buildDeleteSuccess(fileName: string, fileId: string): string {
 // ─── 多文件上传 ──────────────────────────────────────────────
 
 /** 静默模式通知 */
-export function buildSilentModeNotice(fileCount: number): string {
+export function buildSilentModeNotice(fileCount: number, taskId?: string): string {
     return [
         `🤐 **已切换到静默模式**`,
+        ...(taskId ? [`🆔 任务：\`${taskId}\``] : []),
         ``,
         `Bot 将在后台继续处理所有文件，请耐心等待。`,
         ``,
-        `💡 发送 /tasks 查看实时任务状态`,
+        ...(taskId ? [
+            `💡 控制全局下载队列：`,
+            `/task_pause ${taskId}`,
+            `/task_resume ${taskId}`,
+            `/task_cancel ${taskId}`,
+        ] : [`💡 发送 /tasks 查看实时任务状态`]),
     ].join('\n');
 }
 
@@ -477,6 +485,7 @@ export function buildSilentProgress(
     singleFiles: SilentProgressFile[] = [],
     sessionCompleted: number = 0,
     sessionFailed: number = 0,
+    taskId?: string,
 ): string {
     const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
     const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
@@ -503,7 +512,8 @@ export function buildSilentProgress(
         ...(activeBatch ? [`📁 批次: ${activeBatch.folderName}`] : []),
         ...(activeBatch?.queuePending ? [`🕒 队列等待: ${activeBatch.queuePending}`] : []),
         ``,
-        `💡 发送 /tasks 查看实时任务状态`,
+        `💡 控制全局下载队列：${taskId ? `/task_pause ${taskId}　/task_resume ${taskId}　/task_cancel ${taskId}` : '发送 /tasks 查看实时任务状态'}`,
+        ...(taskId && failedFiles > 0 && remainingFiles === 0 ? [`🔄 检测到失败任务，可发送 /tg_retry ${taskId} 重试最近失败项`] : []),
     ].join('\n');
 }
 
@@ -517,12 +527,21 @@ export function buildSilentBatchComplete(types: string, providerName: string): s
     return `✅ **多文件上传完成！**\n🏷️ 类型: ${types}\n📍 ${getProviderDisplayName(providerName)}`;
 }
 
-export function buildSilentAllTasksComplete(totalCount: number, failedCount: number): string {
+export function buildSilentAllTasksComplete(totalCount: number, failedCount: number, taskId?: string): string {
     const successCount = Math.max(0, totalCount - failedCount);
     if (failedCount > 0) {
-        return `⚠️ **后台任务部分完成**\n\n✅ 成功: ${successCount} 个文件\n❌ 失败: ${failedCount} 个文件\n📊 总计: ${totalCount} 个文件`;
+        return [
+            `⚠️ **后台任务部分完成**`,
+            ``,
+            ...(taskId ? [`🆔 任务：\`${taskId}\``] : []),
+            `✅ 成功: ${successCount} 个文件`,
+            `❌ 失败: ${failedCount} 个文件`,
+            `📊 总计: ${totalCount} 个文件`,
+            ``,
+            ...(taskId ? [`🔄 检测到失败任务，发送 /tg_retry ${taskId} 重试最近失败项`] : []),
+        ].join('\n');
     }
-    return `✅ **后台任务全部完成**\n\n📊 总计: ${totalCount} 个文件`;
+    return [`✅ **后台任务全部完成**`, ``, ...(taskId ? [`🆔 任务：\`${taskId}\``] : []), `📊 总计: ${totalCount} 个文件`].join('\n');
 }
 
 // ─── 合并状态（单文件 + 批量） ──────────────────────────────
@@ -531,7 +550,7 @@ export interface ConsolidatedUploadFile {
     id?: string;
     fileName: string;
     typeEmoji: string;
-    phase: 'queued' | 'downloading' | 'saving' | 'success' | 'failed' | 'retrying';
+    phase: 'queued' | 'downloading' | 'saving' | 'success' | 'failed' | 'retrying' | 'cancelled';
     downloaded?: number;
     total?: number;
     size?: number;

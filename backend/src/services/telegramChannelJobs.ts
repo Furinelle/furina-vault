@@ -32,6 +32,31 @@ function messageHasMedia(message: Api.Message | undefined): boolean {
     return Boolean(message.media || message.document || message.photo || message.video || message.audio || message.voice || message.sticker);
 }
 
+function normalizeHashtag(tagInput: string): string {
+    const trimmed = tagInput.trim();
+    if (!trimmed) throw new Error('标签不能为空');
+    const withoutHash = trimmed.replace(/^#+/, '');
+    if (!withoutHash || /\s/.test(withoutHash)) throw new Error('标签格式应为 #xxx，不能包含空格');
+    return `#${withoutHash}`;
+}
+
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function messageTextForTag(message: Api.Message | undefined): string {
+    if (!message) return '';
+    return [message.message, (message as any).text, (message as any).caption].filter(Boolean).join('\n');
+}
+
+function messageMatchesHashtag(message: Api.Message | undefined, normalizedTag: string): boolean {
+    const body = messageTextForTag(message);
+    if (!body) return false;
+    const tag = escapeRegExp(normalizedTag.slice(1));
+    const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_])#${tag}(?![\\p{L}\\p{N}_])`, 'iu');
+    return pattern.test(body);
+}
+
 async function getLatestMessageId(userClient: TelegramClient, source: string): Promise<number> {
     const [latest] = await userClient.getMessages(source as any, { limit: 1 });
     return latest?.id || 0;
@@ -60,6 +85,52 @@ async function getMessagesByDateRange(userClient: TelegramClient, source: string
     }
 
     return result.sort((a, b) => a.id - b.id);
+}
+
+function messageGroupId(message: Api.Message | undefined): string | undefined {
+    const groupedId = (message as any)?.groupedId;
+    return groupedId ? groupedId.toString() : undefined;
+}
+
+async function expandMessagesWithMediaGroups(userClient: TelegramClient, source: string, messages: Api.Message[]): Promise<Api.Message[]> {
+    const byId = new Map<number, Api.Message>();
+    const seenGroups = new Set<string>();
+    for (const message of messages) {
+        if (messageHasMedia(message)) byId.set(message.id, message);
+        const groupId = messageGroupId(message);
+        if (!groupId || seenGroups.has(groupId)) continue;
+        seenGroups.add(groupId);
+        const ids = Array.from({ length: 41 }, (_, index) => message.id - 20 + index).filter(id => id > 0);
+        const nearby = await userClient.getMessages(source as any, { ids });
+        for (const candidate of nearby) {
+            if (candidate && messageHasMedia(candidate) && messageGroupId(candidate) === groupId) {
+                byId.set(candidate.id, candidate);
+            }
+        }
+    }
+    return Array.from(byId.values()).sort((a, b) => a.id - b.id);
+}
+
+async function persistDownloadItems(jobId: string, source: string, messages: Api.Message[]) {
+    for (const message of messages) {
+        await query(
+            `INSERT INTO telegram_download_items (job_id, source, message_id, grouped_id, status)
+             VALUES ($1, $2, $3, $4, 'pending')
+             ON CONFLICT (job_id, message_id) DO NOTHING`,
+            [jobId, source, message.id, messageGroupId(message) || null]
+        );
+    }
+}
+
+async function updateDownloadItemsStatus(jobId: string, messageIds: number[] | undefined, status: 'success' | 'failed' | 'skipped', error?: string) {
+    const ids = Array.from(new Set((messageIds || []).filter(id => id > 0)));
+    if (ids.length === 0) return;
+    await query(
+        `UPDATE telegram_download_items
+         SET status = $2, error = $3, updated_at = NOW()
+         WHERE job_id = $1 AND message_id = ANY($4::int[])`,
+        [jobId, status, error || null, ids]
+    );
 }
 
 function parseDateOnly(value: string, endOfDay = false): Date {
@@ -131,18 +202,6 @@ export async function unsubscribeTelegramChannel(userId: number, selector: strin
     return result.rows[0] || null;
 }
 
-export async function previewTelegramDateDownload(sourceInput: string, startDateText: string, endDateText: string) {
-    const userClient = requireUserClient();
-    const source = normalizeSource(sourceInput);
-    const startDate = parseDateOnly(startDateText);
-    const endDate = parseDateOnly(endDateText, true);
-    if (startDate > endDate) throw new Error('开始日期不能晚于结束日期');
-
-    const messages = await getMessagesByDateRange(userClient, source, startDate, endDate);
-    const preview = await getTelegramDownloadPreview(messages);
-    return { source, startDate, endDate, total: messages.length, ...preview };
-}
-
 export async function enqueueTelegramDateDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, startDateText: string, endDateText: string) {
     const userClient = requireUserClient();
     const source = normalizeSource(sourceInput);
@@ -150,19 +209,81 @@ export async function enqueueTelegramDateDownload(botClient: TelegramClient, req
     const endDate = parseDateOnly(endDateText, true);
     if (startDate > endDate) throw new Error('开始日期不能晚于结束日期');
 
-    const messages = await getMessagesByDateRange(userClient, source, startDate, endDate);
-    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, { startDate: startDateText, endDate: endDateText });
+    const baseMessages = await getMessagesByDateRange(userClient, source, startDate, endDate);
+    const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
+    const messageIds = messages.map(message => message.id);
+    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, { startDate: startDateText, endDate: endDateText, messageIds });
+    await persistDownloadItems(jobId, source, messages);
     await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: messages.length });
 
     try {
         const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id));
+        await updateDownloadItemsStatus(jobId, result.successfulMessageIds, 'success');
+        await updateDownloadItemsStatus(jobId, result.failedMessageIds, 'failed', '下载失败');
+        await updateDownloadItemsStatus(jobId, result.skippedMessageIds, 'skipped');
         await updateJob(jobId, {
-            status: 'completed',
+            status: result.failed > 0 ? 'completed_with_errors' : 'completed',
             enqueued_count: result.found,
             skipped_count: result.skipped,
+            error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
             finished_at: new Date(),
         });
         return { jobId, ...result };
+    } catch (error) {
+        await updateJob(jobId, { status: 'failed', error: error instanceof Error ? error.message : String(error), finished_at: new Date() });
+        throw error;
+    }
+}
+
+async function getMessagesByHashtag(userClient: TelegramClient, source: string, tag: string, maxScan = 10000): Promise<Api.Message[]> {
+    const normalizedTag = normalizeHashtag(tag);
+    const result: Api.Message[] = [];
+    let offsetId = 0;
+
+    while (result.length < maxScan) {
+        const batch = await userClient.getMessages(source as any, {
+            limit: Math.min(100, maxScan - result.length),
+            offsetId,
+            search: normalizedTag,
+        });
+        if (!batch.length) break;
+
+        for (const message of batch) {
+            offsetId = message.id;
+            if (messageHasMedia(message) && messageMatchesHashtag(message, normalizedTag)) {
+                result.push(message);
+            }
+        }
+    }
+
+    return result.sort((a, b) => a.id - b.id);
+}
+
+export async function enqueueTelegramTagDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, tagInput: string) {
+    const userClient = requireUserClient();
+    const source = normalizeSource(sourceInput);
+    const tag = normalizeHashtag(tagInput);
+
+    const baseMessages = await getMessagesByHashtag(userClient, source, tag);
+    const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
+    const messageIds = messages.map(message => message.id);
+    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, { tag, messageIds });
+    await persistDownloadItems(jobId, source, messages);
+    await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: messages.length });
+
+    try {
+        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id));
+        await updateDownloadItemsStatus(jobId, result.successfulMessageIds, 'success');
+        await updateDownloadItemsStatus(jobId, result.failedMessageIds, 'failed', '下载失败');
+        await updateDownloadItemsStatus(jobId, result.skippedMessageIds, 'skipped');
+        await updateJob(jobId, {
+            status: result.failed > 0 ? 'completed_with_errors' : 'completed',
+            enqueued_count: result.found,
+            skipped_count: result.skipped,
+            error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
+            finished_at: new Date(),
+        });
+        return { jobId, tag, ...result };
     } catch (error) {
         await updateJob(jobId, { status: 'failed', error: error instanceof Error ? error.message : String(error), finished_at: new Date() });
         throw error;

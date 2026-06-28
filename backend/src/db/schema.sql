@@ -132,3 +132,24 @@ CREATE OR REPLACE TRIGGER telegram_background_jobs_updated_at
     BEFORE UPDATE ON telegram_background_jobs
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
+
+-- Telegram 下载条目表（用于任务条目审计 / 失败统计）
+CREATE TABLE IF NOT EXISTS telegram_download_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID REFERENCES telegram_background_jobs(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    message_id INT NOT NULL,
+    grouped_id TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(job_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_download_items_job_status ON telegram_download_items(job_id, status);
+
+CREATE OR REPLACE TRIGGER telegram_download_items_updated_at
+    BEFORE UPDATE ON telegram_download_items
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();

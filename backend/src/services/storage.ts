@@ -239,13 +239,14 @@ export class S3StorageProvider implements IStorageProvider {
 
     async saveFile(tempPath: string, fileName: string, mimeType: string, folder?: string | null): Promise<string> {
         try {
-            const fileBuffer = fs.readFileSync(tempPath);
             const objectKey = folder ? `${folder}/${fileName}` : fileName;
+            const stats = await fs.promises.stat(tempPath);
             const command = new PutObjectCommand({
                 Bucket: this.bucket,
                 Key: objectKey,
-                Body: fileBuffer,
+                Body: fs.createReadStream(tempPath),
                 ContentType: mimeType,
+                ContentLength: stats.size,
             });
             await this.client.send(command);
             return objectKey;
@@ -331,12 +332,11 @@ export class WebDAVStorageProvider implements IStorageProvider {
 
     async saveFile(tempPath: string, fileName: string, _mimeType?: string, folder?: string | null): Promise<string> {
         try {
-            const fileBuffer = fs.readFileSync(tempPath);
             const remotePath = folder ? `${folder}/${fileName}` : fileName;
             if (folder) {
                 await this.client.createDirectory(`/${folder}`, { recursive: true });
             }
-            await this.client.putFileContents(`/${remotePath}`, fileBuffer);
+            await this.client.putFileContents(`/${remotePath}`, fs.createReadStream(tempPath));
             console.log('[WebDAV] Upload successful:', remotePath);
             return remotePath;
         } catch (error: any) {

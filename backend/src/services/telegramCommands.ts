@@ -14,7 +14,7 @@ import {
     buildDeleteSuccess,
 } from '../utils/telegramMessages.js';
 import { authenticatedUsers, passwordInputState, isAuthenticated } from './telegramState.js';
-import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus } from './telegramUpload.js';
+import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, retryFailedDownloadTasks } from './telegramUpload.js';
 import { storageManager } from './storage.js';
 import { getSetting, setSetting } from '../utils/settings.js';
 import { DuplicateMode, getDuplicateMode } from '../utils/duplicatePolicy.js';
@@ -373,6 +373,32 @@ export async function handleStopTasks(message: Api.Message): Promise<void> {
         console.error('🤖 强制停止任务失败:', error);
         await message.reply({ message: `❌ 强制停止任务失败: ${(error as Error).message}` });
     }
+}
+
+export async function handlePauseTasks(message: Api.Message, args: string[] = []): Promise<void> {
+    const taskId = args[0];
+    const result = pauseDownloadTasks(taskId);
+    await message.reply({ message: `⏸️ 已暂停下载队列${taskId ? `\n任务: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}\n\n当前正在下载的文件会继续完成，新的等待任务暂不开始。` });
+}
+
+export async function handleResumeTasks(message: Api.Message, args: string[] = []): Promise<void> {
+    const taskId = args[0];
+    const result = resumeDownloadTasks(taskId);
+    await message.reply({ message: `▶️ 已继续下载队列${taskId ? `\n任务: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}` });
+}
+
+export async function handleCancelTask(message: Api.Message, args: string[]): Promise<void> {
+    const selector = args.join(' ').trim() || 'all';
+    const result = cancelDownloadTask(selector);
+    await message.reply({ message: result.total > 0 ? `🛑 已取消任务\n\n匹配: ${selector}\n处理中: ${result.active}\n等待中: ${result.pending}` : `📮 没有找到匹配的任务：${selector}` });
+}
+
+export async function handleRetryFailedTasks(message: Api.Message, args: string[]): Promise<void> {
+    const taskId = args.find(arg => /^t[a-z0-9]+/i.test(arg));
+    const numericArg = args.find(arg => /^\d+$/.test(arg));
+    const limit = Math.max(1, Math.min(50, parseInt(numericArg || '10', 10) || 10));
+    const result = await retryFailedDownloadTasks(limit, taskId);
+    await message.reply({ message: result.retried > 0 ? `🔄 已重新加入 ${result.retried} 个失败任务${taskId ? `\n任务: ${taskId}` : ''}` : '📮 最近没有可重试的失败任务' });
 }
 
 export async function handleDownloadWorkers(message: Api.Message): Promise<void> {

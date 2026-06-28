@@ -7,11 +7,12 @@ import path from 'path';
 import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticated, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleStorage, handleList, handleDelete, handleTasks, handleStopTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handlePathRules, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
+import { handleStart, handleHelp, handleStorage, handleList, handleDelete, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handlePathRules, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
 import { handleFileUpload, handleCleanupCallback } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
 import {
     enqueueTelegramDateDownload,
+    enqueueTelegramTagDownload,
     listTelegramBackgroundJobs,
     listTelegramSubscriptions,
     startTelegramSubscriptionWorker,
@@ -29,14 +30,15 @@ const SESSION_FILE = process.env.TELEGRAM_SESSION_FILE || './data/telegram_sessi
 // GramJS Client
 let client: TelegramClient | null = null;
 
-type TelegramWizardKind = 'tg_sub_manage' | 'tg_date';
-type TelegramWizardStep = 'source' | 'start_date' | 'end_date';
+type TelegramWizardKind = 'tg_sub_manage' | 'tg_date' | 'tg_tag';
+type TelegramWizardStep = 'source' | 'start_date' | 'end_date' | 'tag';
 
 interface TelegramWizardState {
     kind: TelegramWizardKind;
     step: TelegramWizardStep;
     source?: string;
     startDate?: string;
+    tag?: string;
 }
 
 const telegramWizardStates = new Map<number, TelegramWizardState>();
@@ -48,7 +50,9 @@ function isCancelInput(text: string): boolean {
 function buildTelegramWizardPrompt(state: TelegramWizardState): string {
     const title = state.kind === 'tg_sub_manage'
         ? '📡 **订阅频道管理**'
-        : '🗓️ **按日期下载频道文件**';
+        : state.kind === 'tg_tag'
+            ? '🏷️ **按标签下载频道文件**'
+            : '🗓️ **按日期下载频道文件**';
 
     if (state.step === 'source') {
         return [
@@ -56,6 +60,18 @@ function buildTelegramWizardPrompt(state: TelegramWizardState): string {
             '',
             '请发送频道用户名或链接：',
             '例如：`@channel_username` 或 `https://t.me/channel_username`',
+            '',
+            '发送“取消”可退出。',
+        ].join('\n');
+    }
+
+    if (state.step === 'tag') {
+        return [
+            title,
+            `📍 频道：${state.source}`,
+            '',
+            '请发送要下载的标签：',
+            '例如：`#壁纸` 或 `壁纸`',
             '',
             '发送“取消”可退出。',
         ].join('\n');
@@ -150,8 +166,24 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
             }
             return true;
         }
-        state.step = 'start_date';
+        if (state.kind === 'tg_tag') {
+            state.step = 'tag';
+        } else {
+            state.step = 'start_date';
+        }
         await message.reply({ message: buildTelegramWizardPrompt(state) });
+        return true;
+    }
+
+    if (state.step === 'tag') {
+        telegramWizardStates.delete(senderId);
+        try {
+            await message.reply({ message: `⏳ 正在扫描 ${state.source} 中带有 ${input.startsWith('#') ? input : `#${input}`} 的媒体消息...` });
+            const result = await enqueueTelegramTagDownload(client!, message, senderId, state.source!, input);
+            await message.reply({ message: `✅ 标签下载任务已提交\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}` });
+        } catch (error) {
+            await message.reply({ message: `❌ 标签下载失败: ${error instanceof Error ? error.message : String(error)}` });
+        }
         return true;
     }
 
@@ -493,6 +525,7 @@ export async function initTelegramBot(): Promise<void> {
                     new Api.BotCommand({ command: 'ytdlp', description: '解析并下载链接到存储源' }),
                     new Api.BotCommand({ command: 'tg_sub', description: '订阅频道自动同步' }),
                     new Api.BotCommand({ command: 'tg_date', description: '按日期下载频道文件' }),
+                    new Api.BotCommand({ command: 'tg_tag', description: '按标签下载频道文件' }),
                     new Api.BotCommand({ command: 'tg_jobs', description: '查看 Telegram 后台任务' }),
                     new Api.BotCommand({ command: 'storage', description: '查看存储统计' }),
                     new Api.BotCommand({ command: 'list', description: '查看上传记录' }),
@@ -670,6 +703,15 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
+                if (text === '/tg_tag') {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await startTelegramWizard(message, senderId, 'tg_tag');
+                    return;
+                }
+
                 if (!text.startsWith('/')) {
                     const handledTelegramWizard = await handleTelegramWizardMessage(message, senderId, text);
                     if (handledTelegramWizard) return;
@@ -739,6 +781,26 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
+                if (text.startsWith('/tg_tag ')) {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    const parts = text.split(/\s+/).slice(1);
+                    if (parts.length !== 2) {
+                        await message.reply({ message: '❌ 用法：/tg_tag @频道 #标签' });
+                        return;
+                    }
+                    try {
+                        await message.reply({ message: `⏳ 正在扫描 ${parts[0]} 中带有 ${parts[1].startsWith('#') ? parts[1] : `#${parts[1]}`} 的媒体消息...` });
+                        const result = await enqueueTelegramTagDownload(client, message, senderId, parts[0], parts[1]);
+                        await message.reply({ message: `✅ 标签下载任务已提交\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}` });
+                    } catch (error) {
+                        await message.reply({ message: `❌ 标签下载失败: ${error instanceof Error ? error.message : String(error)}` });
+                    }
+                    return;
+                }
+
                 if (text === '/tg_jobs' || text === '/tg_tasks') {
                     if (!isAuthenticated(senderId)) {
                         await message.reply({ message: MSG.AUTH_REQUIRED });
@@ -784,6 +846,42 @@ export async function initTelegramBot(): Promise<void> {
                         return;
                     }
                     await handleTasks(message);
+                    return;
+                }
+
+                if (text === '/task_pause' || text.startsWith('/task_pause ')) {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handlePauseTasks(message, text.split(/\s+/).slice(1));
+                    return;
+                }
+
+                if (text === '/task_resume' || text.startsWith('/task_resume ')) {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleResumeTasks(message, text.split(/\s+/).slice(1));
+                    return;
+                }
+
+                if (text === '/task_cancel' || text.startsWith('/task_cancel ')) {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleCancelTask(message, text.split(/\s+/).slice(1));
+                    return;
+                }
+
+                if (text === '/tg_retry' || text.startsWith('/tg_retry ')) {
+                    if (!isAuthenticated(senderId)) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleRetryFailedTasks(message, text.split(/\s+/).slice(1));
                     return;
                 }
 

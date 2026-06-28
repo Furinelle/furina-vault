@@ -37,6 +37,18 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const DEFAULT_TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TELEGRAM_DOWNLOAD_WORKERS || '4', 10) || 4));
 const TELEGRAM_DOWNLOAD_PART_SIZE = 512 * 1024;
 const TG_BATCH_DEFAULT_LIMIT = 50;
+const TG_LARGE_TASK_SEGMENT_SIZE = Math.max(10, parseInt(process.env.TG_LARGE_TASK_SEGMENT_SIZE || '50', 10) || 50);
+const TG_MIN_FREE_DISK_BYTES = Math.max(1024 * 1024 * 1024, (parseInt(process.env.TG_MIN_FREE_DISK_GB || '8', 10) || 8) * 1024 * 1024 * 1024);
+const TG_LARGE_TASK_REFRESH_INTERVAL_MS = Math.max(3000, parseInt(process.env.TG_LARGE_TASK_REFRESH_INTERVAL_MS || '10000', 10) || 10000);
+const TG_DISK_WATERMARK_RECHECK_MS = Math.max(5000, parseInt(process.env.TG_DISK_WATERMARK_RECHECK_MS || '30000', 10) || 30000);
+const TG_DISK_WATERMARK_MAX_WAIT_MS = Math.max(0, parseInt(process.env.TG_DISK_WATERMARK_MAX_WAIT_MS || '0', 10) || 0);
+const TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE = Math.max(1, parseInt(process.env.TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE || '50', 10) || 50);
+
+interface DownloadableMessageRef {
+    id: number;
+    fileInfo: { fileName: string; mimeType: string };
+    totalSize: number;
+}
 
 function clampDownloadWorkers(value: unknown): number {
     const parsed = parseInt(String(value ?? DEFAULT_TELEGRAM_DOWNLOAD_WORKERS), 10);
@@ -141,6 +153,51 @@ async function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function getDiskWatermarkState(requiredBytes = 0): Promise<{ availableBytes: number; ok: boolean }> {
+    const statfs = await fs.promises.statfs(UPLOAD_DIR);
+    const availableBytes = Number(statfs.bavail) * Number(statfs.bsize);
+    return { availableBytes, ok: availableBytes - requiredBytes >= TG_MIN_FREE_DISK_BYTES };
+}
+
+async function ensureDiskWatermark(requiredBytes = 0): Promise<void> {
+    const { availableBytes, ok } = await getDiskWatermarkState(requiredBytes);
+    if (!ok) {
+        throw new Error(`磁盘空间不足，已触发保护：可用 ${formatBytes(availableBytes)}，预计还需 ${formatBytes(requiredBytes)}，需保留 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
+    }
+}
+
+async function waitForDiskWatermark(requiredBytes = 0): Promise<void> {
+    const startedAt = Date.now();
+    let announcedPause = false;
+
+    while (true) {
+        const { availableBytes, ok } = await getDiskWatermarkState(requiredBytes);
+        if (ok) {
+            if (announcedPause) {
+                const stats = downloadQueue.resumeFromDiskPressure();
+                console.log(`[Queue] 💧 磁盘水位恢复，继续下载队列: active=${stats.active}, pending=${stats.pending}`);
+            }
+            return;
+        }
+
+        if (!announcedPause) {
+            const stats = downloadQueue.pauseForDiskPressure(`磁盘空间不足，已暂停下载队列：可用 ${formatBytes(availableBytes)}，预计还需 ${formatBytes(requiredBytes)}，需保留 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
+            console.warn(`[Queue] 💧 磁盘空间不足，已暂停下载队列: active=${stats.active}, pending=${stats.pending}, available=${formatBytes(availableBytes)}, required=${formatBytes(requiredBytes)}, reserve=${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
+            announcedPause = true;
+        }
+
+        if (TG_DISK_WATERMARK_MAX_WAIT_MS > 0 && Date.now() - startedAt >= TG_DISK_WATERMARK_MAX_WAIT_MS) {
+            throw new Error(`磁盘空间不足，已暂停下载队列后等待超时：可用 ${formatBytes(availableBytes)}，预计还需 ${formatBytes(requiredBytes)}，需保留 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
+        }
+
+        await sleep(TG_DISK_WATERMARK_RECHECK_MS);
+    }
+}
+
+function shouldRefreshLargeTaskStatus(lastStatusRefresh: number, completed: number, force = false): boolean {
+    return force || completed <= 3 || completed % 20 === 0 || Date.now() - lastStatusRefresh >= TG_LARGE_TASK_REFRESH_INTERVAL_MS;
+}
+
 /**
  * 安全编辑消息，捕获 FloodWaitError 并更新全局冷却状态
  */
@@ -190,7 +247,7 @@ async function ensureSilentNotice(client: TelegramClient, chatId: Api.TypeEntity
         if (silentNoticeMessageIdMap.get(chatIdStr)) return;
     }
 
-    const text = buildSilentModeNotice(fileCount);
+    const text = buildSilentModeNotice(fileCount, getSessionTaskId(chatIdStr));
 
     const sendPromise = (async () => {
         let sMsg: any;
@@ -250,6 +307,7 @@ async function safeReply(message: Api.Message, params: { message: string, button
 interface DownloadTask {
     id: string;
     execute: () => Promise<void>;
+    rawExecute: (signal: AbortSignal) => Promise<void>;
     abortController: AbortController;
     fileName: string;
     status: 'pending' | 'active' | 'success' | 'failed' | 'cancelled';
@@ -267,6 +325,9 @@ class BetterDownloadQueue {
     private history: DownloadTask[] = [];
     private maxHistory = 50;
     private maxConcurrent = 2; // 用户要求并发限制为 2
+    private paused = false;
+    private diskPressurePaused = false;
+    private diskPressureReason?: string;
 
     async add(fileName: string, execute: (signal: AbortSignal) => Promise<void>, totalSize: number = 0): Promise<void> {
         const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -279,6 +340,7 @@ class BetterDownloadQueue {
                 abortController,
                 totalSize,
                 downloadedSize: 0,
+                rawExecute: execute,
                 // The actual execution logic
                 execute: async () => {
                     task.status = 'active';
@@ -319,7 +381,7 @@ class BetterDownloadQueue {
     }
 
     private processNext() {
-        if (this.active.length >= this.maxConcurrent || this.queue.length === 0) {
+        if (this.paused || this.active.length >= this.maxConcurrent || this.queue.length === 0) {
             return;
         }
 
@@ -335,7 +397,10 @@ class BetterDownloadQueue {
         return {
             active: this.active.length,
             pending: this.queue.length,
-            total: this.active.length + this.queue.length
+            total: this.active.length + this.queue.length,
+            paused: this.paused,
+            diskPressurePaused: this.diskPressurePaused,
+            diskPressureReason: this.diskPressureReason,
         };
     }
 
@@ -343,7 +408,10 @@ class BetterDownloadQueue {
         return {
             active: [...this.active],
             pending: [...this.queue],
-            history: [...this.history]
+            history: [...this.history],
+            paused: this.paused,
+            diskPressurePaused: this.diskPressurePaused,
+            diskPressureReason: this.diskPressureReason,
         };
     }
 
@@ -353,6 +421,72 @@ class BetterDownloadQueue {
         if (task) {
             task.downloadedSize = downloaded;
         }
+    }
+
+    pause(): { active: number; pending: number; total: number } {
+        this.paused = true;
+        return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
+    }
+
+    pauseForDiskPressure(reason: string): { active: number; pending: number; total: number } {
+        this.diskPressurePaused = true;
+        this.diskPressureReason = reason;
+        this.paused = true;
+        return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
+    }
+
+    resume(): { active: number; pending: number; total: number } {
+        this.diskPressurePaused = false;
+        this.diskPressureReason = undefined;
+        this.paused = false;
+        this.processNext();
+        return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
+    }
+
+    resumeFromDiskPressure(): { active: number; pending: number; total: number } {
+        if (!this.diskPressurePaused) {
+            return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
+        }
+        this.diskPressurePaused = false;
+        this.diskPressureReason = undefined;
+        this.paused = false;
+        this.processNext();
+        return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
+    }
+
+    cancel(selector?: string, reason: string = '用户取消任务'): { active: number; pending: number; total: number } {
+        const normalized = selector?.trim();
+        if (!normalized || normalized === 'all') return this.forceStopAll(reason);
+        let cancelledPending = 0;
+        const pendingIndex = this.queue.findIndex((task, index) => task.id.startsWith(normalized) || String(index + 1) === normalized || task.fileName.includes(normalized));
+        if (pendingIndex >= 0) {
+            const [task] = this.queue.splice(pendingIndex, 1);
+            task.status = 'cancelled';
+            task.error = reason;
+            task.endTime = Date.now();
+            this.history.unshift(task);
+            cancelledPending = 1;
+        }
+        let cancelledActive = 0;
+        for (const task of this.active) {
+            if (task.id.startsWith(normalized) || task.fileName.includes(normalized)) {
+                task.error = reason;
+                task.abortController.abort(reason);
+                cancelledActive += 1;
+            }
+        }
+        if (this.history.length > this.maxHistory) this.history.splice(this.maxHistory);
+        return { active: cancelledActive, pending: cancelledPending, total: cancelledActive + cancelledPending };
+    }
+
+    async retryFailed(limit = 10): Promise<{ retried: number }> {
+        const failed = this.history.filter(task => task.status === 'failed').slice(0, Math.max(1, limit));
+        let retried = 0;
+        for (const task of failed) {
+            this.add(task.fileName, task.rawExecute, task.totalSize || 0).catch(err => console.error(`[Queue] retry failed: ${task.fileName}`, err));
+            retried += 1;
+        }
+        return { retried };
     }
 
     forceStopAll(reason: string = '用户强制停止'): { active: number; pending: number; total: number } {
@@ -410,24 +544,43 @@ interface SilentSession {
     total: number;
     completed: number;
     failed: number;
+    taskId: string;
     knownTaskKeys: Set<string>;
     knownTaskCounts: Map<string, number>;
 }
 
 const silentSessionMap = new Map<string, SilentSession>();
+const taskIdToChatId = new Map<string, string>();
+
+function createSessionTaskId(): string {
+    return `t${Date.now().toString(36).slice(-5)}${Math.random().toString(36).slice(2, 5)}`;
+}
+
+function getSessionTaskId(chatIdStr: string): string | undefined {
+    return silentSessionMap.get(chatIdStr)?.taskId;
+}
+
+function resolveTaskChatId(taskId?: string): string | undefined {
+    if (!taskId) return undefined;
+    return taskIdToChatId.get(taskId.trim());
+}
 
 function getSilentSession(chatIdStr: string): SilentSession {
     let s = silentSessionMap.get(chatIdStr);
     if (!s) {
-        s = { total: 0, completed: 0, failed: 0, knownTaskKeys: new Set(), knownTaskCounts: new Map() };
+        const taskId = createSessionTaskId();
+        s = { total: 0, completed: 0, failed: 0, taskId, knownTaskKeys: new Set(), knownTaskCounts: new Map() };
         silentSessionMap.set(chatIdStr, s);
+        taskIdToChatId.set(taskId, chatIdStr);
     }
     return s;
 }
 
 function startSilentSession(chatIdStr: string, total: number): SilentSession {
-    const s = { total, completed: 0, failed: 0, knownTaskKeys: new Set<string>(), knownTaskCounts: new Map<string, number>() };
+    const taskId = createSessionTaskId();
+    const s = { total, completed: 0, failed: 0, taskId, knownTaskKeys: new Set<string>(), knownTaskCounts: new Map<string, number>() };
     silentSessionMap.set(chatIdStr, s);
+    taskIdToChatId.set(taskId, chatIdStr);
     return s;
 }
 
@@ -444,12 +597,13 @@ async function finalizeSilentSessionIfDone(client: TelegramClient, chatId: Api.T
 
     // 编辑静默通知为完成消息
     if (silentMsgId) {
-        const text = buildSilentAllTasksComplete(s?.total || 0, s?.failed || 0);
+        const text = buildSilentAllTasksComplete(s?.total || 0, s?.failed || 0, s?.taskId);
         await safeEditMessage(client, chatId, { message: silentMsgId, text });
     }
 
     // 清理静默状态
     silentSessionMap.delete(chatIdStr);
+    if (s?.taskId) taskIdToChatId.delete(s.taskId);
     silentNoticeMessageIdMap.delete(chatIdStr);
     lastSilentNotificationTimeMap.delete(chatIdStr);
 
@@ -747,7 +901,7 @@ async function refreshSilentProgress(client: TelegramClient, chatId: Api.TypeEnt
     const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
     const batches = getConsolidatedBatches(chatIdStr);
     const files = getConsolidatedFiles(chatIdStr);
-    const text = buildSilentProgress(session.total, batches, files, session.completed, session.failed);
+    const text = buildSilentProgress(session.total, batches, files, session.completed, session.failed, session.taskId);
     await safeEditMessage(client, chatId, { message: silentMsgId, text });
 }
 
@@ -761,7 +915,9 @@ async function checkAndResetSession(client: TelegramClient, chatId: Api.TypeEnti
     // 这能解决因重启或异常导致的“僵尸”静默会话问题
     const outstanding = getOutstandingTaskCount(chatIdStr);
     if (outstanding === 0 && silentSessionMap.has(chatIdStr)) {
+        const zombieTaskId = getSessionTaskId(chatIdStr);
         silentSessionMap.delete(chatIdStr);
+        if (zombieTaskId) taskIdToChatId.delete(zombieTaskId);
         silentNoticeMessageIdMap.delete(chatIdStr);
         lastSilentNotificationTimeMap.delete(chatIdStr);
         console.log(`[TG][silent] Auto-cleared zombie session for ${chatIdStr}`);
@@ -835,6 +991,29 @@ export function getTaskStatus() {
 
 export function forceStopDownloadTasks(reason?: string) {
     return downloadQueue.forceStopAll(reason);
+}
+
+export function pauseDownloadTasks(_taskId?: string) {
+    // 当前底层下载队列是全局队列；taskId 仅用于用户侧定位任务提示。
+    return downloadQueue.pause();
+}
+
+export function resumeDownloadTasks(_taskId?: string) {
+    // 当前底层下载队列是全局队列；taskId 仅用于用户侧定位任务提示。
+    return downloadQueue.resume();
+}
+
+export function cancelDownloadTask(selector?: string) {
+    const normalized = selector?.trim();
+    if (normalized && resolveTaskChatId(normalized)) {
+        return downloadQueue.forceStopAll(`用户通过 /task_cancel ${normalized} 取消任务`);
+    }
+    return downloadQueue.cancel(normalized, '用户通过 /task_cancel 取消任务');
+}
+
+export function retryFailedDownloadTasks(limit = 10, _taskId?: string) {
+    // 当前失败历史来自全局队列；taskId 仅用于用户侧定位任务提示。
+    return downloadQueue.retryFailed(limit);
 }
 
 // 多文件上传队列管理
@@ -1010,6 +1189,7 @@ async function downloadAndSaveFile(
 
     try {
         if (signal?.aborted) throw new Error('下载任务已停止');
+        await waitForDiskWatermark(totalSize || 0);
         const configuredWorkers = await getTelegramDownloadWorkers();
         const media = getDownloadableMedia(message);
         if (!media) {
@@ -1242,6 +1422,17 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
     return downloadQueue.add(taskDisplayName, queueTask);
 }
 
+async function processMediaGroupFilesBounded(
+    client: TelegramClient,
+    queue: MediaGroupQueue,
+    onFileSettled: () => Promise<void>,
+): Promise<void> {
+    for (let offset = 0; offset < queue.files.length; offset += TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE) {
+        const batch = queue.files.slice(offset, offset + TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE);
+        await Promise.all(batch.map(file => processFileUpload(client, file, queue).finally(onFileSettled)));
+    }
+}
+
 // 处理批量文件上传队列
 async function processBatchUpload(client: TelegramClient, mediaGroupId: string): Promise<void> {
     const queue = mediaGroupQueues.get(mediaGroupId);
@@ -1357,17 +1548,8 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
     }, 3000);
 
     try {
-        // 启动所有文件上传
-        // 注意：我们需要修改 processFileUpload 以便它能正确工作，
-        // 或者我们可以在这里包装它。processFileUpload 自带了 retry 逻辑。
-        // 为了简单，我们让 processFileUpload 更新 file.status，我们要监控 queue.files 的状态变化。
-        // 上面的 setInterval 已经负责了轮询状态并更新 UI。
-        // 我们只需等待所有 promise 完成。
-
-        // 启动所有文件上传，保留 Telegram 原始文件名，避免频道名重复写入文件名
-        await Promise.all(queue.files.map((file) => {
-            return processFileUpload(client, file, queue).finally(refreshBatchProgressAndFinalizeSilent);
-        }));
+        // 分批加入下载队列，限制一次性创建的 Promise / 闭包数量，同时保留队列并发。
+        await processMediaGroupFilesBounded(client, queue, refreshBatchProgressAndFinalizeSilent);
 
         // 最后一次更新状态
         await onBatchProgress();
@@ -1462,7 +1644,7 @@ export async function downloadTelegramChannelRange(
     limit: number = 50,
     direction: 'older' | 'newer' = 'older',
     explicitIds?: number[],
-): Promise<{ requested: number; found: number; skipped: number; firstId: number; lastId: number }> {
+): Promise<{ requested: number; found: number; skipped: number; failed: number; successful: number; successfulMessageIds: number[]; failedMessageIds: number[]; skippedMessageIds: number[]; firstId: number; lastId: number }> {
     const userClient = getTelegramUserClient();
     if (!userClient || !isTelegramUserClientReady()) {
         throw new Error('Telegram 用户账号下载器未就绪：请先配置 TELEGRAM_USER_API_ID / TELEGRAM_USER_API_HASH 并生成 user session');
@@ -1481,7 +1663,6 @@ export async function downloadTelegramChannelRange(
         ? source
         : `@${source}`;
 
-    const messages = await userClient.getMessages(sourceEntity as any, { ids });
     const chatId = requestMessage.chatId;
     if (!chatId) {
         throw new Error('无法识别当前 Bot 会话');
@@ -1492,87 +1673,139 @@ export async function downloadTelegramChannelRange(
     let found = 0;
     let skipped = 0;
     const chatIdStr = chatId.toString();
+    const downloadableRefs: DownloadableMessageRef[] = [];
+    const successfulMessageIds: number[] = [];
+    const failedMessageIds: number[] = [];
+    const skippedMessageIds: number[] = [];
 
-    for (const sourceMessage of messages) {
-        if (!sourceMessage) {
-            skipped += 1;
-            continue;
+    for (let offset = 0; offset < ids.length; offset += TG_LARGE_TASK_SEGMENT_SIZE) {
+        const scanIds = ids.slice(offset, offset + TG_LARGE_TASK_SEGMENT_SIZE);
+        const scanMessages = await userClient.getMessages(sourceEntity as any, { ids: scanIds });
+        const returnedIds = new Set<number>();
+        for (const sourceMessage of scanMessages) {
+            if (!sourceMessage) continue;
+            returnedIds.add(sourceMessage.id);
+            const fileInfo = extractFileInfo(sourceMessage);
+            if (!fileInfo) {
+                skipped += 1;
+                skippedMessageIds.push(sourceMessage.id);
+                continue;
+            }
+            downloadableRefs.push({ id: sourceMessage.id, fileInfo, totalSize: getEstimatedFileSize(sourceMessage) });
         }
-
-        const fileInfo = extractFileInfo(sourceMessage);
-        if (!fileInfo) {
-            skipped += 1;
-            continue;
+        for (const requestedId of scanIds) {
+            if (!returnedIds.has(requestedId)) {
+                skipped += 1;
+                skippedMessageIds.push(requestedId);
+            }
         }
-
-        const { fileName, mimeType } = fileInfo;
-        const typeEmoji = getTypeEmoji(mimeType);
-        const totalSize = getEstimatedFileSize(sourceMessage);
-        const uploadId = `tg-range-${sourceMessage.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-        registerUpload(chatIdStr, uploadId, {
-            fileName,
-            typeEmoji,
-            phase: 'queued',
-            total: totalSize,
-        });
-
-        const uploadItem: FileUploadItem = {
-            fileName,
-            mimeType,
-            message: sourceMessage as Api.Message,
-            status: 'pending',
-        };
-
-        processFileUpload(userClient, uploadItem).then(async () => {
-            if (uploadItem.status === 'success') {
-                updateUploadPhase(chatIdStr, uploadId, {
-                    phase: 'success',
-                    size: uploadItem.size,
-                    providerName: storageManager.getProvider().name,
-                    fileType: uploadItem.fileType,
-                });
-            } else {
-                updateUploadPhase(chatIdStr, uploadId, { phase: 'failed', error: uploadItem.error || '下载失败' });
-            }
-
-            if (silentSessionMap.has(chatIdStr)) {
-                const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
-                const files = getConsolidatedFiles(chatIdStr);
-                session.completed = Math.max(session.completed, files.filter(file => file.phase === 'success' || file.phase === 'failed').length);
-                session.failed = Math.max(session.failed, files.filter(file => file.phase === 'failed').length);
-                await refreshSilentProgress(botClient, chatId);
-                await finalizeSilentSessionIfDone(botClient, chatId);
-            } else {
-                await refreshConsolidatedMessage(botClient, chatId);
-            }
-
-            setTimeout(() => removeUpload(chatIdStr, uploadId), 8000);
-        }).catch(async err => {
-            console.error(`🤖 频道批量下载任务异常: ${fileName}`, err);
-            updateUploadPhase(chatIdStr, uploadId, { phase: 'failed', error: err instanceof Error ? err.message : String(err) });
-            if (silentSessionMap.has(chatIdStr)) {
-                const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
-                session.failed += 1;
-                await refreshSilentProgress(botClient, chatId);
-                await finalizeSilentSessionIfDone(botClient, chatId);
-            } else {
-                await refreshConsolidatedMessage(botClient, chatId);
-            }
-            setTimeout(() => removeUpload(chatIdStr, uploadId), 8000);
-        });
-        found += 1;
     }
 
-    if (found > 0) {
+    const batchId = `tg-range-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    if (downloadableRefs.length > 0) {
+        registerBatch(chatIdStr, batchId, {
+            id: batchId,
+            folderName: sourceEntity.toString(),
+            totalFiles: downloadableRefs.length,
+            completed: 0,
+            successful: 0,
+            failed: 0,
+            providerName: storageManager.getProvider().name,
+            queuePending: 0,
+        });
         await trySilentMode(botClient, chatId, requestMessage);
         await refreshConsolidatedMessage(botClient, chatId, requestMessage);
+    }
+
+    let completed = 0;
+    let successful = 0;
+    let failed = 0;
+    let lastStatusRefresh = 0;
+
+    const refreshSegmentStatus = async (force = false, currentFileName?: string) => {
+        if (!shouldRefreshLargeTaskStatus(lastStatusRefresh, completed, force)) return;
+        lastStatusRefresh = Date.now();
+        const stats = downloadQueue.getStats();
+        updateBatch(chatIdStr, batchId, {
+            completed,
+            successful,
+            failed,
+            queuePending: stats.pending,
+            currentFileName,
+        });
+        if (silentSessionMap.has(chatIdStr)) {
+            await refreshSilentProgress(botClient, chatId);
+            await finalizeSilentSessionIfDone(botClient, chatId);
+        } else {
+            await refreshConsolidatedMessage(botClient, chatId);
+        }
+    };
+
+    for (let offset = 0; offset < downloadableRefs.length; offset += TG_LARGE_TASK_SEGMENT_SIZE) {
+        const segment = downloadableRefs.slice(offset, offset + TG_LARGE_TASK_SEGMENT_SIZE);
+        const segmentBytes = segment.reduce((sum, item) => sum + (item.totalSize || 0), 0);
+        await waitForDiskWatermark(segmentBytes);
+        const segmentIds = segment.map(item => item.id);
+        const segmentMessages = await userClient.getMessages(sourceEntity as any, { ids: segmentIds });
+        const segmentMessageById = new Map<number, Api.Message>();
+        for (const segmentMessage of segmentMessages) {
+            if (segmentMessage) segmentMessageById.set(segmentMessage.id, segmentMessage as Api.Message);
+        }
+
+        await Promise.all(segment.map(async (item) => {
+            const { fileName, mimeType } = item.fileInfo;
+            const message = segmentMessageById.get(item.id);
+            if (!message) {
+                skipped += 1;
+                failed += 1;
+                completed += 1;
+                skippedMessageIds.push(item.id);
+                await refreshSegmentStatus(false, fileName);
+                return;
+            }
+            const uploadItem: FileUploadItem = {
+                fileName,
+                mimeType,
+                message,
+                status: 'pending',
+            };
+            try {
+                await processFileUpload(userClient, uploadItem);
+                if (uploadItem.status === 'success') {
+                    successful += 1;
+                    successfulMessageIds.push(item.id);
+                } else {
+                    failed += 1;
+                    failedMessageIds.push(item.id);
+                }
+            } catch (err) {
+                console.error(`🤖 频道分段下载任务异常: ${fileName}`, err);
+                failed += 1;
+                failedMessageIds.push(item.id);
+            } finally {
+                completed += 1;
+                found += 1;
+                await refreshSegmentStatus(false, fileName);
+            }
+        }));
+        await refreshSegmentStatus(true, segment[segment.length - 1]?.fileInfo.fileName);
+    }
+
+    if (downloadableRefs.length > 0) {
+        updateBatch(chatIdStr, batchId, { completed, successful, failed, queuePending: 0, currentFileName: undefined });
+        await refreshSegmentStatus(true);
+        setTimeout(() => removeBatch(chatIdStr, batchId), 8000);
     }
 
     return {
         requested: ids.length,
         found,
         skipped,
+        failed,
+        successful,
+        successfulMessageIds,
+        failedMessageIds,
+        skippedMessageIds: skippedMessageIds.filter(id => id > 0),
         firstId: ids[0],
         lastId: ids[ids.length - 1],
     };
@@ -1602,6 +1835,9 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
     const mediaGroupId = (message as any).groupedId?.toString();
 
     if (mediaGroupId) {
+        if (message.chatId) {
+            await checkAndResetSession(client, message.chatId);
+        }
         let queue = mediaGroupQueues.get(mediaGroupId);
         if (!queue) {
             queue = {
