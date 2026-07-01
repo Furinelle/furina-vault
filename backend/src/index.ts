@@ -5,6 +5,7 @@ import path from 'path';
 import fs from 'fs';
 
 import filesRouter from './routes/files.js';
+import scopedFolderOperationsRouter from './routes/folderOperations.js';
 import uploadRouter from './routes/upload.js';
 import storageRouter from './routes/storage.js';
 import chunkedUploadRouter from './routes/chunkedUpload.js';
@@ -95,6 +96,7 @@ app.use('/thumbnails', requireAuth, express.static(THUMBNAIL_DIR, {
 }));
 
 // API 路由（需要认证）
+app.use('/api/files', requireAuth, scopedFolderOperationsRouter);
 app.use('/api/files', requireAuthOrSignedUrl, filesRouter);
 app.use('/api/upload', requireAuth, uploadRouter);
 app.use('/api/v1/upload', requireAuth, uploadRouter); // 外部 API 接口保持原有认证（API Key）
