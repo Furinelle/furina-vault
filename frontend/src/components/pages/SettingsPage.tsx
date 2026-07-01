@@ -300,17 +300,38 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
             const left = window.screenX + (window.innerWidth - width) / 2;
             const top = window.screenY + (window.innerHeight - height) / 2;
 
-            window.open(authUrl, 'OneDriveAuth', `width=${width},height=${height},left=${left},top=${top},status=yes,toolbar=no,menubar=no`);
+            const authWindow = window.open(authUrl, 'OneDriveAuth', `width=${width},height=${height},left=${left},top=${top},status=yes,toolbar=no,menubar=no`);
+            if (!authWindow) {
+                throw new Error('授权窗口被浏览器拦截，请允许弹窗后重试');
+            }
+
+            let authHandled = false;
+            const finishOneDriveAuth = async (showAlert: boolean) => {
+                if (authHandled) return;
+                authHandled = true;
+                window.removeEventListener('message', messageHandler);
+                window.clearInterval(authWindowPoll);
+                const newData = await fileApi.getStorageConfig();
+                setConfig(newData);
+                setShowOneDriveForm(false);
+                if (showAlert) {
+                    alert("OneDrive 授权成功并已启用！");
+                }
+            };
 
             const messageHandler = async (event: MessageEvent) => {
                 if (event.data === 'onedrive_auth_success') {
-                    const newData = await fileApi.getStorageConfig();
-                    setConfig(newData);
-                    alert("OneDrive 授权成功并已启用！");
-                    window.removeEventListener('message', messageHandler);
+                    await finishOneDriveAuth(true);
                 }
             };
             window.addEventListener('message', messageHandler);
+
+            const authWindowPoll = window.setInterval(async () => {
+                if (authHandled) return;
+                if (authWindow.closed) {
+                    await finishOneDriveAuth(false);
+                }
+            }, 1000);
         } catch (error: any) {
             alert("发起授权失败: " + error.message);
         } finally {
@@ -1029,8 +1050,11 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
                                     </div>
                                     <p className="text-xs text-muted-foreground leading-relaxed">
                                         前往 <a href="https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">Microsoft Entra ID 控制台</a> 并登录。授权账号可与最终存储账号不同。
-                                        注册应用时，<b>重定向 URI</b> 请选择 <code>Web</code>（或公共客户端），并填写：
+                                        注册应用时，<b>重定向 URI</b> 请选择 <code>Web</code>，并填写：
                                         <code className="block mt-1 p-1 bg-muted rounded text-primary">{(config as any)?.redirectUri || `${(window as any)._env_?.VITE_API_URL || import.meta.env.VITE_API_URL || window.location.origin}/api/storage/onedrive/callback`}</code>
+                                    </p>
+                                    <p className="text-xs text-amber-600 dark:text-amber-400 leading-relaxed rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
+                                        如果填写客户端密码，请复制 Azure「证书和密码」里新建密码后的<b>值 Value</b>；不要复制“机密 ID/Secret ID”。复制错会导致 Microsoft 返回 <code>AADSTS7000215 Invalid client secret</code>。
                                     </p>
                                 </div>
 

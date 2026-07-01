@@ -1599,7 +1599,7 @@ var init_storage = __esm({
 import express from "express";
 import cors from "cors";
 import dotenv3 from "dotenv";
-import path18 from "path";
+import path19 from "path";
 import fs15 from "fs";
 
 // src/routes/files.ts
@@ -6948,6 +6948,11 @@ async function sendLoginNotification(req) {
   await sendSecurityNotification(message);
 }
 var router = Router();
+var SIGNED_URL_TYPES = /* @__PURE__ */ new Set(["preview", "thumbnail", "download"]);
+function normalizeSignedUrlType(value) {
+  if (typeof value !== "string") return null;
+  return SIGNED_URL_TYPES.has(value) ? value : null;
+}
 function getAuthToken(req) {
   const headerToken = req.headers["authorization"]?.replace("Bearer ", "");
   if (headerToken) return headerToken;
@@ -7118,16 +7123,25 @@ router.get("/status", (_req, res) => {
   });
 });
 router.post("/sign-url", requireAuth, (req, res) => {
-  const { fileId, expiresIn = 300 } = req.body;
+  const { fileId, expiresIn = 300, type = "preview" } = req.body;
   if (!fileId) {
     return res.status(400).json({ error: "\u7F3A\u5C11 fileId" });
   }
-  const expires = Date.now() + expiresIn * 1e3;
-  const sign = generateSignature(fileId, expires);
+  const signedType = normalizeSignedUrlType(type);
+  if (!signedType) {
+    return res.status(400).json({ error: "\u7B7E\u540D\u7C7B\u578B\u65E0\u6548" });
+  }
+  const expiresInSeconds = Number(expiresIn);
+  if (!Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) {
+    return res.status(400).json({ error: "\u8FC7\u671F\u65F6\u95F4\u65E0\u6548" });
+  }
+  const expires = Date.now() + expiresInSeconds * 1e3;
+  const sign = generateSignature(fileId, signedType, expires);
   res.json({
     sign,
     expires,
-    expiresIn
+    expiresIn: expiresInSeconds,
+    type: signedType
   });
 });
 function requireAuth(req, res, next) {
@@ -7148,29 +7162,41 @@ function requireAuth(req, res, next) {
 var auth_default = router;
 
 // src/middleware/signedUrl.ts
-function generateSignature(fileId, expires) {
-  const data = `${fileId}:${expires}`;
+var SIGNED_URL_TYPES2 = /* @__PURE__ */ new Set(["preview", "thumbnail", "download"]);
+function normalizeSignedUrlType2(value) {
+  if (!value) return null;
+  return SIGNED_URL_TYPES2.has(value) ? value : null;
+}
+function getSignedUrlRouteParts(req) {
+  let id = req.params.id;
+  let type = normalizeSignedUrlType2(req.params.type);
+  const match = req.path.match(/^\/?([^\/]+)\/(preview|thumbnail|download)(?:\/|$)/);
+  if (match) {
+    id = id || match[1];
+    type = type || normalizeSignedUrlType2(match[2]);
+  }
+  return { id, type };
+}
+function generateSignature(fileId, typeOrExpires, expires) {
+  const type = typeof typeOrExpires === "number" ? "preview" : typeOrExpires;
+  const expiresTimestamp = typeof typeOrExpires === "number" ? typeOrExpires : expires;
+  if (typeof expiresTimestamp !== "number") {
+    throw new Error("Missing signed URL expiration timestamp");
+  }
+  const data = `${fileId}:${type}:${expiresTimestamp}`;
   return crypto8.createHmac("sha256", SESSION_SECRET).update(data).digest("hex");
 }
 function getSignedUrl(fileId, type, expiresIn = 24 * 60 * 60) {
   const expires = Date.now() + expiresIn * 1e3;
-  const sign = generateSignature(fileId, expires);
+  const sign = generateSignature(fileId, type, expires);
   return `/api/files/${fileId}/${type}?sign=${sign}&expires=${expires}`;
 }
 function verifySignedUrl(req) {
   const sign = req.query.sign;
   const expires = req.query.expires;
-  let id = req.params.id;
-  if (!id) {
-    const match = req.path.match(/^\/?([^\/]+)/);
-    if (match) {
-      id = match[1];
-    } else {
-      console.log("[SignedURL] Failed to extract ID from path:", req.path);
-    }
-  }
-  if (typeof sign !== "string" || typeof expires !== "string" || typeof id !== "string") {
-    console.log("[SignedURL] Missing or invalid params:", { sign, expires, id });
+  const { id, type } = getSignedUrlRouteParts(req);
+  if (typeof sign !== "string" || typeof expires !== "string" || typeof id !== "string" || !type) {
+    console.log("[SignedURL] Missing or invalid params:", { sign, expires, id, type });
     return false;
   }
   const expiresTimestamp = parseInt(expires, 10);
@@ -7182,12 +7208,12 @@ function verifySignedUrl(req) {
     console.log("[SignedURL] Expired signature:", { now: Date.now(), expires: expiresTimestamp });
     return false;
   }
-  const expectedSign = generateSignature(id, expiresTimestamp);
+  const expectedSign = generateSignature(id, type, expiresTimestamp);
   try {
     const received = Buffer.from(sign, "hex");
     const expected = Buffer.from(expectedSign, "hex");
     if (received.length !== expected.length || !crypto8.timingSafeEqual(received, expected)) {
-      console.log("[SignedURL] Signature mismatch:", { id });
+      console.log("[SignedURL] Signature mismatch:", { id, type });
       return false;
     }
   } catch {
@@ -7810,12 +7836,164 @@ router2.post("/:id([0-9a-fA-F-]{36})/favorite", async (req, res) => {
 });
 var files_default = router2;
 
+// src/routes/folderOperations.ts
+init_db();
+init_localPath();
+import { Router as Router3 } from "express";
+import path15 from "path";
+var router3 = Router3();
+var UPLOAD_DIR5 = path15.resolve(process.env.UPLOAD_DIR || "./data/uploads");
+var THUMBNAIL_DIR5 = path15.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var CLOUD_SOURCES = /* @__PURE__ */ new Set(["onedrive", "aliyun_oss", "s3", "webdav", "google_drive"]);
+async function getCurrentStorageScope() {
+  const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+  const provider = storageManager2.getProvider();
+  if (provider.name === "local") {
+    return { clause: "source = 'local'", params: [] };
+  }
+  return { clause: "storage_account_id = $1", params: [storageManager2.getActiveAccountId()] };
+}
+function nextParam(scope, offset) {
+  return `$${scope.params.length + offset}`;
+}
+async function removePhysicalFile(file) {
+  if (CLOUD_SOURCES.has(file.source)) {
+    const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+    const provider = storageManager2.getProvider(`${file.source}:${file.storage_account_id}`);
+    await provider.deleteFile(file.path);
+  } else {
+    const filePath = file.path || path15.join(UPLOAD_DIR5, file.stored_name);
+    await safeUnlink(filePath, UPLOAD_DIR5);
+  }
+  if (file.thumbnail_path) {
+    const thumbPath = path15.join(THUMBNAIL_DIR5, path15.basename(file.thumbnail_path));
+    await safeUnlink(thumbPath, THUMBNAIL_DIR5);
+  }
+}
+router3.post("/batch-delete", async (req, res) => {
+  try {
+    const { fileIds = [], folderNames = [] } = req.body;
+    if (!Array.isArray(fileIds) || !Array.isArray(folderNames)) {
+      return res.status(400).json({ error: "\u53C2\u6570\u683C\u5F0F\u9519\u8BEF" });
+    }
+    if (fileIds.length === 0 && folderNames.length === 0) {
+      return res.status(400).json({ error: "\u8BF7\u63D0\u4F9B\u8981\u5220\u9664\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939" });
+    }
+    const scope = await getCurrentStorageScope();
+    let filesToDelete = [];
+    if (fileIds.length > 0) {
+      const result = await query(
+        `SELECT * FROM files WHERE ${scope.clause} AND id = ANY(${nextParam(scope, 1)})`,
+        [...scope.params, fileIds]
+      );
+      filesToDelete = [...filesToDelete, ...result.rows];
+    }
+    if (folderNames.length > 0) {
+      const result = await query(
+        `SELECT * FROM files WHERE ${scope.clause} AND folder = ANY(${nextParam(scope, 1)})`,
+        [...scope.params, folderNames]
+      );
+      filesToDelete = [...filesToDelete, ...result.rows];
+    }
+    const uniqueFiles = Array.from(new Map(filesToDelete.map((file) => [file.id, file])).values());
+    if (uniqueFiles.length === 0) {
+      return res.json({ success: true, message: "\u6CA1\u6709\u53D1\u73B0\u5F85\u5220\u9664\u7684\u9879\u76EE" });
+    }
+    await Promise.all(uniqueFiles.map(async (file) => {
+      try {
+        await removePhysicalFile(file);
+      } catch (err) {
+        console.error(`\u5220\u9664\u7269\u7406\u6587\u4EF6\u5931\u8D25 (ID: ${file.id}):`, err);
+      }
+    }));
+    const idsToDelete = uniqueFiles.map((file) => file.id);
+    await query("DELETE FROM files WHERE id = ANY($1)", [idsToDelete]);
+    res.json({ success: true, message: `\u6210\u529F\u5220\u9664 ${uniqueFiles.length} \u4E2A\u6587\u4EF6` });
+  } catch (error) {
+    console.error("\u6279\u91CF\u5220\u9664\u5931\u8D25:", error);
+    res.status(500).json({ error: "\u6279\u91CF\u5220\u9664\u5931\u8D25" });
+  }
+});
+router3.patch("/rename-folder", async (req, res) => {
+  try {
+    const { oldName, newName } = req.body;
+    if (!oldName || !newName || typeof oldName !== "string" || typeof newName !== "string") {
+      return res.status(400).json({ error: "\u53C2\u6570\u9519\u8BEF" });
+    }
+    const trimmedNew = newName.trim();
+    if (trimmedNew.length === 0) {
+      return res.status(400).json({ error: "\u6587\u4EF6\u5939\u540D\u4E0D\u80FD\u4E3A\u7A7A" });
+    }
+    if (/[\/\\:*?"<>|]/.test(trimmedNew)) {
+      return res.status(400).json({ error: "\u6587\u4EF6\u5939\u540D\u5305\u542B\u975E\u6CD5\u5B57\u7B26" });
+    }
+    const scope = await getCurrentStorageScope();
+    const checkResult = await query(
+      `SELECT COUNT(*) as cnt FROM files WHERE ${scope.clause} AND folder = ${nextParam(scope, 1)}`,
+      [...scope.params, oldName]
+    );
+    if (parseInt(checkResult.rows[0].cnt) === 0) {
+      return res.status(404).json({ error: "\u6587\u4EF6\u5939\u4E0D\u5B58\u5728" });
+    }
+    if (trimmedNew !== oldName) {
+      const existResult = await query(
+        `SELECT COUNT(*) as cnt FROM files WHERE ${scope.clause} AND folder = ${nextParam(scope, 1)}`,
+        [...scope.params, trimmedNew]
+      );
+      if (parseInt(existResult.rows[0].cnt) > 0) {
+        return res.status(400).json({ error: "\u8BE5\u6587\u4EF6\u5939\u540D\u5DF2\u5B58\u5728" });
+      }
+    }
+    await query(
+      `UPDATE files SET folder = ${nextParam(scope, 1)} WHERE ${scope.clause} AND folder = ${nextParam(scope, 2)}`,
+      [...scope.params, trimmedNew, oldName]
+    );
+    res.json({ success: true, name: trimmedNew });
+  } catch (error) {
+    console.error("\u91CD\u547D\u540D\u6587\u4EF6\u5939\u5931\u8D25:", error);
+    res.status(500).json({ error: "\u91CD\u547D\u540D\u6587\u4EF6\u5939\u5931\u8D25" });
+  }
+});
+router3.patch("/move-folder", async (req, res) => {
+  try {
+    const { oldName, newName } = req.body;
+    if (!oldName || typeof oldName !== "string") {
+      return res.status(400).json({ error: "\u539F\u6587\u4EF6\u5939\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A" });
+    }
+    if (newName !== null && typeof newName !== "string") {
+      return res.status(400).json({ error: "\u76EE\u6807\u6587\u4EF6\u5939\u540D\u79F0\u683C\u5F0F\u9519\u8BEF" });
+    }
+    const trimmedOld = oldName.trim();
+    const trimmedNew = newName ? newName.trim() : null;
+    if (trimmedNew && /[\/\\:*?"<>|]/.test(trimmedNew)) {
+      return res.status(400).json({ error: "\u76EE\u6807\u6587\u4EF6\u5939\u540D\u5305\u542B\u975E\u6CD5\u5B57\u7B26" });
+    }
+    const scope = await getCurrentStorageScope();
+    const checkResult = await query(
+      `SELECT COUNT(*) as cnt FROM files WHERE ${scope.clause} AND folder = ${nextParam(scope, 1)}`,
+      [...scope.params, trimmedOld]
+    );
+    if (parseInt(checkResult.rows[0].cnt) === 0) {
+      return res.status(404).json({ error: "\u539F\u6587\u4EF6\u5939\u4E0D\u5B58\u5728" });
+    }
+    await query(
+      `UPDATE files SET folder = ${nextParam(scope, 1)}, updated_at = NOW() WHERE ${scope.clause} AND folder = ${nextParam(scope, 2)}`,
+      [...scope.params, trimmedNew, trimmedOld]
+    );
+    res.json({ success: true, folder: trimmedNew });
+  } catch (error) {
+    console.error("\u79FB\u52A8\u6587\u4EF6\u5939\u5931\u8D25:", error);
+    res.status(500).json({ error: "\u79FB\u52A8\u6587\u4EF6\u5939\u5931\u8D25" });
+  }
+});
+var folderOperations_default = router3;
+
 // src/routes/upload.ts
 init_db();
-import { Router as Router3 } from "express";
+import { Router as Router4 } from "express";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
-import path15 from "path";
+import path16 from "path";
 import fs12 from "fs";
 
 // src/middleware/apiKey.ts
@@ -7875,7 +8053,7 @@ var validateApiKey = async (req, res, next) => {
 // src/routes/upload.ts
 init_storage();
 import { rateLimit as rateLimit2 } from "express-rate-limit";
-var router3 = Router3();
+var router4 = Router4();
 var uploadLimiter = rateLimit2({
   windowMs: 15 * 60 * 1e3,
   max: 60,
@@ -7901,7 +8079,7 @@ function decodeFilename(filename) {
   }
   return filename;
 }
-var TEMP_DIR = path15.join(process.cwd(), "data", "temp");
+var TEMP_DIR = path16.join(process.cwd(), "data", "temp");
 if (!fs12.existsSync(TEMP_DIR)) {
   fs12.mkdirSync(TEMP_DIR, { recursive: true });
 }
@@ -7910,7 +8088,7 @@ var storage = multer.diskStorage({
     cb(null, TEMP_DIR);
   },
   filename: (_req, file, cb) => {
-    const ext = path15.extname(file.originalname);
+    const ext = path16.extname(file.originalname);
     const storedName = `${uuidv4()}${ext}`;
     cb(null, storedName);
   }
@@ -7931,7 +8109,7 @@ var handleUpload = async (req, res, source = "web") => {
   const originalName = decodeFilename(file.originalname);
   const mimeType = file.mimetype;
   const size = file.size;
-  const tempPath = path15.resolve(file.path);
+  const tempPath = path16.resolve(file.path);
   const activeAccountId = storageManager.getActiveAccountId();
   const storageRules = await getStoragePathRules();
   const storageFolder = buildStorageFolderWithRules({ source, folder: folder || null, mimeType, fileName: originalName }, storageRules);
@@ -7967,7 +8145,7 @@ var handleUpload = async (req, res, source = "web") => {
       try {
         const thumbResult = await generateThumbnail(tempPath, storedName, mimeType);
         if (thumbResult) {
-          thumbnailPath = path15.basename(thumbResult);
+          thumbnailPath = path16.basename(thumbResult);
           console.log(`[Upload] \u2728 Thumbnail generated: ${thumbnailPath}`);
           const dims = await getImageDimensions(tempPath, mimeType);
           width = dims.width;
@@ -8025,26 +8203,26 @@ var handleUpload = async (req, res, source = "web") => {
     res.status(500).json({ error: "\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25" });
   }
 };
-router3.post("/", uploadLimiter, upload.single("file"), async (req, res) => {
+router4.post("/", uploadLimiter, upload.single("file"), async (req, res) => {
   await handleUpload(req, res, "web");
 });
-router3.post("/api", uploadLimiter, validateApiKey, upload.single("file"), async (req, res) => {
+router4.post("/api", uploadLimiter, validateApiKey, upload.single("file"), async (req, res) => {
   await handleUpload(req, res, "api");
 });
-var upload_default = router3;
+var upload_default = router4;
 
 // src/routes/storage.ts
 init_db();
-import { Router as Router4 } from "express";
+import { Router as Router5 } from "express";
 import checkDiskSpaceModule2 from "check-disk-space";
 import os3 from "os";
-import path16 from "path";
+import path17 from "path";
 import fs13 from "fs";
 import axios3 from "axios";
 import crypto9 from "crypto";
 var checkDiskSpace2 = checkDiskSpaceModule2.default || checkDiskSpaceModule2;
-var router4 = Router4();
-var UPLOAD_DIR5 = process.env.UPLOAD_DIR || "./data/uploads";
+var router5 = Router5();
+var UPLOAD_DIR6 = process.env.UPLOAD_DIR || "./data/uploads";
 function getOneDriveRedirectUri(req) {
   const apiBase = process.env.VITE_API_URL;
   if (apiBase) {
@@ -8063,9 +8241,9 @@ function getGoogleDriveRedirectUri(req) {
   const host = req.get("host");
   return `${protocol}://${host}/api/storage/google-drive/callback`;
 }
-router4.get("/stats", requireAuth, async (_req, res) => {
+router5.get("/stats", requireAuth, async (_req, res) => {
   try {
-    const diskPath = os3.platform() === "win32" ? "C:" : path16.resolve(UPLOAD_DIR5);
+    const diskPath = os3.platform() === "win32" ? "C:" : path17.resolve(UPLOAD_DIR6);
     const diskSpace = await checkDiskSpace2(diskPath);
     const result = await query(`
             SELECT 
@@ -8096,7 +8274,7 @@ router4.get("/stats", requireAuth, async (_req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u5B58\u50A8\u7EDF\u8BA1\u5931\u8D25" });
   }
 });
-router4.get("/stats/types", requireAuth, async (_req, res) => {
+router5.get("/stats/types", requireAuth, async (_req, res) => {
   try {
     const result = await query(`
             SELECT 
@@ -8126,7 +8304,7 @@ function formatBytes3(bytes) {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
-router4.get("/config", requireAuth, async (req, res) => {
+router5.get("/config", requireAuth, async (req, res) => {
   try {
     const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
     const provider = storageManager2.getProvider();
@@ -8150,7 +8328,7 @@ router4.get("/config", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u5B58\u50A8\u914D\u7F6E\u5931\u8D25" });
   }
 });
-router4.post("/config/telegram-user-download", requireAuth, async (req, res) => {
+router5.post("/config/telegram-user-download", requireAuth, async (req, res) => {
   try {
     const enabled = !!req.body?.enabled;
     if (enabled && !isTelegramUserClientReady()) {
@@ -8163,7 +8341,7 @@ router4.post("/config/telegram-user-download", requireAuth, async (req, res) => 
     res.status(500).json({ error: "\u66F4\u65B0 Telegram \u7528\u6237\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25" });
   }
 });
-router4.post("/config/onedrive/auth-url", requireAuth, async (req, res) => {
+router5.post("/config/onedrive/auth-url", requireAuth, async (req, res) => {
   try {
     const { clientId, tenantId, redirectUri, clientSecret, name } = req.body;
     if (!clientId || !redirectUri) {
@@ -8189,7 +8367,7 @@ router4.post("/config/onedrive/auth-url", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u6388\u6743 URL \u5931\u8D25" });
   }
 });
-router4.get("/onedrive/callback", async (req, res) => {
+router5.get("/onedrive/callback", async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
     if (error) {
@@ -8216,13 +8394,23 @@ router4.get("/onedrive/callback", async (req, res) => {
     try {
       tokens = await OneDriveStorageProvider2.exchangeCodeForToken(clientId, clientSecret, tenantId, redirectUri, code);
     } catch (err) {
+      const msError = err.response?.data;
+      const errorCode = Array.isArray(msError?.error_codes) ? msError.error_codes[0] : void 0;
+      const errorDescription = msError?.error_description || err.message || "\u672A\u77E5\u9519\u8BEF";
       console.error("[OneDrive] exchangeCodeForToken failed:", {
-        error: err.response?.data || err.message,
+        error: msError?.error,
+        errorCode,
+        errorDescription,
+        traceId: msError?.trace_id,
+        correlationId: msError?.correlation_id,
         clientId: clientId.substring(0, 8) + "...",
         redirectUri,
         tenantId
       });
-      throw err;
+      if (errorCode === 7000215 || /invalid client secret|AADSTS7000215/i.test(errorDescription)) {
+        return res.status(400).send("\u6388\u6743\u5931\u8D25\uFF1AMicrosoft \u8FD4\u56DE AADSTS7000215\uFF0CClient Secret \u65E0\u6548\u3002\u8BF7\u5728 Azure/Entra\u300C\u8BC1\u4E66\u548C\u5BC6\u7801\u300D\u4E2D\u65B0\u5EFA\u5BA2\u6237\u7AEF\u5BC6\u7801\uFF0C\u5E76\u590D\u5236\u201C\u503C Value\u201D\uFF08\u4E0D\u662F\u201C\u673A\u5BC6 ID/Secret ID\u201D\uFF09\u540E\u91CD\u65B0\u6388\u6743\u3002");
+      }
+      return res.status(err.response?.status || 400).send(`\u6388\u6743\u5931\u8D25\uFF1A${errorDescription}`);
     }
     let accountName = "OneDrive Account";
     try {
@@ -8240,21 +8428,27 @@ router4.get("/onedrive/callback", async (req, res) => {
     if (activeId) {
       await query("UPDATE storage_accounts SET name = $1 WHERE id = $2", [finalName, activeId]);
     }
+    res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+    res.setHeader("Cross-Origin-Opener-Policy", "unsafe-none");
     res.send(`
             <html>
                 <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
                     <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
                         <h2 style="color: #16a34a; margin-bottom: 10px;">\u{1F389} \u6388\u6743\u6210\u529F\uFF01</h2>
                         <p style="color: #15803d; margin-bottom: 20px;">OneDrive \u5DF2\u6210\u529F\u8FDE\u63A5\u5E76\u542F\u7528\u3002</p>
-                        <button onclick="window.close()" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">\u5173\u95ED\u6B64\u7A97\u53E3</button>
+                        <p style="color: #16a34a; font-size: 13px; margin-bottom: 20px;">\u7A97\u53E3\u5C06\u81EA\u52A8\u5173\u95ED\u3002\u5982\u679C\u672A\u5173\u95ED\uFF0C\u8BF7\u624B\u52A8\u5173\u95ED\uFF0C\u4E3B\u9875\u9762\u4F1A\u81EA\u52A8\u5237\u65B0\u8D26\u6237\u5217\u8868\u3002</p>
+                        <button onclick="notifyParent(); window.close();" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">\u5173\u95ED\u6B64\u7A97\u53E3</button>
                         <script>
-                            setTimeout(() => {
-                                // \u5C1D\u8BD5\u901A\u77E5\u7236\u7A97\u53E3\uFF08\u5982\u679C\u662F\u5728\u5F39\u51FA\u7A97\u53E3\u4E2D\u6253\u5F00\u7684\uFF09
-                                if (window.opener) {
+                            const notifyParent = () => {
+                                if (window.opener && !window.opener.closed) {
                                     window.opener.postMessage('onedrive_auth_success', '*');
                                 }
+                            };
+                            notifyParent();
+                            setTimeout(() => {
+                                notifyParent();
                                 window.close();
-                            }, 3000);
+                            }, 1200);
                         </script>
                     </div>
                 </body>
@@ -8265,7 +8459,7 @@ router4.get("/onedrive/callback", async (req, res) => {
     res.status(500).send("\u6388\u6743\u5904\u7406\u51FA\u9519\uFF0C\u8BF7\u68C0\u67E5\u540E\u7AEF\u65E5\u5FD7\u3002");
   }
 });
-router4.post("/config/google-drive/auth-url", requireAuth, async (req, res) => {
+router5.post("/config/google-drive/auth-url", requireAuth, async (req, res) => {
   try {
     const { clientId, clientSecret, redirectUri, name } = req.body;
     if (!clientId || !clientSecret || !redirectUri) {
@@ -8287,7 +8481,7 @@ router4.post("/config/google-drive/auth-url", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u6388\u6743 URL \u5931\u8D25" });
   }
 });
-router4.get("/google-drive/callback", async (req, res) => {
+router5.get("/google-drive/callback", async (req, res) => {
   try {
     const { code, state, error } = req.query;
     if (error) {
@@ -8348,7 +8542,7 @@ router4.get("/google-drive/callback", async (req, res) => {
     res.status(500).send("\u6388\u6743\u5904\u7406\u51FA\u9519\uFF0C\u8BF7\u68C0\u67E5\u540E\u7AEF\u65E5\u5FD7\u3002");
   }
 });
-router4.put("/config/onedrive", requireAuth, async (req, res) => {
+router5.put("/config/onedrive", requireAuth, async (req, res) => {
   try {
     const { clientId, clientSecret, refreshToken, tenantId, name } = req.body;
     if (!clientId || !refreshToken) {
@@ -8362,7 +8556,7 @@ router4.put("/config/onedrive", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u66F4\u65B0 OneDrive \u914D\u7F6E\u5931\u8D25" });
   }
 });
-router4.post("/config/aliyun-oss", requireAuth, async (req, res) => {
+router5.post("/config/aliyun-oss", requireAuth, async (req, res) => {
   try {
     const { name, region, accessKeyId, accessKeySecret, bucket } = req.body;
     if (!name || !region || !accessKeyId || !accessKeySecret || !bucket) {
@@ -8376,7 +8570,7 @@ router4.post("/config/aliyun-oss", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u6DFB\u52A0 Aliyun OSS \u914D\u7F6E\u5931\u8D25" });
   }
 });
-router4.post("/config/s3", requireAuth, async (req, res) => {
+router5.post("/config/s3", requireAuth, async (req, res) => {
   try {
     const { name, endpoint, region, accessKeyId, accessKeySecret, bucket, forcePathStyle } = req.body;
     if (!name || !endpoint || !region || !accessKeyId || !accessKeySecret || !bucket) {
@@ -8390,7 +8584,7 @@ router4.post("/config/s3", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u6DFB\u52A0 S3 \u914D\u7F6E\u5931\u8D25" });
   }
 });
-router4.post("/config/webdav", requireAuth, async (req, res) => {
+router5.post("/config/webdav", requireAuth, async (req, res) => {
   try {
     const { name, url, username, password } = req.body;
     if (!name || !url) {
@@ -8404,7 +8598,7 @@ router4.post("/config/webdav", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u6DFB\u52A0 WebDAV \u914D\u7F6E\u5931\u8D25" });
   }
 });
-router4.post("/switch", requireAuth, async (req, res) => {
+router5.post("/switch", requireAuth, async (req, res) => {
   try {
     const { provider, accountId } = req.body;
     const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
@@ -8432,7 +8626,7 @@ router4.post("/switch", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u5207\u6362\u5B58\u50A8\u5931\u8D25" });
   }
 });
-router4.get("/accounts", requireAuth, async (req, res) => {
+router5.get("/accounts", requireAuth, async (req, res) => {
   try {
     const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
     const accounts = await storageManager2.getAccounts();
@@ -8442,7 +8636,7 @@ router4.get("/accounts", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u8D26\u6237\u5217\u8868\u5931\u8D25" });
   }
 });
-router4.delete("/accounts/:id", requireAuth, async (req, res) => {
+router5.delete("/accounts/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
@@ -8465,17 +8659,17 @@ router4.delete("/accounts/:id", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u5220\u9664\u8D26\u6237\u5931\u8D25" });
   }
 });
-var storage_default = router4;
+var storage_default = router5;
 
 // src/routes/chunkedUpload.ts
 init_db();
-import { Router as Router5 } from "express";
+import { Router as Router6 } from "express";
 import { v4 as uuidv42 } from "uuid";
-import path17 from "path";
+import path18 from "path";
 import fs14 from "fs";
 init_storage();
 import { rateLimit as rateLimit3 } from "express-rate-limit";
-var router5 = Router5();
+var router6 = Router6();
 var chunkedUploadLimiter = rateLimit3({
   windowMs: 15 * 60 * 1e3,
   max: 300,
@@ -8486,11 +8680,11 @@ var chunkedUploadLimiter = rateLimit3({
 var MAX_CHUNK_BYTES = Math.max(1024 * 1024, parseInt(process.env.MAX_UPLOAD_CHUNK_MB || "64", 10) * 1024 * 1024);
 var MAX_UPLOAD_SESSIONS = Math.max(10, parseInt(process.env.MAX_UPLOAD_SESSIONS || "200", 10) || 200);
 var MAX_TOTAL_CHUNKS = Math.max(1, parseInt(process.env.MAX_TOTAL_CHUNKS || "50000", 10) || 5e4);
-router5.use(chunkedUploadLimiter);
-var UPLOAD_DIR6 = process.env.UPLOAD_DIR || "./data/uploads";
-var THUMBNAIL_DIR5 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
+router6.use(chunkedUploadLimiter);
+var UPLOAD_DIR7 = process.env.UPLOAD_DIR || "./data/uploads";
+var THUMBNAIL_DIR6 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
 var CHUNK_DIR = process.env.CHUNK_DIR || "./data/chunks";
-[UPLOAD_DIR6, THUMBNAIL_DIR5, CHUNK_DIR].forEach((dir) => {
+[UPLOAD_DIR7, THUMBNAIL_DIR6, CHUNK_DIR].forEach((dir) => {
   if (!fs14.existsSync(dir)) {
     fs14.mkdirSync(dir, { recursive: true });
   }
@@ -8500,7 +8694,7 @@ setInterval(() => {
   const now = /* @__PURE__ */ new Date();
   uploadSessions.forEach((session, uploadId) => {
     if (now.getTime() - session.createdAt.getTime() > 24 * 60 * 60 * 1e3) {
-      const chunkDir = path17.join(CHUNK_DIR, uploadId);
+      const chunkDir = path18.join(CHUNK_DIR, uploadId);
       if (fs14.existsSync(chunkDir)) {
         fs14.rmSync(chunkDir, { recursive: true });
       }
@@ -8526,7 +8720,7 @@ function decodeFilename2(filename) {
   }
   return filename;
 }
-router5.post("/init", (req, res) => {
+router6.post("/init", (req, res) => {
   try {
     const { filename, totalChunks, mimeType, totalSize, folder } = req.body;
     if (!filename || !totalChunks || !mimeType || !totalSize) {
@@ -8541,7 +8735,7 @@ router5.post("/init", (req, res) => {
       return res.status(429).json({ error: "\u5F53\u524D\u4E0A\u4F20\u4F1A\u8BDD\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5" });
     }
     const uploadId = uuidv42();
-    const chunkDir = path17.join(CHUNK_DIR, uploadId);
+    const chunkDir = path18.join(CHUNK_DIR, uploadId);
     fs14.mkdirSync(chunkDir, { recursive: true });
     uploadSessions.set(uploadId, {
       uploadId,
@@ -8563,7 +8757,7 @@ router5.post("/init", (req, res) => {
     res.status(500).json({ error: "\u521D\u59CB\u5316\u4E0A\u4F20\u5931\u8D25" });
   }
 });
-router5.post("/chunk", async (req, res) => {
+router6.post("/chunk", async (req, res) => {
   try {
     const uploadIdHeader = req.headers["x-upload-id"];
     const chunkIndexHeader = req.headers["x-chunk-index"];
@@ -8583,7 +8777,7 @@ router5.post("/chunk", async (req, res) => {
     if (declaredLength > MAX_CHUNK_BYTES) {
       return res.status(413).json({ error: "\u5355\u4E2A\u5206\u5757\u8FC7\u5927" });
     }
-    const chunkPath = path17.join(CHUNK_DIR, uploadId, `chunk_${chunkIndex}`);
+    const chunkPath = path18.join(CHUNK_DIR, uploadId, `chunk_${chunkIndex}`);
     const writeStream = fs14.createWriteStream(chunkPath);
     await new Promise((resolve, reject) => {
       let receivedBytes = 0;
@@ -8614,7 +8808,7 @@ router5.post("/chunk", async (req, res) => {
     res.status(500).json({ error: "\u4E0A\u4F20\u5206\u5757\u5931\u8D25" });
   }
 });
-router5.post("/complete", async (req, res) => {
+router6.post("/complete", async (req, res) => {
   try {
     const { uploadId } = req.body;
     if (!uploadId) {
@@ -8640,12 +8834,12 @@ router5.post("/complete", async (req, res) => {
       fileName: session.filename
     }, storageRules);
     const storedName = await getUniqueStoredName(session.filename, storageFolder, activeAccountId);
-    const tempMergedPath = path17.resolve(path17.join(UPLOAD_DIR6, `${uploadId}-${storedName}`));
+    const tempMergedPath = path18.resolve(path18.join(UPLOAD_DIR7, `${uploadId}-${storedName}`));
     const writeStream = fs14.createWriteStream(tempMergedPath);
     console.log(`[ChunkedComplete] \u{1F9E9} Merging ${session.totalChunks} chunks for: ${session.filename}`);
     console.log(`[ChunkedComplete] \u{1F3E0} Final temp path: ${tempMergedPath}`);
     for (let i = 0; i < session.totalChunks; i++) {
-      const chunkPath = path17.join(CHUNK_DIR, uploadId, `chunk_${i}`);
+      const chunkPath = path18.join(CHUNK_DIR, uploadId, `chunk_${i}`);
       const chunkData = fs14.readFileSync(chunkPath);
       writeStream.write(chunkData);
     }
@@ -8654,7 +8848,7 @@ router5.post("/complete", async (req, res) => {
       writeStream.on("finish", resolve);
       writeStream.on("error", reject);
     });
-    const chunkDir = path17.join(CHUNK_DIR, uploadId);
+    const chunkDir = path18.join(CHUNK_DIR, uploadId);
     fs14.rmSync(chunkDir, { recursive: true });
     uploadSessions.delete(uploadId);
     const duplicateMode = await getDuplicateMode();
@@ -8684,7 +8878,7 @@ router5.post("/complete", async (req, res) => {
         console.log(`[ChunkedComplete] \u{1F5BC}\uFE0F  MIME: ${session.mimeType}, starting generation...`);
         const thumbResult = await generateThumbnail(tempMergedPath, storedName, session.mimeType);
         if (thumbResult) {
-          thumbnailPath = path17.basename(thumbResult);
+          thumbnailPath = path18.basename(thumbResult);
           console.log(`[ChunkedComplete] \u2728 Thumbnail generated: ${thumbnailPath}`);
           const dims = await getImageDimensions(tempMergedPath, session.mimeType);
           width = dims.width;
@@ -8738,12 +8932,12 @@ router5.post("/complete", async (req, res) => {
     res.status(500).json({ error: "\u5B8C\u6210\u4E0A\u4F20\u5931\u8D25" });
   }
 });
-router5.delete("/:uploadId", (req, res) => {
+router6.delete("/:uploadId", (req, res) => {
   try {
     const uploadId = req.params.uploadId;
     const session = uploadSessions.get(uploadId);
     if (session) {
-      const chunkDir = path17.join(CHUNK_DIR, uploadId);
+      const chunkDir = path18.join(CHUNK_DIR, uploadId);
       if (fs14.existsSync(chunkDir)) {
         fs14.rmSync(chunkDir, { recursive: true });
       }
@@ -8755,7 +8949,7 @@ router5.delete("/:uploadId", (req, res) => {
     res.status(500).json({ error: "\u53D6\u6D88\u4E0A\u4F20\u5931\u8D25" });
   }
 });
-router5.get("/:uploadId/status", (req, res) => {
+router6.get("/:uploadId/status", (req, res) => {
   try {
     const uploadId = req.params.uploadId;
     const session = uploadSessions.get(uploadId);
@@ -8774,7 +8968,7 @@ router5.get("/:uploadId/status", (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u4E0A\u4F20\u72B6\u6001\u5931\u8D25" });
   }
 });
-var chunkedUpload_default = router5;
+var chunkedUpload_default = router6;
 
 // src/index.ts
 import helmet from "helmet";
@@ -8782,16 +8976,16 @@ dotenv3.config();
 var app = express();
 app.set("trust proxy", process.env.TRUST_PROXY || "loopback");
 var PORT = process.env.PORT || 51947;
-var UPLOAD_DIR7 = process.env.UPLOAD_DIR || "./data/uploads";
-var THUMBNAIL_DIR6 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
+var UPLOAD_DIR8 = process.env.UPLOAD_DIR || "./data/uploads";
+var THUMBNAIL_DIR7 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
 var CHUNK_DIR2 = process.env.CHUNK_DIR || "./data/chunks";
-if (!fs15.existsSync(UPLOAD_DIR7)) {
-  fs15.mkdirSync(UPLOAD_DIR7, { recursive: true });
-  console.log(`\u{1F4C1} \u521B\u5EFA\u4E0A\u4F20\u76EE\u5F55: ${UPLOAD_DIR7}`);
+if (!fs15.existsSync(UPLOAD_DIR8)) {
+  fs15.mkdirSync(UPLOAD_DIR8, { recursive: true });
+  console.log(`\u{1F4C1} \u521B\u5EFA\u4E0A\u4F20\u76EE\u5F55: ${UPLOAD_DIR8}`);
 }
-if (!fs15.existsSync(THUMBNAIL_DIR6)) {
-  fs15.mkdirSync(THUMBNAIL_DIR6, { recursive: true });
-  console.log(`\u{1F4C1} \u521B\u5EFA\u7F29\u7565\u56FE\u76EE\u5F55: ${THUMBNAIL_DIR6}`);
+if (!fs15.existsSync(THUMBNAIL_DIR7)) {
+  fs15.mkdirSync(THUMBNAIL_DIR7, { recursive: true });
+  console.log(`\u{1F4C1} \u521B\u5EFA\u7F29\u7565\u56FE\u76EE\u5F55: ${THUMBNAIL_DIR7}`);
 }
 if (!fs15.existsSync(CHUNK_DIR2)) {
   fs15.mkdirSync(CHUNK_DIR2, { recursive: true });
@@ -8828,14 +9022,15 @@ app.use(helmet({
   hsts: { maxAge: 31536e3, includeSubDomains: true }
 }));
 app.use("/api/auth", auth_default);
-app.use("/uploads", requireAuth, express.static(UPLOAD_DIR7, {
+app.use("/uploads", requireAuth, express.static(UPLOAD_DIR8, {
   maxAge: "1d",
   etag: true
 }));
-app.use("/thumbnails", requireAuth, express.static(THUMBNAIL_DIR6, {
+app.use("/thumbnails", requireAuth, express.static(THUMBNAIL_DIR7, {
   maxAge: "7d",
   etag: true
 }));
+app.use("/api/files", requireAuth, folderOperations_default);
 app.use("/api/files", requireAuthOrSignedUrl, files_default);
 app.use("/api/upload", requireAuth, upload_default);
 app.use("/api/v1/upload", requireAuth, upload_default);
@@ -8864,8 +9059,8 @@ app.listen(PORT, async () => {
   console.log(`
 \u{1F680} FlClouds \u540E\u7AEF\u670D\u52A1\u5DF2\u542F\u52A8
 \u{1F4CD} \u7AEF\u53E3: ${PORT}
-\u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path18.resolve(UPLOAD_DIR7)}
-\u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path18.resolve(THUMBNAIL_DIR6)}
+\u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path19.resolve(UPLOAD_DIR8)}
+\u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path19.resolve(THUMBNAIL_DIR7)}
 \u{1F510} \u5BC6\u7801\u4FDD\u62A4: ${passwordProtected ? "\u5DF2\u542F\u7528" : "\u672A\u542F\u7528"}
 \u{1F916} Telegram Bot: ${telegramEnabled ? "\u5DF2\u542F\u7528 (\u6700\u5927 2GB\uFF0C\u8D26\u53F7\u7EA7\u4E0B\u8F7D\u5668\u4E0D\u53D7\u6B64\u9650\u5236)" : "\u672A\u542F\u7528"}
 \u{1F464} Telegram User Download: ${isTelegramUserClientReady() ? "\u5DF2\u542F\u7528" : "\u672A\u542F\u7528"}

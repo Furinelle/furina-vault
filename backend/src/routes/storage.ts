@@ -240,13 +240,25 @@ router.get('/onedrive/callback', async (req: Request, res: Response) => {
         try {
             tokens = await OneDriveStorageProvider.exchangeCodeForToken(clientId, clientSecret, tenantId, redirectUri, code as string);
         } catch (err: any) {
+            const msError = err.response?.data;
+            const errorCode = Array.isArray(msError?.error_codes) ? msError.error_codes[0] : undefined;
+            const errorDescription = msError?.error_description || err.message || '未知错误';
             console.error('[OneDrive] exchangeCodeForToken failed:', {
-                error: err.response?.data || err.message,
+                error: msError?.error,
+                errorCode,
+                errorDescription,
+                traceId: msError?.trace_id,
+                correlationId: msError?.correlation_id,
                 clientId: clientId.substring(0, 8) + '...',
                 redirectUri,
                 tenantId
             });
-            throw err;
+
+            if (errorCode === 7000215 || /invalid client secret|AADSTS7000215/i.test(errorDescription)) {
+                return res.status(400).send('授权失败：Microsoft 返回 AADSTS7000215，Client Secret 无效。请在 Azure/Entra「证书和密码」中新建客户端密码，并复制“值 Value”（不是“机密 ID/Secret ID”）后重新授权。');
+            }
+
+            return res.status(err.response?.status || 400).send(`授权失败：${errorDescription}`);
         }
 
         // 尝试获取账户名称（可选，如果缺少 User.Read 权限则跳过）
@@ -275,21 +287,27 @@ router.get('/onedrive/callback', async (req: Request, res: Response) => {
             await query('UPDATE storage_accounts SET name = $1 WHERE id = $2', [finalName, activeId]);
         }
 
+        res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+        res.setHeader('Cross-Origin-Opener-Policy', 'unsafe-none');
         res.send(`
             <html>
                 <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
                     <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
                         <h2 style="color: #16a34a; margin-bottom: 10px;">🎉 授权成功！</h2>
                         <p style="color: #15803d; margin-bottom: 20px;">OneDrive 已成功连接并启用。</p>
-                        <button onclick="window.close()" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">关闭此窗口</button>
+                        <p style="color: #16a34a; font-size: 13px; margin-bottom: 20px;">窗口将自动关闭。如果未关闭，请手动关闭，主页面会自动刷新账户列表。</p>
+                        <button onclick="notifyParent(); window.close();" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">关闭此窗口</button>
                         <script>
-                            setTimeout(() => {
-                                // 尝试通知父窗口（如果是在弹出窗口中打开的）
-                                if (window.opener) {
+                            const notifyParent = () => {
+                                if (window.opener && !window.opener.closed) {
                                     window.opener.postMessage('onedrive_auth_success', '*');
                                 }
+                            };
+                            notifyParent();
+                            setTimeout(() => {
+                                notifyParent();
                                 window.close();
-                            }, 3000);
+                            }, 1200);
                         </script>
                     </div>
                 </body>
