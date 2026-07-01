@@ -262,7 +262,8 @@ async function ensureSilentNotice(client: TelegramClient, chatId: Api.TypeEntity
         if (silentNoticeMessageIdMap.get(chatIdStr)) return;
     }
 
-    const text = buildSilentModeNotice(fileCount, getSessionTaskId(chatIdStr));
+    const queueStats = getDownloadQueueStats();
+    const text = buildSilentModeNotice(fileCount, getSessionTaskId(chatIdStr), queueStats.paused, queueStats.pauseReason);
 
     const sendPromise = (async () => {
         let sMsg: any;
@@ -416,6 +417,7 @@ class BetterDownloadQueue {
             paused: this.paused,
             diskPressurePaused: this.diskPressurePaused,
             diskPressureReason: this.diskPressureReason,
+            pauseReason: this.diskPressureReason || (this.paused ? '用户已暂停下载队列' : undefined),
         };
     }
 
@@ -427,6 +429,7 @@ class BetterDownloadQueue {
             paused: this.paused,
             diskPressurePaused: this.diskPressurePaused,
             diskPressureReason: this.diskPressureReason,
+            pauseReason: this.diskPressureReason || (this.paused ? '用户已暂停下载队列' : undefined),
         };
     }
 
@@ -635,7 +638,8 @@ async function finalizeSilentSessionIfDone(client: TelegramClient, chatId: Api.T
                 })),
             ],
         );
-        await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+        const controls = s?.failed ? buildTaskControlButtons(s?.taskId) : new Api.ReplyInlineMarkup({ rows: [] });
+        await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons: controls });
     }
 
     // 清理静默状态
@@ -956,7 +960,7 @@ function syncSilentSessionTotals(chatIdStr: string): SilentSession | null {
     return session;
 }
 
-async function refreshSilentProgress(client: TelegramClient, chatId: Api.TypeEntityLike) {
+export async function refreshSilentProgress(client: TelegramClient, chatId: Api.TypeEntityLike) {
     const chatIdStr = chatId.toString();
     if (!silentSessionMap.has(chatIdStr)) return;
     const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr);
@@ -965,8 +969,27 @@ async function refreshSilentProgress(client: TelegramClient, chatId: Api.TypeEnt
     const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
     const batches = getConsolidatedBatches(chatIdStr);
     const files = getConsolidatedFiles(chatIdStr);
-    const text = buildSilentProgress(session.total, batches, files, session.completed, session.failed, session.taskId);
-    await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons: buildTaskControlButtons(session.taskId) });
+    const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
+    const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
+    const completedSingleFiles = files.filter(file => file.phase === 'success' || file.phase === 'failed').length;
+    const totalFiles = Math.max(session.total, totalBatchFiles + files.length, completedBatchFiles + completedSingleFiles, session.completed);
+    const completedFiles = Math.max(session.completed, completedBatchFiles + completedSingleFiles);
+    const isComplete = totalFiles > 0 && completedFiles >= totalFiles;
+    const queueStats = getDownloadQueueStats();
+    const text = buildSilentProgress(
+        session.total,
+        batches,
+        files,
+        session.completed,
+        session.failed,
+        session.taskId,
+        queueStats.paused,
+        queueStats.pauseReason,
+    );
+    const buttons = isComplete && session.failed === 0
+        ? new Api.ReplyInlineMarkup({ rows: [] })
+        : buildTaskControlButtons(session.taskId);
+    await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons });
 }
 
 
@@ -1077,6 +1100,43 @@ export function cancelDownloadTask(selector?: string) {
         return downloadQueue.forceStopAll(`用户通过 /task_cancel ${normalized} 取消任务`);
     }
     return downloadQueue.cancel(normalized, '用户通过 /task_cancel 取消任务');
+}
+
+export async function cancelSilentTask(client: TelegramClient, chatId: Api.TypeEntityLike, taskId: string, fallbackMessageId?: number) {
+    const mappedChatId = resolveTaskChatId(taskId);
+    const chatIdStr = mappedChatId || chatId.toString();
+    const editChatId = mappedChatId || chatId;
+    const session = silentSessionMap.get(chatIdStr);
+    const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr) || fallbackMessageId;
+    const result = cancelDownloadTask(taskId);
+    const total = Math.max(session?.total || 0, result.total);
+    const completed = session?.completed || 0;
+    const failed = session?.failed || 0;
+    const pendingOrActive = Math.max(0, total - completed);
+
+    if (silentMsgId) {
+        const text = [
+            `🛑 **后台任务已取消**`,
+            ``,
+            `🆔 任务：\`${taskId}\``,
+            `✅ 已完成: ${completed} 个文件`,
+            ...(failed > 0 ? [`❌ 失败: ${failed} 个文件`] : []),
+            `🚫 已停止/清空: ${pendingOrActive} 个等待或进行中的任务`,
+            ``,
+            `已移除暂停 / 继续 / 取消按钮，此任务不会再响应旧按钮操作。`,
+        ].join('\n');
+        await safeEditMessage(client, editChatId, { message: silentMsgId, text, buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+    }
+
+    silentSessionMap.delete(chatIdStr);
+    if (session?.taskId) taskIdToChatId.delete(session.taskId);
+    taskIdToChatId.delete(taskId);
+    silentNoticeMessageIdMap.delete(chatIdStr);
+    lastSilentNotificationTimeMap.delete(chatIdStr);
+    clearConsolidatedState(chatIdStr);
+    resetChatTransferSession(chatIdStr);
+
+    return result;
 }
 
 export function retryFailedDownloadTasks(limit = 10, _taskId?: string) {

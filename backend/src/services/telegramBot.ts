@@ -8,7 +8,7 @@ import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticated, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
 import { handleStart, handleHelp, handleStorage, handleList, handleDelete, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handlePathRules, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
-import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, resolveTaskChatIdForControl } from './telegramUpload.js';
+import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
 import {
     enqueueTelegramDateDownload,
@@ -523,15 +523,17 @@ async function handleTaskQueueCallback(update: Api.UpdateBotCallbackQuery, data:
     try {
         if (action === 'pause') {
             pauseDownloadTasks(taskId);
+            await refreshSilentProgress(client, update.peer);
             await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已暂停下载队列' }));
             return;
         }
         if (action === 'resume') {
             resumeDownloadTasks(taskId);
+            await refreshSilentProgress(client, update.peer);
             await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已继续下载队列' }));
             return;
         }
-        cancelDownloadTask(taskId);
+        await cancelSilentTask(client, update.peer, taskId, update.msgId);
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已取消后台任务', alert: true }));
     } catch (error) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({

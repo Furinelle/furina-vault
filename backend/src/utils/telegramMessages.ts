@@ -22,18 +22,21 @@ export function getProviderDisplayName(providerName: string): string {
     return PROVIDER_DISPLAY_MAP[providerName] || `📦 ${providerName}`;
 }
 
-function buildTaskControlLines(taskId?: string): string[] {
+function buildTaskControlLines(taskId?: string, queuePaused = false, pauseReason?: string): string[] {
     if (!taskId) return [`💡 发送 /tasks 查看实时任务状态`];
+    if (queuePaused) {
+        return [
+            `⏸️ **当前状态：已暂停**`,
+            pauseReason ? `📌 原因：${pauseReason}` : `📌 等待中的下载任务不会继续开始`,
+            `▶️ 点击下方“继续”可恢复后台下载队列`,
+            `🛑 点击“取消”可停止当前后台任务并清空等待项`,
+        ];
+    }
     return [
         `💡 下载队列控制：请优先点下方按钮`,
         `⏸ 暂停：暂时停止继续下载，已在处理的任务会尽快停住`,
         `▶️ 继续：从暂停处恢复后台下载队列`,
         `🛑 取消：停止当前后台任务并清空等待项`,
-        ``,
-        `备用手动命令：`,
-        `/task_pause ${taskId}`,
-        `/task_resume ${taskId}`,
-        `/task_cancel ${taskId}`,
     ];
 }
 
@@ -505,14 +508,14 @@ export function buildDeleteSuccess(fileName: string, fileId: string): string {
 // ─── 多文件上传 ──────────────────────────────────────────────
 
 /** 静默模式通知 */
-export function buildSilentModeNotice(fileCount: number, taskId?: string): string {
+export function buildSilentModeNotice(fileCount: number, taskId?: string, queuePaused = false, pauseReason?: string): string {
     return [
-        `🤐 **已切换到静默模式**`,
+        queuePaused ? `⏸️ **后台下载已暂停**` : `🤐 **已切换到静默模式**`,
         ...(taskId ? [`🆔 任务：\`${taskId}\``] : []),
         ``,
-        `Bot 将在后台继续处理所有文件，请耐心等待。`,
+        queuePaused ? `等待任务已暂停，不会继续开始新的下载。` : `Bot 将在后台继续处理所有文件，请耐心等待。`,
         ``,
-        ...buildTaskControlLines(taskId),
+        ...buildTaskControlLines(taskId, queuePaused, pauseReason),
     ].join('\n');
 }
 
@@ -544,6 +547,8 @@ export function buildSilentProgress(
     sessionCompleted: number = 0,
     sessionFailed: number = 0,
     taskId?: string,
+    queuePaused = false,
+    pauseReason?: string,
 ): string {
     const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
     const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
@@ -556,13 +561,17 @@ export function buildSilentProgress(
     const failedFiles = Math.max(sessionFailed, failedBatchFiles + failedSingleFiles);
     const successfulFiles = Math.max(0, completedFiles - failedFiles);
     const remainingFiles = Math.max(0, totalFiles - completedFiles);
+    const isComplete = totalFiles > 0 && remainingFiles === 0;
     const activeBatch = batches.find(batch => batch.completed < batch.totalFiles);
     const activeSingle = singleFiles.find(file => !['success', 'failed'].includes(file.phase));
     const currentFile = activeBatch?.currentFileName || activeSingle?.fileName;
     const progress = generateProgressBar(completedFiles, Math.max(totalFiles, 1));
+    if (isComplete) {
+        return buildSilentAllTasksComplete(totalFiles, failedFiles, taskId, singleFiles, batches);
+    }
 
     return [
-        `🤐 **后台批量处理中**`,
+        queuePaused ? `⏸️ **后台下载已暂停**` : `🤐 **后台批量处理中**`,
         `${progress} (${completedFiles}/${totalFiles})`,
         ``,
         `✅ 成功: ${successfulFiles}　❌ 失败: ${failedFiles}　⏳ 剩余: ${remainingFiles}`,
@@ -570,7 +579,7 @@ export function buildSilentProgress(
         ...(activeBatch ? [`📁 批次: ${activeBatch.folderName}`] : []),
         ...(activeBatch?.queuePending ? [`🕒 队列等待: ${activeBatch.queuePending}`] : []),
         ``,
-        ...buildTaskControlLines(taskId),
+        ...buildTaskControlLines(taskId, queuePaused, pauseReason),
         ...(taskId && failedFiles > 0 && remainingFiles === 0 ? [`🔄 检测到失败任务，可发送 /tg_retry ${taskId} 重试最近失败项`] : []),
     ].join('\n');
 }

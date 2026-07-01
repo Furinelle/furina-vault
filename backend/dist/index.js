@@ -1958,18 +1958,21 @@ var PROVIDER_DISPLAY_MAP = {
 function getProviderDisplayName(providerName) {
   return PROVIDER_DISPLAY_MAP[providerName] || `\u{1F4E6} ${providerName}`;
 }
-function buildTaskControlLines(taskId) {
+function buildTaskControlLines(taskId, queuePaused = false, pauseReason) {
   if (!taskId) return [`\u{1F4A1} \u53D1\u9001 /tasks \u67E5\u770B\u5B9E\u65F6\u4EFB\u52A1\u72B6\u6001`];
+  if (queuePaused) {
+    return [
+      `\u23F8\uFE0F **\u5F53\u524D\u72B6\u6001\uFF1A\u5DF2\u6682\u505C**`,
+      pauseReason ? `\u{1F4CC} \u539F\u56E0\uFF1A${pauseReason}` : `\u{1F4CC} \u7B49\u5F85\u4E2D\u7684\u4E0B\u8F7D\u4EFB\u52A1\u4E0D\u4F1A\u7EE7\u7EED\u5F00\u59CB`,
+      `\u25B6\uFE0F \u70B9\u51FB\u4E0B\u65B9\u201C\u7EE7\u7EED\u201D\u53EF\u6062\u590D\u540E\u53F0\u4E0B\u8F7D\u961F\u5217`,
+      `\u{1F6D1} \u70B9\u51FB\u201C\u53D6\u6D88\u201D\u53EF\u505C\u6B62\u5F53\u524D\u540E\u53F0\u4EFB\u52A1\u5E76\u6E05\u7A7A\u7B49\u5F85\u9879`
+    ];
+  }
   return [
     `\u{1F4A1} \u4E0B\u8F7D\u961F\u5217\u63A7\u5236\uFF1A\u8BF7\u4F18\u5148\u70B9\u4E0B\u65B9\u6309\u94AE`,
     `\u23F8 \u6682\u505C\uFF1A\u6682\u65F6\u505C\u6B62\u7EE7\u7EED\u4E0B\u8F7D\uFF0C\u5DF2\u5728\u5904\u7406\u7684\u4EFB\u52A1\u4F1A\u5C3D\u5FEB\u505C\u4F4F`,
     `\u25B6\uFE0F \u7EE7\u7EED\uFF1A\u4ECE\u6682\u505C\u5904\u6062\u590D\u540E\u53F0\u4E0B\u8F7D\u961F\u5217`,
-    `\u{1F6D1} \u53D6\u6D88\uFF1A\u505C\u6B62\u5F53\u524D\u540E\u53F0\u4EFB\u52A1\u5E76\u6E05\u7A7A\u7B49\u5F85\u9879`,
-    ``,
-    `\u5907\u7528\u624B\u52A8\u547D\u4EE4\uFF1A`,
-    `/task_pause ${taskId}`,
-    `/task_resume ${taskId}`,
-    `/task_cancel ${taskId}`
+    `\u{1F6D1} \u53D6\u6D88\uFF1A\u505C\u6B62\u5F53\u524D\u540E\u53F0\u4EFB\u52A1\u5E76\u6E05\u7A7A\u7B49\u5F85\u9879`
   ];
 }
 function buildTaskControlButtons(taskId) {
@@ -2310,17 +2313,17 @@ function buildDeleteSuccess(fileName, fileId) {
     `\u{1F5D1}\uFE0F ID: ${fileId}`
   ].join("\n");
 }
-function buildSilentModeNotice(fileCount, taskId) {
+function buildSilentModeNotice(fileCount, taskId, queuePaused = false, pauseReason) {
   return [
-    `\u{1F910} **\u5DF2\u5207\u6362\u5230\u9759\u9ED8\u6A21\u5F0F**`,
+    queuePaused ? `\u23F8\uFE0F **\u540E\u53F0\u4E0B\u8F7D\u5DF2\u6682\u505C**` : `\u{1F910} **\u5DF2\u5207\u6362\u5230\u9759\u9ED8\u6A21\u5F0F**`,
     ...taskId ? [`\u{1F194} \u4EFB\u52A1\uFF1A\`${taskId}\``] : [],
     ``,
-    `Bot \u5C06\u5728\u540E\u53F0\u7EE7\u7EED\u5904\u7406\u6240\u6709\u6587\u4EF6\uFF0C\u8BF7\u8010\u5FC3\u7B49\u5F85\u3002`,
+    queuePaused ? `\u7B49\u5F85\u4EFB\u52A1\u5DF2\u6682\u505C\uFF0C\u4E0D\u4F1A\u7EE7\u7EED\u5F00\u59CB\u65B0\u7684\u4E0B\u8F7D\u3002` : `Bot \u5C06\u5728\u540E\u53F0\u7EE7\u7EED\u5904\u7406\u6240\u6709\u6587\u4EF6\uFF0C\u8BF7\u8010\u5FC3\u7B49\u5F85\u3002`,
     ``,
-    ...buildTaskControlLines(taskId)
+    ...buildTaskControlLines(taskId, queuePaused, pauseReason)
   ].join("\n");
 }
-function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCompleted = 0, sessionFailed = 0, taskId) {
+function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCompleted = 0, sessionFailed = 0, taskId, queuePaused = false, pauseReason) {
   const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
   const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
   const successfulBatchFiles = batches.reduce((sum, batch) => sum + batch.successful, 0);
@@ -2332,12 +2335,16 @@ function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCom
   const failedFiles = Math.max(sessionFailed, failedBatchFiles + failedSingleFiles);
   const successfulFiles = Math.max(0, completedFiles - failedFiles);
   const remainingFiles = Math.max(0, totalFiles - completedFiles);
+  const isComplete = totalFiles > 0 && remainingFiles === 0;
   const activeBatch = batches.find((batch) => batch.completed < batch.totalFiles);
   const activeSingle = singleFiles.find((file) => !["success", "failed"].includes(file.phase));
   const currentFile = activeBatch?.currentFileName || activeSingle?.fileName;
   const progress = generateProgressBar(completedFiles, Math.max(totalFiles, 1));
+  if (isComplete) {
+    return buildSilentAllTasksComplete(totalFiles, failedFiles, taskId, singleFiles, batches);
+  }
   return [
-    `\u{1F910} **\u540E\u53F0\u6279\u91CF\u5904\u7406\u4E2D**`,
+    queuePaused ? `\u23F8\uFE0F **\u540E\u53F0\u4E0B\u8F7D\u5DF2\u6682\u505C**` : `\u{1F910} **\u540E\u53F0\u6279\u91CF\u5904\u7406\u4E2D**`,
     `${progress} (${completedFiles}/${totalFiles})`,
     ``,
     `\u2705 \u6210\u529F: ${successfulFiles}\u3000\u274C \u5931\u8D25: ${failedFiles}\u3000\u23F3 \u5269\u4F59: ${remainingFiles}`,
@@ -2345,7 +2352,7 @@ function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCom
     ...activeBatch ? [`\u{1F4C1} \u6279\u6B21: ${activeBatch.folderName}`] : [],
     ...activeBatch?.queuePending ? [`\u{1F552} \u961F\u5217\u7B49\u5F85: ${activeBatch.queuePending}`] : [],
     ``,
-    ...buildTaskControlLines(taskId),
+    ...buildTaskControlLines(taskId, queuePaused, pauseReason),
     ...taskId && failedFiles > 0 && remainingFiles === 0 ? [`\u{1F504} \u68C0\u6D4B\u5230\u5931\u8D25\u4EFB\u52A1\uFF0C\u53EF\u53D1\u9001 /tg_retry ${taskId} \u91CD\u8BD5\u6700\u8FD1\u5931\u8D25\u9879`] : []
   ].join("\n");
 }
@@ -3137,7 +3144,8 @@ async function ensureSilentNotice(client2, chatId, fileCount, replyToMsg) {
     }
     if (silentNoticeMessageIdMap.get(chatIdStr)) return;
   }
-  const text = buildSilentModeNotice(fileCount, getSessionTaskId(chatIdStr));
+  const queueStats = getDownloadQueueStats();
+  const text = buildSilentModeNotice(fileCount, getSessionTaskId(chatIdStr), queueStats.paused, queueStats.pauseReason);
   const sendPromise = (async () => {
     let sMsg;
     if (replyToMsg) {
@@ -3256,7 +3264,8 @@ var BetterDownloadQueue = class {
       total: this.active.length + this.queue.length,
       paused: this.paused,
       diskPressurePaused: this.diskPressurePaused,
-      diskPressureReason: this.diskPressureReason
+      diskPressureReason: this.diskPressureReason,
+      pauseReason: this.diskPressureReason || (this.paused ? "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : void 0)
     };
   }
   getDetailedStatus() {
@@ -3266,7 +3275,8 @@ var BetterDownloadQueue = class {
       history: [...this.history],
       paused: this.paused,
       diskPressurePaused: this.diskPressurePaused,
-      diskPressureReason: this.diskPressureReason
+      diskPressureReason: this.diskPressureReason,
+      pauseReason: this.diskPressureReason || (this.paused ? "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : void 0)
     };
   }
   // Update progress method
@@ -3431,7 +3441,8 @@ async function finalizeSilentSessionIfDone(client2, chatId) {
         }))
       ]
     );
-    await safeEditMessage(client2, chatId, { message: silentMsgId, text, buttons: new Api2.ReplyInlineMarkup({ rows: [] }) });
+    const controls = s?.failed ? buildTaskControlButtons(s?.taskId) : new Api2.ReplyInlineMarkup({ rows: [] });
+    await safeEditMessage(client2, chatId, { message: silentMsgId, text, buttons: controls });
   }
   silentSessionMap.delete(chatIdStr);
   if (s?.taskId) taskIdToChatId.delete(s.taskId);
@@ -3671,8 +3682,25 @@ async function refreshSilentProgress(client2, chatId) {
   const session = syncSilentSessionTotals(chatIdStr) || getSilentSession(chatIdStr);
   const batches = getConsolidatedBatches(chatIdStr);
   const files = getConsolidatedFiles(chatIdStr);
-  const text = buildSilentProgress(session.total, batches, files, session.completed, session.failed, session.taskId);
-  await safeEditMessage(client2, chatId, { message: silentMsgId, text, buttons: buildTaskControlButtons(session.taskId) });
+  const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
+  const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
+  const completedSingleFiles = files.filter((file) => file.phase === "success" || file.phase === "failed").length;
+  const totalFiles = Math.max(session.total, totalBatchFiles + files.length, completedBatchFiles + completedSingleFiles, session.completed);
+  const completedFiles = Math.max(session.completed, completedBatchFiles + completedSingleFiles);
+  const isComplete = totalFiles > 0 && completedFiles >= totalFiles;
+  const queueStats = getDownloadQueueStats();
+  const text = buildSilentProgress(
+    session.total,
+    batches,
+    files,
+    session.completed,
+    session.failed,
+    session.taskId,
+    queueStats.paused,
+    queueStats.pauseReason
+  );
+  const buttons = isComplete && session.failed === 0 ? new Api2.ReplyInlineMarkup({ rows: [] }) : buildTaskControlButtons(session.taskId);
+  await safeEditMessage(client2, chatId, { message: silentMsgId, text, buttons });
 }
 async function checkAndResetSession(client2, chatId) {
   const chatIdStr = chatId.toString();
@@ -3751,6 +3779,39 @@ function cancelDownloadTask(selector) {
     return downloadQueue.forceStopAll(`\u7528\u6237\u901A\u8FC7 /task_cancel ${normalized} \u53D6\u6D88\u4EFB\u52A1`);
   }
   return downloadQueue.cancel(normalized, "\u7528\u6237\u901A\u8FC7 /task_cancel \u53D6\u6D88\u4EFB\u52A1");
+}
+async function cancelSilentTask(client2, chatId, taskId, fallbackMessageId) {
+  const mappedChatId = resolveTaskChatId(taskId);
+  const chatIdStr = mappedChatId || chatId.toString();
+  const editChatId = mappedChatId || chatId;
+  const session = silentSessionMap.get(chatIdStr);
+  const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr) || fallbackMessageId;
+  const result = cancelDownloadTask(taskId);
+  const total = Math.max(session?.total || 0, result.total);
+  const completed = session?.completed || 0;
+  const failed = session?.failed || 0;
+  const pendingOrActive = Math.max(0, total - completed);
+  if (silentMsgId) {
+    const text = [
+      `\u{1F6D1} **\u540E\u53F0\u4EFB\u52A1\u5DF2\u53D6\u6D88**`,
+      ``,
+      `\u{1F194} \u4EFB\u52A1\uFF1A\`${taskId}\``,
+      `\u2705 \u5DF2\u5B8C\u6210: ${completed} \u4E2A\u6587\u4EF6`,
+      ...failed > 0 ? [`\u274C \u5931\u8D25: ${failed} \u4E2A\u6587\u4EF6`] : [],
+      `\u{1F6AB} \u5DF2\u505C\u6B62/\u6E05\u7A7A: ${pendingOrActive} \u4E2A\u7B49\u5F85\u6216\u8FDB\u884C\u4E2D\u7684\u4EFB\u52A1`,
+      ``,
+      `\u5DF2\u79FB\u9664\u6682\u505C / \u7EE7\u7EED / \u53D6\u6D88\u6309\u94AE\uFF0C\u6B64\u4EFB\u52A1\u4E0D\u4F1A\u518D\u54CD\u5E94\u65E7\u6309\u94AE\u64CD\u4F5C\u3002`
+    ].join("\n");
+    await safeEditMessage(client2, editChatId, { message: silentMsgId, text, buttons: new Api2.ReplyInlineMarkup({ rows: [] }) });
+  }
+  silentSessionMap.delete(chatIdStr);
+  if (session?.taskId) taskIdToChatId.delete(session.taskId);
+  taskIdToChatId.delete(taskId);
+  silentNoticeMessageIdMap.delete(chatIdStr);
+  lastSilentNotificationTimeMap.delete(chatIdStr);
+  clearConsolidatedState(chatIdStr);
+  resetChatTransferSession(chatIdStr);
+  return result;
 }
 function retryFailedDownloadTasks(limit = 10, _taskId) {
   return downloadQueue.retryFailed(limit);
@@ -6369,15 +6430,17 @@ async function handleTaskQueueCallback(update, data) {
   try {
     if (action === "pause") {
       pauseDownloadTasks(taskId);
+      await refreshSilentProgress(client, update.peer);
       await client.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" }));
       return;
     }
     if (action === "resume") {
       resumeDownloadTasks(taskId);
+      await refreshSilentProgress(client, update.peer);
       await client.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u7EE7\u7EED\u4E0B\u8F7D\u961F\u5217" }));
       return;
     }
-    cancelDownloadTask(taskId);
+    await cancelSilentTask(client, update.peer, taskId, update.msgId);
     await client.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u53D6\u6D88\u540E\u53F0\u4EFB\u52A1", alert: true }));
   } catch (error) {
     await client.invoke(new Api4.messages.SetBotCallbackAnswer({
