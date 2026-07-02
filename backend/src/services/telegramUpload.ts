@@ -46,6 +46,11 @@ const TG_DISK_WATERMARK_RECHECK_MS = Math.max(5000, parseInt(process.env.TG_DISK
 const TG_DISK_WATERMARK_MAX_WAIT_MS = Math.max(0, parseInt(process.env.TG_DISK_WATERMARK_MAX_WAIT_MS || '0', 10) || 0);
 const TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE = Math.max(1, parseInt(process.env.TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE || '50', 10) || 50);
 
+function normalizeFileDownloadConcurrency(value: unknown): number {
+    const parsed = parseInt(String(value ?? process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY ?? '2'), 10);
+    return [1, 2, 3, 4].includes(parsed) ? parsed : 2;
+}
+
 const TG_DEBUG_LOG_PATH = process.env.TG_STATUS_DEBUG_LOG || path.join(process.cwd(), 'data', 'logs', 'tg_silent_debug.log');
 const TG_DEBUG_LOG_MAX_BYTES = Math.max(1024 * 1024, parseInt(process.env.TG_DEBUG_LOG_MAX_MB || '5', 10) * 1024 * 1024);
 function appendTelegramDebugLog(line: string) {
@@ -340,7 +345,7 @@ class BetterDownloadQueue {
     private active: DownloadTask[] = [];
     private history: DownloadTask[] = [];
     private maxHistory = 50;
-    private maxConcurrent = 2; // 用户要求并发限制为 2
+    private maxConcurrent = normalizeFileDownloadConcurrency(process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY);
     private paused = false;
     private diskPressurePaused = false;
     private diskPressureReason?: string;
@@ -413,6 +418,7 @@ class BetterDownloadQueue {
             active: this.active.length,
             pending: this.queue.length,
             total: this.active.length + this.queue.length,
+            maxConcurrent: this.maxConcurrent,
             paused: this.paused,
             diskPressurePaused: this.diskPressurePaused,
             diskPressureReason: this.diskPressureReason,
@@ -425,6 +431,7 @@ class BetterDownloadQueue {
             active: [...this.active],
             pending: [...this.queue],
             history: [...this.history],
+            maxConcurrent: this.maxConcurrent,
             paused: this.paused,
             diskPressurePaused: this.diskPressurePaused,
             diskPressureReason: this.diskPressureReason,
@@ -438,6 +445,16 @@ class BetterDownloadQueue {
         if (task) {
             task.downloadedSize = downloaded;
         }
+    }
+
+    getMaxConcurrent(): number {
+        return this.maxConcurrent;
+    }
+
+    setMaxConcurrent(value: number): number {
+        this.maxConcurrent = normalizeFileDownloadConcurrency(value);
+        this.processNext();
+        return this.maxConcurrent;
     }
 
     pause(): { active: number; pending: number; total: number } {
@@ -1105,6 +1122,21 @@ async function refreshConsolidatedMessage(client: TelegramClient, chatId: Api.Ty
 // 导出获取队列统计信息的函数
 export function getDownloadQueueStats() {
     return downloadQueue.getStats();
+}
+
+export function getFileDownloadConcurrency(): number {
+    return downloadQueue.getMaxConcurrent();
+}
+
+export function setFileDownloadConcurrency(value: number): number {
+    const normalized = downloadQueue.setMaxConcurrent(value);
+    process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY = String(normalized);
+    return normalized;
+}
+
+export async function loadFileDownloadConcurrencySetting(): Promise<number> {
+    const value = await getSetting('telegram_file_download_concurrency', process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY || '2');
+    return setFileDownloadConcurrency(normalizeFileDownloadConcurrency(value));
 }
 
 export function getTaskStatus() {

@@ -15,7 +15,7 @@ import {
     buildDeleteSuccess,
 } from '../utils/telegramMessages.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync } from './telegramState.js';
-import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, retryFailedDownloadTasks } from './telegramUpload.js';
+import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, retryFailedDownloadTasks, getFileDownloadConcurrency, setFileDownloadConcurrency } from './telegramUpload.js';
 import { storageManager } from './storage.js';
 import { listTelegramBackgroundJobs } from './telegramChannelJobs.js';
 import { getSetting, setSetting } from '../utils/settings.js';
@@ -38,6 +38,7 @@ import {
 // ESM compatibility
 const checkDiskSpace = (checkDiskSpaceModule as any).default || checkDiskSpaceModule;
 const DOWNLOAD_WORKER_OPTIONS = [4, 8, 12, 16];
+const FILE_CONCURRENCY_OPTIONS = [1, 2, 3, 4];
 const ON_VALUES = new Set(['1', 'true', 'yes', 'on']);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const THUMBNAIL_DIR = process.env.THUMBNAIL_DIR || './data/thumbnails';
@@ -159,16 +160,80 @@ async function pruneEmptyDirs(dir: string, baseDir = path.resolve(UPLOAD_DIR)): 
 
 function buildDownloadWorkersText(current: number): string {
     return [
-        '⚙️ **Telegram 并发下载设置**',
+        '⚙️ **Telegram 分片并发设置**',
         '',
         `当前 worker 数：**${current}**`,
         '',
-        '说明：Telegram 单次请求上限仍是 512KB，这里调整的是并发分片数量。',
+        '说明：Telegram 单次请求上限仍是 512KB，这里调整的是单个文件内部的并发分片请求数。',
+        '如果要调整“一次同时下载几个文件”，请使用 /file_concurrency。',
         '',
         '建议：',
         '- `4`：稳定优先',
         '- `8`：速度/稳定平衡',
         '- `12` / `16`：激进模式，可能触发风控、断流、限速，甚至账号风险，需要二次确认',
+    ].join('\n');
+}
+
+function normalizeFileConcurrency(value: unknown): number {
+    const parsed = parseInt(String(value ?? '2'), 10);
+    return FILE_CONCURRENCY_OPTIONS.includes(parsed) ? parsed : 2;
+}
+
+async function getCurrentFileConcurrency(): Promise<number> {
+    const value = await getSetting('telegram_file_download_concurrency', process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY || String(getFileDownloadConcurrency()));
+    return normalizeFileConcurrency(value);
+}
+
+function buildFileConcurrencyKeyboard(current: number, confirmValue?: number): Api.ReplyInlineMarkup {
+    if (confirmValue) {
+        return new Api.ReplyInlineMarkup({
+            rows: [
+                new Api.KeyboardButtonRow({
+                    buttons: [
+                        new Api.KeyboardButtonCallback({ text: `⚠️ 确认同时下载 ${confirmValue} 个文件`, data: Buffer.from(`fc_confirm_${confirmValue}`) }),
+                        new Api.KeyboardButtonCallback({ text: '取消', data: Buffer.from('fc_cancel') }),
+                    ],
+                }),
+            ],
+        });
+    }
+
+    return new Api.ReplyInlineMarkup({
+        rows: [
+            new Api.KeyboardButtonRow({
+                buttons: [
+                    new Api.KeyboardButtonCallback({ text: `${current === 1 ? '✅ ' : ''}1`, data: Buffer.from('fc_set_1') }),
+                    new Api.KeyboardButtonCallback({ text: `${current === 2 ? '✅ ' : ''}2`, data: Buffer.from('fc_set_2') }),
+                ],
+            }),
+            new Api.KeyboardButtonRow({
+                buttons: [
+                    new Api.KeyboardButtonCallback({ text: `${current === 3 ? '✅ ' : ''}3`, data: Buffer.from('fc_set_3') }),
+                    new Api.KeyboardButtonCallback({ text: `${current === 4 ? '✅ ' : ''}4 ⚠️`, data: Buffer.from('fc_set_4') }),
+                ],
+            }),
+        ],
+    });
+}
+
+function buildFileConcurrencyText(current: number): string {
+    const stats = getDownloadQueueStats();
+    return [
+        '📦 **Telegram 文件级并发设置**',
+        '',
+        `当前同时下载文件数：**${current}**`,
+        `当前队列：进行中 ${stats.active}，等待中 ${stats.pending}`,
+        '',
+        '说明：这里控制“一次同时下载几个文件”。',
+        '它不同于 /download_workers：后者控制单个文件内部的 512KB 分片并发。',
+        '',
+        '建议：',
+        '- `1`：最稳，适合风控/限速时使用',
+        '- `2`：默认推荐，速度与稳定平衡',
+        '- `3`：速度优先，适合线路稳定时使用',
+        '- `4`：激进模式，可能触发 Telegram 限流或云盘上传限速，需要二次确认',
+        '',
+        '修改后会立即影响队列中新启动的文件下载；已在进行中的文件不会被中断。',
     ].join('\n');
 }
 
@@ -594,8 +659,22 @@ export async function handleDownloadWorkers(message: Api.Message): Promise<void>
             buttons: buildDownloadWorkersKeyboard(current),
         });
     } catch (error) {
-        console.error('🤖 获取并发下载设置失败:', error);
-        await message.reply({ message: `❌ 获取并发下载设置失败: ${(error as Error).message}` });
+        console.error('🤖 获取分片并发设置失败:', error);
+        await message.reply({ message: `❌ 获取分片并发设置失败: ${(error as Error).message}` });
+    }
+}
+
+export async function handleFileConcurrency(message: Api.Message): Promise<void> {
+    try {
+        const current = await getCurrentFileConcurrency();
+        setFileDownloadConcurrency(current);
+        await message.reply({
+            message: buildFileConcurrencyText(current),
+            buttons: buildFileConcurrencyKeyboard(current),
+        });
+    } catch (error) {
+        console.error('🤖 获取文件级并发设置失败:', error);
+        await message.reply({ message: `❌ 获取文件级并发设置失败: ${(error as Error).message}` });
     }
 }
 
@@ -781,7 +860,7 @@ export async function handleDownloadWorkersCallback(client: TelegramClient, upda
                     text: [
                         `⚠️ **确认使用 ${workers} workers？**`,
                         '',
-                        '这是激进并发模式，可能出现：',
+                        '这是激进分片并发模式，可能出现：',
                         '- Telegram 风控或限流',
                         '- 下载断流 / 重试增多',
                         '- user session 账号风险，极端情况下可能影响账号',
@@ -817,6 +896,82 @@ export async function handleDownloadWorkersCallback(client: TelegramClient, upda
         }
     } catch (error) {
         console.error('🤖 设置并发下载 worker 失败:', error);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({
+            queryId: update.queryId,
+            message: `设置失败: ${(error as Error).message}`,
+            alert: true,
+        }));
+    }
+}
+
+export async function handleFileConcurrencyCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
+    const userId = update.userId.toJSNumber();
+    if (!(await isAuthenticatedAsync(userId))) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({
+            queryId: update.queryId,
+            message: MSG.AUTH_REQUIRED,
+            alert: true,
+        }));
+        return;
+    }
+
+    try {
+        if (data === 'fc_cancel') {
+            const current = await getCurrentFileConcurrency();
+            setFileDownloadConcurrency(current);
+            await client.editMessage(update.peer, {
+                message: update.msgId,
+                text: buildFileConcurrencyText(current),
+                buttons: buildFileConcurrencyKeyboard(current),
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已取消' }));
+            return;
+        }
+
+        const setMatch = data.match(/^fc_set_(1|2|3|4)$/);
+        if (setMatch) {
+            const concurrency = Number(setMatch[1]);
+            if (concurrency === 4) {
+                await client.editMessage(update.peer, {
+                    message: update.msgId,
+                    text: [
+                        '⚠️ **确认同时下载 4 个文件？**',
+                        '',
+                        '这是文件级激进并发模式，可能出现：',
+                        '- Telegram 风控或限流',
+                        '- 云盘上传限速 / 失败重试增多',
+                        '- 服务器磁盘和网络压力明显增加',
+                        '',
+                        '如果只是日常下载，建议使用 2 或 3。',
+                    ].join('\n'),
+                    buttons: buildFileConcurrencyKeyboard(concurrency, concurrency),
+                });
+                await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '需要二次确认' }));
+                return;
+            }
+
+            await setSetting('telegram_file_download_concurrency', String(concurrency));
+            const normalized = setFileDownloadConcurrency(concurrency);
+            await client.editMessage(update.peer, {
+                message: `${buildFileConcurrencyText(normalized)}\n\n✅ 已切换为同时下载 ${normalized} 个文件。`,
+                buttons: buildFileConcurrencyKeyboard(normalized),
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `已设置为 ${normalized}` }));
+            return;
+        }
+
+        const confirmMatch = data.match(/^fc_confirm_4$/);
+        if (confirmMatch) {
+            await setSetting('telegram_file_download_concurrency', '4');
+            const normalized = setFileDownloadConcurrency(4);
+            await client.editMessage(update.peer, {
+                message: `${buildFileConcurrencyText(normalized)}\n\n⚠️ 已确认并切换为同时下载 4 个文件。若出现限流、断流或上传失败，请立即降回 2 或 3。`,
+                buttons: buildFileConcurrencyKeyboard(normalized),
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已确认 4 个文件并发', alert: true }));
+        }
+    } catch (error) {
+        console.error('🤖 设置文件级并发失败:', error);
         await client.invoke(new Api.messages.SetBotCallbackAnswer({
             queryId: update.queryId,
             message: `设置失败: ${(error as Error).message}`,

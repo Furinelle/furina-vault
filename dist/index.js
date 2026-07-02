@@ -2154,7 +2154,8 @@ function buildWelcomeBack() {
     `\u{1F4C1}  /path_rules \u2014 \u4FDD\u5B58\u8DEF\u5F84/\u81EA\u5B9A\u4E49\u76EE\u5F55`,
     `\u{1F4E1}  /tg_sub \u2014 \u8BA2\u9605\u9891\u9053\u81EA\u52A8\u540C\u6B65`,
     `\u{1F4E6}  /tg_download \u2014 \u6309\u65E5\u671F/\u6807\u7B7E\u4E0B\u8F7D\u9891\u9053\u6587\u4EF6`,
-    `\u2699\uFE0F  /download_workers \u2014 \u4E0B\u8F7D\u5E76\u53D1\u8BBE\u7F6E`,
+    `\u2699\uFE0F  /download_workers \u2014 \u5355\u6587\u4EF6\u5206\u7247\u5E76\u53D1\u8BBE\u7F6E`,
+    `\u{1F4E6}  /file_concurrency \u2014 \u540C\u65F6\u4E0B\u8F7D\u6587\u4EF6\u6570`,
     `\u{1F9EC}  /duplicate_mode \u2014 \u91CD\u590D\u6587\u4EF6\u5904\u7406`,
     `\u{1F9F9}  /cleanup_settings \u2014 \u81EA\u52A8\u6E05\u7406\u8BBE\u7F6E`,
     `\u{1F4CA}  /storage \u2014 \u5B58\u50A8\u7EDF\u8BA1/\u6E05\u7406\u672C\u5730\u6587\u4EF6`,
@@ -2199,7 +2200,8 @@ function buildHelp() {
     `  /tg_download \u2014 \u6309\u65E5\u671F/\u6807\u7B7E\u4E0B\u8F7D\u9891\u9053\u6587\u4EF6`,
     `  /tg_download date <\u9891\u9053> <\u5F00\u59CB\u65E5\u671F> <\u7ED3\u675F\u65E5\u671F> \u2014 \u6309\u65E5\u671F\u4E0B\u8F7D`,
     `  /tg_download tag <\u9891\u9053> <#\u6807\u7B7E> \u2014 \u6309\u6807\u7B7E\u4E0B\u8F7D`,
-    `  /download_workers \u2014 \u8BBE\u7F6E\u4E0B\u8F7D\u5E76\u53D1`,
+    `  /download_workers \u2014 \u8BBE\u7F6E\u5355\u6587\u4EF6\u5206\u7247\u5E76\u53D1`,
+    `  /file_concurrency \u2014 \u8BBE\u7F6E\u540C\u65F6\u4E0B\u8F7D\u6587\u4EF6\u6570`,
     `  /duplicate_mode \u2014 \u8BBE\u7F6E\u91CD\u590D\u6587\u4EF6\u5904\u7406`,
     `  /cleanup_settings \u2014 \u8BBE\u7F6E\u81EA\u52A8\u6E05\u7406\u5F00\u5173`,
     `  /storage \u2014 \u5B58\u50A8\u7EDF\u8BA1/\u6E05\u7406\u672C\u5730\u6587\u4EF6`,
@@ -3218,6 +3220,10 @@ var TG_LARGE_TASK_REFRESH_INTERVAL_MS = Math.max(3e3, parseInt(process.env.TG_LA
 var TG_DISK_WATERMARK_RECHECK_MS = Math.max(5e3, parseInt(process.env.TG_DISK_WATERMARK_RECHECK_MS || "30000", 10) || 3e4);
 var TG_DISK_WATERMARK_MAX_WAIT_MS = Math.max(0, parseInt(process.env.TG_DISK_WATERMARK_MAX_WAIT_MS || "0", 10) || 0);
 var TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE = Math.max(1, parseInt(process.env.TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE || "50", 10) || 50);
+function normalizeFileDownloadConcurrency(value) {
+  const parsed = parseInt(String(value ?? process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY ?? "2"), 10);
+  return [1, 2, 3, 4].includes(parsed) ? parsed : 2;
+}
 var TG_DEBUG_LOG_PATH = process.env.TG_STATUS_DEBUG_LOG || path10.join(process.cwd(), "data", "logs", "tg_silent_debug.log");
 var TG_DEBUG_LOG_MAX_BYTES = Math.max(1024 * 1024, parseInt(process.env.TG_DEBUG_LOG_MAX_MB || "5", 10) * 1024 * 1024);
 function appendTelegramDebugLog(line) {
@@ -3441,8 +3447,7 @@ var BetterDownloadQueue = class {
   active = [];
   history = [];
   maxHistory = 50;
-  maxConcurrent = 2;
-  // 用户要求并发限制为 2
+  maxConcurrent = normalizeFileDownloadConcurrency(process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY);
   paused = false;
   diskPressurePaused = false;
   diskPressureReason;
@@ -3505,6 +3510,7 @@ var BetterDownloadQueue = class {
       active: this.active.length,
       pending: this.queue.length,
       total: this.active.length + this.queue.length,
+      maxConcurrent: this.maxConcurrent,
       paused: this.paused,
       diskPressurePaused: this.diskPressurePaused,
       diskPressureReason: this.diskPressureReason,
@@ -3516,6 +3522,7 @@ var BetterDownloadQueue = class {
       active: [...this.active],
       pending: [...this.queue],
       history: [...this.history],
+      maxConcurrent: this.maxConcurrent,
       paused: this.paused,
       diskPressurePaused: this.diskPressurePaused,
       diskPressureReason: this.diskPressureReason,
@@ -3528,6 +3535,14 @@ var BetterDownloadQueue = class {
     if (task) {
       task.downloadedSize = downloaded;
     }
+  }
+  getMaxConcurrent() {
+    return this.maxConcurrent;
+  }
+  setMaxConcurrent(value) {
+    this.maxConcurrent = normalizeFileDownloadConcurrency(value);
+    this.processNext();
+    return this.maxConcurrent;
   }
   pause() {
     this.paused = true;
@@ -4026,6 +4041,18 @@ async function refreshConsolidatedMessage(client2, chatId, replyTo) {
 }
 function getDownloadQueueStats() {
   return downloadQueue.getStats();
+}
+function getFileDownloadConcurrency() {
+  return downloadQueue.getMaxConcurrent();
+}
+function setFileDownloadConcurrency(value) {
+  const normalized = downloadQueue.setMaxConcurrent(value);
+  process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY = String(normalized);
+  return normalized;
+}
+async function loadFileDownloadConcurrencySetting() {
+  const value = await getSetting("telegram_file_download_concurrency", process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY || "2");
+  return setFileDownloadConcurrency(normalizeFileDownloadConcurrency(value));
 }
 function getTaskStatus() {
   return downloadQueue.getDetailedStatus();
@@ -5658,6 +5685,7 @@ async function updateScopedFileById(id, setSql, values) {
 // src/services/telegramCommands.ts
 var checkDiskSpace = checkDiskSpaceModule.default || checkDiskSpaceModule;
 var DOWNLOAD_WORKER_OPTIONS = [4, 8, 12, 16];
+var FILE_CONCURRENCY_OPTIONS = [1, 2, 3, 4];
 var ON_VALUES = /* @__PURE__ */ new Set(["1", "true", "yes", "on"]);
 var UPLOAD_DIR4 = process.env.UPLOAD_DIR || "./data/uploads";
 var THUMBNAIL_DIR4 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
@@ -5757,16 +5785,75 @@ async function pruneEmptyDirs(dir, baseDir = path13.resolve(UPLOAD_DIR4)) {
 }
 function buildDownloadWorkersText(current) {
   return [
-    "\u2699\uFE0F **Telegram \u5E76\u53D1\u4E0B\u8F7D\u8BBE\u7F6E**",
+    "\u2699\uFE0F **Telegram \u5206\u7247\u5E76\u53D1\u8BBE\u7F6E**",
     "",
     `\u5F53\u524D worker \u6570\uFF1A**${current}**`,
     "",
-    "\u8BF4\u660E\uFF1ATelegram \u5355\u6B21\u8BF7\u6C42\u4E0A\u9650\u4ECD\u662F 512KB\uFF0C\u8FD9\u91CC\u8C03\u6574\u7684\u662F\u5E76\u53D1\u5206\u7247\u6570\u91CF\u3002",
+    "\u8BF4\u660E\uFF1ATelegram \u5355\u6B21\u8BF7\u6C42\u4E0A\u9650\u4ECD\u662F 512KB\uFF0C\u8FD9\u91CC\u8C03\u6574\u7684\u662F\u5355\u4E2A\u6587\u4EF6\u5185\u90E8\u7684\u5E76\u53D1\u5206\u7247\u8BF7\u6C42\u6570\u3002",
+    "\u5982\u679C\u8981\u8C03\u6574\u201C\u4E00\u6B21\u540C\u65F6\u4E0B\u8F7D\u51E0\u4E2A\u6587\u4EF6\u201D\uFF0C\u8BF7\u4F7F\u7528 /file_concurrency\u3002",
     "",
     "\u5EFA\u8BAE\uFF1A",
     "- `4`\uFF1A\u7A33\u5B9A\u4F18\u5148",
     "- `8`\uFF1A\u901F\u5EA6/\u7A33\u5B9A\u5E73\u8861",
     "- `12` / `16`\uFF1A\u6FC0\u8FDB\u6A21\u5F0F\uFF0C\u53EF\u80FD\u89E6\u53D1\u98CE\u63A7\u3001\u65AD\u6D41\u3001\u9650\u901F\uFF0C\u751A\u81F3\u8D26\u53F7\u98CE\u9669\uFF0C\u9700\u8981\u4E8C\u6B21\u786E\u8BA4"
+  ].join("\n");
+}
+function normalizeFileConcurrency(value) {
+  const parsed = parseInt(String(value ?? "2"), 10);
+  return FILE_CONCURRENCY_OPTIONS.includes(parsed) ? parsed : 2;
+}
+async function getCurrentFileConcurrency() {
+  const value = await getSetting("telegram_file_download_concurrency", process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY || String(getFileDownloadConcurrency()));
+  return normalizeFileConcurrency(value);
+}
+function buildFileConcurrencyKeyboard(current, confirmValue) {
+  if (confirmValue) {
+    return new Api4.ReplyInlineMarkup({
+      rows: [
+        new Api4.KeyboardButtonRow({
+          buttons: [
+            new Api4.KeyboardButtonCallback({ text: `\u26A0\uFE0F \u786E\u8BA4\u540C\u65F6\u4E0B\u8F7D ${confirmValue} \u4E2A\u6587\u4EF6`, data: Buffer.from(`fc_confirm_${confirmValue}`) }),
+            new Api4.KeyboardButtonCallback({ text: "\u53D6\u6D88", data: Buffer.from("fc_cancel") })
+          ]
+        })
+      ]
+    });
+  }
+  return new Api4.ReplyInlineMarkup({
+    rows: [
+      new Api4.KeyboardButtonRow({
+        buttons: [
+          new Api4.KeyboardButtonCallback({ text: `${current === 1 ? "\u2705 " : ""}1`, data: Buffer.from("fc_set_1") }),
+          new Api4.KeyboardButtonCallback({ text: `${current === 2 ? "\u2705 " : ""}2`, data: Buffer.from("fc_set_2") })
+        ]
+      }),
+      new Api4.KeyboardButtonRow({
+        buttons: [
+          new Api4.KeyboardButtonCallback({ text: `${current === 3 ? "\u2705 " : ""}3`, data: Buffer.from("fc_set_3") }),
+          new Api4.KeyboardButtonCallback({ text: `${current === 4 ? "\u2705 " : ""}4 \u26A0\uFE0F`, data: Buffer.from("fc_set_4") })
+        ]
+      })
+    ]
+  });
+}
+function buildFileConcurrencyText(current) {
+  const stats = getDownloadQueueStats();
+  return [
+    "\u{1F4E6} **Telegram \u6587\u4EF6\u7EA7\u5E76\u53D1\u8BBE\u7F6E**",
+    "",
+    `\u5F53\u524D\u540C\u65F6\u4E0B\u8F7D\u6587\u4EF6\u6570\uFF1A**${current}**`,
+    `\u5F53\u524D\u961F\u5217\uFF1A\u8FDB\u884C\u4E2D ${stats.active}\uFF0C\u7B49\u5F85\u4E2D ${stats.pending}`,
+    "",
+    "\u8BF4\u660E\uFF1A\u8FD9\u91CC\u63A7\u5236\u201C\u4E00\u6B21\u540C\u65F6\u4E0B\u8F7D\u51E0\u4E2A\u6587\u4EF6\u201D\u3002",
+    "\u5B83\u4E0D\u540C\u4E8E /download_workers\uFF1A\u540E\u8005\u63A7\u5236\u5355\u4E2A\u6587\u4EF6\u5185\u90E8\u7684 512KB \u5206\u7247\u5E76\u53D1\u3002",
+    "",
+    "\u5EFA\u8BAE\uFF1A",
+    "- `1`\uFF1A\u6700\u7A33\uFF0C\u9002\u5408\u98CE\u63A7/\u9650\u901F\u65F6\u4F7F\u7528",
+    "- `2`\uFF1A\u9ED8\u8BA4\u63A8\u8350\uFF0C\u901F\u5EA6\u4E0E\u7A33\u5B9A\u5E73\u8861",
+    "- `3`\uFF1A\u901F\u5EA6\u4F18\u5148\uFF0C\u9002\u5408\u7EBF\u8DEF\u7A33\u5B9A\u65F6\u4F7F\u7528",
+    "- `4`\uFF1A\u6FC0\u8FDB\u6A21\u5F0F\uFF0C\u53EF\u80FD\u89E6\u53D1 Telegram \u9650\u6D41\u6216\u4E91\u76D8\u4E0A\u4F20\u9650\u901F\uFF0C\u9700\u8981\u4E8C\u6B21\u786E\u8BA4",
+    "",
+    "\u4FEE\u6539\u540E\u4F1A\u7ACB\u5373\u5F71\u54CD\u961F\u5217\u4E2D\u65B0\u542F\u52A8\u7684\u6587\u4EF6\u4E0B\u8F7D\uFF1B\u5DF2\u5728\u8FDB\u884C\u4E2D\u7684\u6587\u4EF6\u4E0D\u4F1A\u88AB\u4E2D\u65AD\u3002"
   ].join("\n");
 }
 function isOn(value, defaultValue = true) {
@@ -6139,8 +6226,21 @@ async function handleDownloadWorkers(message) {
       buttons: buildDownloadWorkersKeyboard(current)
     });
   } catch (error) {
-    console.error("\u{1F916} \u83B7\u53D6\u5E76\u53D1\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25:", error);
-    await message.reply({ message: `\u274C \u83B7\u53D6\u5E76\u53D1\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25: ${error.message}` });
+    console.error("\u{1F916} \u83B7\u53D6\u5206\u7247\u5E76\u53D1\u8BBE\u7F6E\u5931\u8D25:", error);
+    await message.reply({ message: `\u274C \u83B7\u53D6\u5206\u7247\u5E76\u53D1\u8BBE\u7F6E\u5931\u8D25: ${error.message}` });
+  }
+}
+async function handleFileConcurrency(message) {
+  try {
+    const current = await getCurrentFileConcurrency();
+    setFileDownloadConcurrency(current);
+    await message.reply({
+      message: buildFileConcurrencyText(current),
+      buttons: buildFileConcurrencyKeyboard(current)
+    });
+  } catch (error) {
+    console.error("\u{1F916} \u83B7\u53D6\u6587\u4EF6\u7EA7\u5E76\u53D1\u8BBE\u7F6E\u5931\u8D25:", error);
+    await message.reply({ message: `\u274C \u83B7\u53D6\u6587\u4EF6\u7EA7\u5E76\u53D1\u8BBE\u7F6E\u5931\u8D25: ${error.message}` });
   }
 }
 async function handlePathRules(message) {
@@ -6314,7 +6414,7 @@ async function handleDownloadWorkersCallback(client2, update, data) {
           text: [
             `\u26A0\uFE0F **\u786E\u8BA4\u4F7F\u7528 ${workers} workers\uFF1F**`,
             "",
-            "\u8FD9\u662F\u6FC0\u8FDB\u5E76\u53D1\u6A21\u5F0F\uFF0C\u53EF\u80FD\u51FA\u73B0\uFF1A",
+            "\u8FD9\u662F\u6FC0\u8FDB\u5206\u7247\u5E76\u53D1\u6A21\u5F0F\uFF0C\u53EF\u80FD\u51FA\u73B0\uFF1A",
             "- Telegram \u98CE\u63A7\u6216\u9650\u6D41",
             "- \u4E0B\u8F7D\u65AD\u6D41 / \u91CD\u8BD5\u589E\u591A",
             "- user session \u8D26\u53F7\u98CE\u9669\uFF0C\u6781\u7AEF\u60C5\u51B5\u4E0B\u53EF\u80FD\u5F71\u54CD\u8D26\u53F7",
@@ -6352,6 +6452,81 @@ async function handleDownloadWorkersCallback(client2, update, data) {
     }
   } catch (error) {
     console.error("\u{1F916} \u8BBE\u7F6E\u5E76\u53D1\u4E0B\u8F7D worker \u5931\u8D25:", error);
+    await client2.invoke(new Api4.messages.SetBotCallbackAnswer({
+      queryId: update.queryId,
+      message: `\u8BBE\u7F6E\u5931\u8D25: ${error.message}`,
+      alert: true
+    }));
+  }
+}
+async function handleFileConcurrencyCallback(client2, update, data) {
+  const userId = update.userId.toJSNumber();
+  if (!await isAuthenticatedAsync(userId)) {
+    await client2.invoke(new Api4.messages.SetBotCallbackAnswer({
+      queryId: update.queryId,
+      message: MSG.AUTH_REQUIRED,
+      alert: true
+    }));
+    return;
+  }
+  try {
+    if (data === "fc_cancel") {
+      const current = await getCurrentFileConcurrency();
+      setFileDownloadConcurrency(current);
+      await client2.editMessage(update.peer, {
+        message: update.msgId,
+        text: buildFileConcurrencyText(current),
+        buttons: buildFileConcurrencyKeyboard(current)
+      });
+      await client2.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u53D6\u6D88" }));
+      return;
+    }
+    const setMatch = data.match(/^fc_set_(1|2|3|4)$/);
+    if (setMatch) {
+      const concurrency = Number(setMatch[1]);
+      if (concurrency === 4) {
+        await client2.editMessage(update.peer, {
+          message: update.msgId,
+          text: [
+            "\u26A0\uFE0F **\u786E\u8BA4\u540C\u65F6\u4E0B\u8F7D 4 \u4E2A\u6587\u4EF6\uFF1F**",
+            "",
+            "\u8FD9\u662F\u6587\u4EF6\u7EA7\u6FC0\u8FDB\u5E76\u53D1\u6A21\u5F0F\uFF0C\u53EF\u80FD\u51FA\u73B0\uFF1A",
+            "- Telegram \u98CE\u63A7\u6216\u9650\u6D41",
+            "- \u4E91\u76D8\u4E0A\u4F20\u9650\u901F / \u5931\u8D25\u91CD\u8BD5\u589E\u591A",
+            "- \u670D\u52A1\u5668\u78C1\u76D8\u548C\u7F51\u7EDC\u538B\u529B\u660E\u663E\u589E\u52A0",
+            "",
+            "\u5982\u679C\u53EA\u662F\u65E5\u5E38\u4E0B\u8F7D\uFF0C\u5EFA\u8BAE\u4F7F\u7528 2 \u6216 3\u3002"
+          ].join("\n"),
+          buttons: buildFileConcurrencyKeyboard(concurrency, concurrency)
+        });
+        await client2.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u9700\u8981\u4E8C\u6B21\u786E\u8BA4" }));
+        return;
+      }
+      await setSetting("telegram_file_download_concurrency", String(concurrency));
+      const normalized = setFileDownloadConcurrency(concurrency);
+      await client2.editMessage(update.peer, {
+        message: `${buildFileConcurrencyText(normalized)}
+
+\u2705 \u5DF2\u5207\u6362\u4E3A\u540C\u65F6\u4E0B\u8F7D ${normalized} \u4E2A\u6587\u4EF6\u3002`,
+        buttons: buildFileConcurrencyKeyboard(normalized)
+      });
+      await client2.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u5DF2\u8BBE\u7F6E\u4E3A ${normalized}` }));
+      return;
+    }
+    const confirmMatch = data.match(/^fc_confirm_4$/);
+    if (confirmMatch) {
+      await setSetting("telegram_file_download_concurrency", "4");
+      const normalized = setFileDownloadConcurrency(4);
+      await client2.editMessage(update.peer, {
+        message: `${buildFileConcurrencyText(normalized)}
+
+\u26A0\uFE0F \u5DF2\u786E\u8BA4\u5E76\u5207\u6362\u4E3A\u540C\u65F6\u4E0B\u8F7D 4 \u4E2A\u6587\u4EF6\u3002\u82E5\u51FA\u73B0\u9650\u6D41\u3001\u65AD\u6D41\u6216\u4E0A\u4F20\u5931\u8D25\uFF0C\u8BF7\u7ACB\u5373\u964D\u56DE 2 \u6216 3\u3002`,
+        buttons: buildFileConcurrencyKeyboard(normalized)
+      });
+      await client2.invoke(new Api4.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u786E\u8BA4 4 \u4E2A\u6587\u4EF6\u5E76\u53D1", alert: true }));
+    }
+  } catch (error) {
+    console.error("\u{1F916} \u8BBE\u7F6E\u6587\u4EF6\u7EA7\u5E76\u53D1\u5931\u8D25:", error);
     await client2.invoke(new Api4.messages.SetBotCallbackAnswer({
       queryId: update.queryId,
       message: `\u8BBE\u7F6E\u5931\u8D25: ${error.message}`,
@@ -7374,7 +7549,8 @@ async function initTelegramBot() {
           new Api5.BotCommand({ command: "path_rules", description: "\u4FDD\u5B58\u8DEF\u5F84/\u81EA\u5B9A\u4E49\u76EE\u5F55" }),
           new Api5.BotCommand({ command: "tg_sub", description: "\u8BA2\u9605\u9891\u9053\u81EA\u52A8\u540C\u6B65" }),
           new Api5.BotCommand({ command: "tg_download", description: "\u6309\u65E5\u671F/\u6807\u7B7E\u4E0B\u8F7D\u9891\u9053\u6587\u4EF6" }),
-          new Api5.BotCommand({ command: "download_workers", description: "\u8BBE\u7F6E Telegram \u5E76\u53D1\u4E0B\u8F7D" }),
+          new Api5.BotCommand({ command: "download_workers", description: "\u8BBE\u7F6E\u5355\u6587\u4EF6\u5206\u7247\u5E76\u53D1" }),
+          new Api5.BotCommand({ command: "file_concurrency", description: "\u8BBE\u7F6E\u540C\u65F6\u4E0B\u8F7D\u6587\u4EF6\u6570" }),
           new Api5.BotCommand({ command: "duplicate_mode", description: "\u8BBE\u7F6E\u91CD\u590D\u6587\u4EF6\u5904\u7406" }),
           new Api5.BotCommand({ command: "cleanup_settings", description: "\u8BBE\u7F6E\u81EA\u52A8\u6E05\u7406\u5F00\u5173" }),
           new Api5.BotCommand({ command: "storage", description: "\u67E5\u770B\u5B58\u50A8\u7EDF\u8BA1/\u6E05\u7406\u672C\u5730\u6587\u4EF6" }),
@@ -7395,6 +7571,12 @@ async function initTelegramBot() {
       }
     } catch (e) {
       console.warn("\u{1F9F9} \u8BFB\u53D6\u81EA\u52A8\u6E05\u7406\u8BBE\u7F6E\u5931\u8D25\uFF0C\u4F7F\u7528\u73AF\u5883\u53D8\u91CF\u9ED8\u8BA4\u503C:", e);
+    }
+    try {
+      const fileConcurrency = await loadFileDownloadConcurrencySetting();
+      console.log(`\u{1F916} Telegram \u6587\u4EF6\u7EA7\u5E76\u53D1: ${fileConcurrency}`);
+    } catch (e) {
+      console.warn("\u{1F916} \u8BFB\u53D6\u6587\u4EF6\u7EA7\u5E76\u53D1\u8BBE\u7F6E\u5931\u8D25\uFF0C\u4F7F\u7528\u73AF\u5883\u53D8\u91CF\u9ED8\u8BA4\u503C:", e);
     }
     if (isAutoCleanupEnabled()) {
       try {
@@ -7770,6 +7952,14 @@ ${buildPathPreviewLine(appliedPath.folder)}
           await handleDownloadWorkers(message);
           return;
         }
+        if (text === "/file_concurrency" || text === "/file_workers" || text === "/download_files") {
+          if (!await isAuthenticatedAsync(senderId)) {
+            await message.reply({ message: MSG.AUTH_REQUIRED });
+            return;
+          }
+          await handleFileConcurrency(message);
+          return;
+        }
         if (text === "/path_rules" || text === "/path" || text === "/save_rules") {
           if (!await isAuthenticatedAsync(senderId)) {
             await message.reply({ message: MSG.AUTH_REQUIRED });
@@ -7882,6 +8072,10 @@ ${buildPathPreviewLine(appliedPath.folder)}
         }
         if (data.startsWith("dw_")) {
           await handleDownloadWorkersCallback(activeClient, callbackUpdate, data);
+          return;
+        }
+        if (data.startsWith("fc_")) {
+          await handleFileConcurrencyCallback(activeClient, callbackUpdate, data);
           return;
         }
         if (data.startsWith("storage_")) {

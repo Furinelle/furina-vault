@@ -7,8 +7,8 @@ import path from 'path';
 import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleStorage, handleDelete, handleDeleteConfirmCallback, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
-import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask } from './telegramUpload.js';
+import { handleStart, handleHelp, handleStorage, handleDelete, handleDeleteConfirmCallback, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
+import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask, loadFileDownloadConcurrencySetting } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
 import {
     enqueueTelegramDateDownload,
@@ -904,7 +904,8 @@ export async function initTelegramBot(): Promise<void> {
                     new Api.BotCommand({ command: 'path_rules', description: '保存路径/自定义目录' }),
                     new Api.BotCommand({ command: 'tg_sub', description: '订阅频道自动同步' }),
                     new Api.BotCommand({ command: 'tg_download', description: '按日期/标签下载频道文件' }),
-                    new Api.BotCommand({ command: 'download_workers', description: '设置 Telegram 并发下载' }),
+                    new Api.BotCommand({ command: 'download_workers', description: '设置单文件分片并发' }),
+                    new Api.BotCommand({ command: 'file_concurrency', description: '设置同时下载文件数' }),
                     new Api.BotCommand({ command: 'duplicate_mode', description: '设置重复文件处理' }),
                     new Api.BotCommand({ command: 'cleanup_settings', description: '设置自动清理开关' }),
                     new Api.BotCommand({ command: 'storage', description: '查看存储统计/清理本地文件' }),
@@ -926,6 +927,13 @@ export async function initTelegramBot(): Promise<void> {
             }
         } catch (e) {
             console.warn('🧹 读取自动清理设置失败，使用环境变量默认值:', e);
+        }
+
+        try {
+            const fileConcurrency = await loadFileDownloadConcurrencySetting();
+            console.log(`🤖 Telegram 文件级并发: ${fileConcurrency}`);
+        } catch (e) {
+            console.warn('🤖 读取文件级并发设置失败，使用环境变量默认值:', e);
         }
 
         // 启动时清理孤儿文件（默认开启，可通过 /cleanup_settings 关闭）
@@ -1349,6 +1357,15 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
+                if (text === '/file_concurrency' || text === '/file_workers' || text === '/download_files') {
+                    if (!(await isAuthenticatedAsync(senderId))) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleFileConcurrency(message);
+                    return;
+                }
+
                 if (text === '/path_rules' || text === '/path' || text === '/save_rules') {
                     if (!(await isAuthenticatedAsync(senderId))) {
                         await message.reply({ message: MSG.AUTH_REQUIRED });
@@ -1488,6 +1505,12 @@ export async function initTelegramBot(): Promise<void> {
                 // 处理并发下载 worker 设置回调
                 if (data.startsWith('dw_')) {
                     await handleDownloadWorkersCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
+                // 处理文件级并发设置回调
+                if (data.startsWith('fc_')) {
+                    await handleFileConcurrencyCallback(activeClient, callbackUpdate, data);
                     return;
                 }
 

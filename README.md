@@ -116,7 +116,8 @@ docker compose up -d
 | `TELEGRAM_API_ID` | 启用 Bot 或账号级下载器 | 从 [my.telegram.org](https://my.telegram.org) 获取；Bot 与账号级下载器共用 |
 | `TELEGRAM_API_HASH` | 启用 Bot 或账号级下载器 | 与 `TELEGRAM_API_ID` 同页获取；Bot 与账号级下载器共用这一组 API 配置 |
 | `TELEGRAM_USER_SESSION_FILE` | 可选，启用账号级下载器 | 默认 `/data/telegram_user_session.txt`；运行登录脚本生成 |
-| `TELEGRAM_DOWNLOAD_WORKERS` | 可选，调 Telegram 下载并发 | 默认 `4`，建议 `4` 或 `8`；`12/16` 更激进，可能触发限流 |
+| `TELEGRAM_DOWNLOAD_WORKERS` | 可选，调单文件分片并发 | 默认 `4`，建议 `4` 或 `8`；`12/16` 更激进，可能触发限流 |
+| `TELEGRAM_FILE_DOWNLOAD_CONCURRENCY` | 可选，调一次同时下载几个文件 | 默认 `2`，可在 Bot 里用 `/file_concurrency` 设置 `1/2/3/4`；选择 `4` 需要二次确认 |
 
 ### 常用可选项
 
@@ -185,15 +186,23 @@ docker compose up -d
 - 频道订阅同步：`/tg_sub` 后台扫描依赖用户账号读取频道/群组新消息。
 - 大文件下载：Bot 直接下载受 Telegram Bot 限制影响，账号级下载器通常更稳定。
 
-### Telegram 并发下载调参
+### Telegram 文件与分片并发调参
 
-`TELEGRAM_DOWNLOAD_WORKERS` 控制并发分片请求数，默认 `4`。
+FlClouds 有两层 Telegram 下载并发：
 
-- `4`：默认推荐，稳定优先
-- `8`：速度与稳定性均衡
-- `12` / `16`：激进模式，需要二次确认，可能更容易遇到 Telegram 限流、断流或账号风险
+| 命令 / 配置 | 控制什么 | 可选值 |
+| :--- | :--- | :--- |
+| `/file_concurrency` / `TELEGRAM_FILE_DOWNLOAD_CONCURRENCY` | 一次同时下载几个文件 | `1` / `2` / `3` / `4`，选择 `4` 需要二次确认 |
+| `/download_workers` / `TELEGRAM_DOWNLOAD_WORKERS` | 单个文件内部同时拉几个 512KB 分片 | `4` / `8` / `12` / `16`，选择 `12/16` 需要二次确认 |
 
-> Telegram 单次 `upload.getFile` 请求最大约 512KB。这里调的是并发分片数，不是单请求大小。
+建议组合：
+
+- 稳定优先：文件级 `1`，分片 `4`
+- 默认推荐：文件级 `2`，分片 `4`
+- 速度优先：文件级 `3`，分片 `4` 或 `8`
+- 激进模式：文件级 `4` 或分片 `12/16`，可能触发 Telegram 限流、断流或云盘上传限速
+
+> Telegram 单次 `upload.getFile` 请求最大约 512KB。分片 worker 调的是单个文件内部请求数；文件级并发调的是队列中同时跑几个文件。
 
 ---
 
@@ -212,7 +221,8 @@ docker compose up -d
 | `/task_resume [任务ID]` | 继续全局队列或指定任务卡 | 否 |
 | `/task_cancel <任务ID或all>` | 取消匹配任务 | 否 |
 | `/stop_tasks` | 停止所有下载任务；别名 `/stop`、`/cancel_tasks` | 否 |
-| `/download_workers` | 设置 Telegram 下载并发；别名 `/workers` | 否 |
+| `/download_workers` | 设置单文件分片并发；别名 `/workers` | 否 |
+| `/file_concurrency` | 设置一次同时下载几个文件；别名 `/file_workers`、`/download_files` | 否 |
 | `/duplicate_mode` | 设置重复文件处理；别名 `/duplicate`、`/dup` | 否 |
 | `/cleanup_settings` | 设置本地孤儿文件自动清理开关；别名 `/cleanup` | 否 |
 | `/ytdlp <url>` | 解析并下载视频链接到当前存储源 | 否 |
