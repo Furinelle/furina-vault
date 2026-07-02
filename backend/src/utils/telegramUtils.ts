@@ -1,21 +1,4 @@
-import crypto from 'crypto';
 import path from 'path';
-
-const ACCESS_PASSWORD_HASH = process.env.ACCESS_PASSWORD_HASH || '';
-
-// Verify password using timing-safe comparison
-export function verifyPassword(password: string): boolean {
-    if (!ACCESS_PASSWORD_HASH) {
-        return true;
-    }
-    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
-    try {
-        return crypto.timingSafeEqual(Buffer.from(inputHash), Buffer.from(ACCESS_PASSWORD_HASH));
-    } catch (e) {
-        // Length mismatch or other error
-        return false;
-    }
-}
 
 // Format bytes
 export function formatBytes(bytes: number): string {

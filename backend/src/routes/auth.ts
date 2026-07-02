@@ -1,12 +1,13 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
-import { ACCESS_PASSWORD_HASH, SESSION_SECRET, TOKEN_EXPIRY } from '../utils/config.js';
+import { TOKEN_EXPIRY } from '../utils/config.js';
 import { generateSignature, type SignedUrlType } from '../middleware/signedUrl.js';
 import { rateLimit } from 'express-rate-limit';
 import { is2FAEnabled, verifyTOTP, generateOTPAuthUrl, activate2FA, disable2FA, getClientIP } from '../utils/security.js';
 import { UAParser } from 'ua-parser-js';
 import axios from 'axios';
 import { sendSecurityNotification } from '../services/telegramBot.js';
+import { createInitialAdminCredentials, isInitialSetupRequired, validateTelegramPin, validateWebPassword, verifyWebPassword } from '../utils/authSettings.js';
 
 // 导入可能需要的辅助函数
 async function getIPLocation(ip: string) {
@@ -45,6 +46,11 @@ async function sendLoginNotification(req: Request) {
 
 const router = Router();
 const SIGNED_URL_TYPES = new Set<SignedUrlType>(['preview', 'thumbnail', 'download']);
+const MAX_SIGNED_URL_EXPIRES_IN_SECONDS: Record<SignedUrlType, number> = {
+    thumbnail: 24 * 60 * 60,
+    preview: 60 * 60,
+    download: 60 * 60,
+};
 
 function normalizeSignedUrlType(value: unknown): SignedUrlType | null {
     if (typeof value !== 'string') return null;
@@ -63,7 +69,7 @@ function setAuthCookie(res: Response, token: string, expiresAt: Date) {
     res.cookie('flclouds_token', token, {
         httpOnly: true,
         sameSite: 'lax',
-        secure: process.env.NODE_ENV === 'production',
+        secure: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
         expires: expiresAt,
         path: '/',
     });
@@ -87,7 +93,7 @@ setInterval(() => {
     });
 }, 60 * 60 * 1000); // 每小时清理一次
 
-// 生成密码哈希（用于配置）
+// 生成密码哈希（兼容旧部署文档）
 export function hashPassword(password: string): string {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
@@ -97,20 +103,18 @@ function generateToken(): string {
     return crypto.randomBytes(32).toString('hex');
 }
 
-// 验证密码
-function verifyPassword(password: string): boolean {
-    if (!ACCESS_PASSWORD_HASH) {
-        // 如果没有设置密码，允许访问
-        return true;
-    }
-    const inputHash = hashPassword(password);
-    try {
-        const input = Buffer.from(inputHash, 'hex');
-        const expected = Buffer.from(ACCESS_PASSWORD_HASH, 'hex');
-        return input.length === expected.length && crypto.timingSafeEqual(input, expected);
-    } catch {
-        return false;
-    }
+function issueSession(req: Request, res: Response) {
+    const token = generateToken();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + TOKEN_EXPIRY);
+
+    sessions.set(token, { createdAt: now, expiresAt });
+    sendLoginNotification(req).catch(error => console.warn('发送登录通知失败:', error));
+    setAuthCookie(res, token, expiresAt);
+    res.json({
+        success: true,
+        expiresAt: expiresAt.toISOString(),
+    });
 }
 
 // 登录频率限制：15分钟内最多5次尝试
@@ -123,15 +127,39 @@ const loginLimiter = rateLimit({
     keyGenerator: (req: Request) => getClientIP(req),
 });
 
+router.post('/setup', loginLimiter, async (req: Request, res: Response) => {
+    try {
+        if (!(await isInitialSetupRequired())) {
+            return res.status(409).json({ error: '管理员密码已创建' });
+        }
+
+        const { webPassword, telegramPin } = req.body;
+        const webError = validateWebPassword(webPassword);
+        if (webError) return res.status(400).json({ error: webError });
+        const pinError = validateTelegramPin(telegramPin);
+        if (pinError) return res.status(400).json({ error: pinError });
+
+        await createInitialAdminCredentials(webPassword, telegramPin);
+        issueSession(req, res);
+    } catch (error) {
+        console.error('初始化管理员失败:', error);
+        res.status(500).json({ error: error instanceof Error ? error.message : '初始化管理员失败' });
+    }
+});
+
 // 登录接口
 router.post('/login', loginLimiter, async (req: Request, res: Response) => {
     const { password } = req.body;
+
+    if (await isInitialSetupRequired()) {
+        return res.status(428).json({ error: '请先创建管理员密码', setupRequired: true });
+    }
 
     if (!password) {
         return res.status(400).json({ error: '请输入密码' });
     }
 
-    if (!verifyPassword(password)) {
+    if (!(await verifyWebPassword(password))) {
         return res.status(401).json({ error: '认证失败' });
     }
 
@@ -140,26 +168,11 @@ router.post('/login', loginLimiter, async (req: Request, res: Response) => {
         return res.json({
             success: true,
             requiresTOTP: true,
-            // 暂时不生成完整 token，只在 TOTP 验证后返回
             message: '请输入二次验证码'
         });
     }
 
-    const token = generateToken();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + TOKEN_EXPIRY);
-
-    sessions.set(token, { createdAt: now, expiresAt });
-
-    // 异步发送通知
-    sendLoginNotification(req);
-
-    setAuthCookie(res, token, expiresAt);
-    res.json({
-        success: true,
-        token,
-        expiresAt: expiresAt.toISOString(),
-    });
+    issueSession(req, res);
 });
 
 // TOTP 验证接口
@@ -171,7 +184,7 @@ router.post('/verify-totp', loginLimiter, async (req: Request, res: Response) =>
     }
 
     // 再次验证密码（确保安全性）
-    if (!verifyPassword(password)) {
+    if (!(await verifyWebPassword(password))) {
         return res.status(401).json({ error: '认证失败' });
     }
 
@@ -192,7 +205,6 @@ router.post('/verify-totp', loginLimiter, async (req: Request, res: Response) =>
     setAuthCookie(res, token, expiresAt);
     res.json({
         success: true,
-        token,
         expiresAt: expiresAt.toISOString(),
     });
 });
@@ -231,7 +243,7 @@ router.post('/2fa-disable', requireAuth, async (req: Request, res: Response) => 
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: '请输入密码验证' });
 
-    if (!verifyPassword(password)) {
+    if (!(await verifyWebPassword(password))) {
         return res.status(401).json({ error: '认证失败' });
     }
 
@@ -245,7 +257,10 @@ router.post('/2fa-disable', requireAuth, async (req: Request, res: Response) => 
 });
 
 // 验证 Token
-router.get('/verify', (req: Request, res: Response) => {
+router.get('/verify', async (req: Request, res: Response) => {
+    if (await isInitialSetupRequired()) {
+        return res.status(428).json({ valid: false, setupRequired: true, error: '请先创建管理员密码' });
+    }
     const token = getAuthToken(req);
 
     if (!token) {
@@ -271,10 +286,12 @@ router.post('/logout', (req: Request, res: Response) => {
     res.json({ success: true });
 });
 
-// 检查是否需要密码
-router.get('/status', (_req: Request, res: Response) => {
+// 检查认证初始化状态
+router.get('/status', async (_req: Request, res: Response) => {
+    const setupRequired = await isInitialSetupRequired();
     res.json({
-        passwordRequired: !!ACCESS_PASSWORD_HASH,
+        setupRequired,
+        passwordRequired: true,
     });
 });
 
@@ -291,9 +308,19 @@ router.post('/sign-url', requireAuth, (req: Request, res: Response) => {
         return res.status(400).json({ error: '签名类型无效' });
     }
 
-    const expiresInSeconds = Number(expiresIn);
+    const expiresInSeconds = Math.floor(Number(expiresIn));
     if (!Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) {
         return res.status(400).json({ error: '过期时间无效' });
+    }
+
+    const maxExpiresIn = MAX_SIGNED_URL_EXPIRES_IN_SECONDS[signedType];
+    if (expiresInSeconds > maxExpiresIn) {
+        return res.status(400).json({
+            error: signedType === 'thumbnail'
+                ? '缩略图签名有效期不能超过 24 小时'
+                : '预览/下载签名有效期不能超过 1 小时',
+            maxExpiresIn,
+        });
     }
 
     const expires = Date.now() + (expiresInSeconds * 1000);
@@ -308,10 +335,9 @@ router.post('/sign-url', requireAuth, (req: Request, res: Response) => {
 });
 
 // 认证中间件
-export function requireAuth(req: Request, res: Response, next: NextFunction) {
-    // 如果没有设置密码，跳过认证
-    if (!ACCESS_PASSWORD_HASH) {
-        return next();
+export async function requireAuth(req: Request, res: Response, next: NextFunction) {
+    if (await isInitialSetupRequired()) {
+        return res.status(428).json({ error: '请先创建管理员密码', setupRequired: true });
     }
 
     // 优先从 Authorization header 获取 token

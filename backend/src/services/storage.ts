@@ -394,7 +394,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
     name = 'onedrive';
     private accessToken: string | null = null;
     private tokenExpiresAt: number = 0;
-    private readonly ONEDRIVE_FOLDER = 'FlClouds'; // 存储文件夹名
+    private readonly ONEDRIVE_FOLDER = ''; // 使用第三方存储根目录，不再额外套 FlClouds 目录
 
     constructor(
         public id: string,
@@ -516,6 +516,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
      */
     private async ensureFolderExists(token: string, folder?: string | null): Promise<string> {
         const fullFolderPath = [this.ONEDRIVE_FOLDER, folder].filter(Boolean).join('/');
+        if (!fullFolderPath) return '';
         try {
             // 使用标准的路径寻址格式，并在末尾添加冒号确保路径闭合
             const endpoint = `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(fullFolderPath)}:`;
@@ -578,7 +579,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
         const uploadFolder = await this.ensureFolderExists(token, folder);
 
         // URL编码文件名，处理特殊字符
-        const encodedFileName = encodeURIComponent(fileName);
+        const targetPath = uploadFolder ? `${uploadFolder}/${fileName}` : fileName;
 
         try {
             // 小于 4MB 使用简单上传
@@ -587,7 +588,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
                 const fileBuffer = await fs.promises.readFile(tempPath);
 
                 const response = await axios.put(
-                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}:/content`,
+                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(targetPath)}:/content`,
                     fileBuffer,
                     {
                         headers: {
@@ -609,7 +610,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
 
                 // 1. 创建上传会话
                 const sessionRes = await axios.post(
-                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}:/createUploadSession`,
+                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(targetPath)}:/createUploadSession`,
                     {
                         item: {
                             "@microsoft.graph.conflictBehavior": "rename",
@@ -677,7 +678,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
 
                 // 如果最后响应没有ID，查询文件信息
                 const itemRes = await axios.get(
-                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(uploadFolder)}/${encodedFileName}`,
+                    `https://graph.microsoft.com/v1.0/me/drive/root:/${this.encodeOneDrivePath(targetPath)}`,
                     {
                         headers: { 'Authorization': `Bearer ${token}` },
                         timeout: 30000
@@ -1358,8 +1359,12 @@ export class StorageManager {
     }
 
     getProvider(name?: string): IStorageProvider {
-        if (name && this.providers.has(name)) {
-            return this.providers.get(name)!;
+        if (name) {
+            const provider = this.providers.get(name);
+            if (!provider) {
+                throw new Error(`Storage provider not found: ${name}`);
+            }
+            return provider;
         }
         return this.activeProvider;
     }

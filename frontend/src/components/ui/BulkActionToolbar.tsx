@@ -32,8 +32,8 @@ export const BulkActionToolbar = ({
 
     const [generatedLink, setGeneratedLink] = useState<string | null>(null);
 
-    // Share is only available when exactly one item is selected
-    const canShare = selectedFilesCount + selectedFoldersCount === 1;
+    // Share is currently only available for exactly one file (not folders).
+    const canShare = selectedFilesCount === 1 && selectedFoldersCount === 0;
 
     const handleShareClick = () => {
         if (showShareSettings) {

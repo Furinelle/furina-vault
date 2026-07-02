@@ -140,12 +140,6 @@ class FileAPI {
             xhr.open('POST', `${API_BASE}/api/upload`);
             xhr.withCredentials = true;
 
-            // 添加认证头
-            const token = authService.getToken();
-            if (token) {
-                xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-            }
-
             xhr.send(formData);
         });
     }
@@ -182,6 +176,7 @@ class FileAPI {
                 const chunk = file.slice(start, end);
 
                 const chunkResponse = await fetch(`${API_BASE}/api/chunked/chunk`, {
+                    credentials: 'include',
                     method: 'POST',
                     headers: getHeaders({
                         'Content-Type': 'application/octet-stream',
@@ -220,6 +215,7 @@ class FileAPI {
         } catch (error) {
             try {
                 await fetch(`${API_BASE}/api/chunked/${uploadId}`, {
+                    credentials: 'include',
                     method: 'DELETE',
                     headers: getHeaders(),
                 });
@@ -266,7 +262,11 @@ class FileAPI {
             headers: getHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ fileIds, folderNames }),
         });
-        if (response.status === 401) throw new Error('UNAUTHORIZED');
+        if (response.status === 401 || response.status === 428) throw new Error('UNAUTHORIZED');
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.error || error.message || '批量删除失败');
+        }
         return response.json();
     }
 

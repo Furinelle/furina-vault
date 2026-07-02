@@ -28,6 +28,8 @@ services:
     environment:
       - DATABASE_URL=postgresql://flclouds:${DB_PASSWORD:?DB_PASSWORD is required}@postgres:5432/flclouds
       - PORT=51947
+      - NODE_ENV=production
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
       - UPLOAD_DIR=/data/uploads
       - THUMBNAIL_DIR=/data/thumbnails
       - CHUNK_DIR=/data/chunks

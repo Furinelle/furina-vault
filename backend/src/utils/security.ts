@@ -133,17 +133,7 @@ export async function generateOTPAuthUrl(user: string = 'Admin'): Promise<string
  * 优先读取 Cloudflare 的真实 IP 头，其次读取标准代理头 x-forwarded-for
  */
 export function getClientIP(req: any): string {
-    // Cloudflare 真实 IP
-    const cfIP = req.headers['cf-connecting-ip'];
-    if (cfIP) return Array.isArray(cfIP) ? cfIP[0] : cfIP;
-
-    // 标准代理头
-    const xForwardedFor = req.headers['x-forwarded-for'];
-    if (xForwardedFor) {
-        const ips = Array.isArray(xForwardedFor) ? xForwardedFor : xForwardedFor.split(',');
-        return ips[0].trim();
-    }
-
-    // fallback 到 express 自带的 ip
-    return req.ip || '未知';
+    // Only trust Express' proxy-aware req.ip. app.set('trust proxy', ...) controls which
+    // proxy headers are accepted, so direct clients cannot spoof x-forwarded-for here.
+    return req.ip || req.socket?.remoteAddress || '未知';
 }

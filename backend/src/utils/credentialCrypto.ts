@@ -15,6 +15,8 @@ const SENSITIVE_SETTING_KEYS = new Set([
     'onedrive_refresh_token',
     'google_drive_client_secret',
     'google_drive_refresh_token',
+    'admin_password_hash',
+    'telegram_pin_hash',
 ]);
 
 function getCredentialSecret(): string {

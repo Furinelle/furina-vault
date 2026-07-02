@@ -3,6 +3,7 @@ import { query } from '../db/index.js';
 import checkDiskSpaceModule from 'check-disk-space';
 import os from 'os';
 import fs from 'fs';
+import path from 'path';
 import { formatBytes, getTypeEmoji } from '../utils/telegramUtils.js';
 import {
     MSG,
@@ -13,13 +14,26 @@ import {
     buildTasksReport,
     buildDeleteSuccess,
 } from '../utils/telegramMessages.js';
-import { authenticatedUsers, passwordInputState, isAuthenticated } from './telegramState.js';
+import { authenticatedUsers, passwordInputState, isAuthenticatedAsync } from './telegramState.js';
 import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, retryFailedDownloadTasks } from './telegramUpload.js';
 import { storageManager } from './storage.js';
+import { listTelegramBackgroundJobs } from './telegramChannelJobs.js';
 import { getSetting, setSetting } from '../utils/settings.js';
 import { DuplicateMode, getDuplicateMode } from '../utils/duplicatePolicy.js';
 import { startPeriodicCleanup, stopPeriodicCleanup } from './orphanCleanup.js';
 import { safeUnlink } from '../utils/localPath.js';
+import { getCurrentStorageScope, nextParam, removePhysicalFile } from '../utils/fileScope.js';
+import {
+    buildPathSettingsKeyboard,
+    buildPathSettingsText,
+    buildPendingPathPromptPersistent,
+    buildPathPreviewLine,
+    clearTelegramPathState,
+    getRecentTelegramPathsPersistent,
+    setPendingTelegramPathInput,
+    setNextTelegramPathPersistent,
+    setSessionTelegramPathPersistent,
+} from '../utils/telegramPathSettings.js';
 
 // ESM compatibility
 const checkDiskSpace = (checkDiskSpaceModule as any).default || checkDiskSpaceModule;
@@ -27,6 +41,28 @@ const DOWNLOAD_WORKER_OPTIONS = [4, 8, 12, 16];
 const ON_VALUES = new Set(['1', 'true', 'yes', 'on']);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const THUMBNAIL_DIR = process.env.THUMBNAIL_DIR || './data/thumbnails';
+
+interface PendingDeleteInfo {
+    fileId: string;
+    name: string;
+    size: number;
+    selector: string;
+    createdAt: number;
+}
+const pendingDeleteConfirmations = new Map<string, PendingDeleteInfo>();
+const DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
+
+function buildDeleteConfirmKeyboard(confirmId: string): Api.ReplyInlineMarkup {
+    return new Api.ReplyInlineMarkup({
+        rows: [new Api.KeyboardButtonRow({
+            buttons: [
+                new Api.KeyboardButtonCallback({ text: '⚠️ 确认删除', data: Buffer.from(`del_confirm_${confirmId}`) }),
+                new Api.KeyboardButtonCallback({ text: '取消', data: Buffer.from(`del_cancel_${confirmId}`) }),
+            ],
+        })],
+    });
+}
+
 
 function normalizeDownloadWorkers(value: unknown): number {
     const parsed = parseInt(String(value ?? '4'), 10);
@@ -70,6 +106,57 @@ function buildDownloadWorkersKeyboard(current: number, confirmValue?: number): A
     });
 }
 
+function buildStorageMaintenanceKeyboard(localFileCount: number, confirm = false): Api.ReplyInlineMarkup | undefined {
+    if (localFileCount <= 0) return undefined;
+    return new Api.ReplyInlineMarkup({
+        rows: [
+            new Api.KeyboardButtonRow({
+                buttons: confirm
+                    ? [
+                        new Api.KeyboardButtonCallback({ text: '⚠️ 确认删除本地全部下载文件', data: Buffer.from('storage_clear_confirm') }),
+                        new Api.KeyboardButtonCallback({ text: '取消', data: Buffer.from('storage_clear_cancel') }),
+                    ]
+                    : [
+                        new Api.KeyboardButtonCallback({ text: `🧹 删除本地全部下载文件 (${localFileCount})`, data: Buffer.from('storage_clear_ask') }),
+                    ],
+            }),
+        ],
+    });
+}
+
+async function scanLocalDownloadFiles(): Promise<{ count: number; totalSize: number; paths: string[] }> {
+    const baseDir = path.resolve(UPLOAD_DIR);
+    const paths: string[] = [];
+    let totalSize = 0;
+    if (!fs.existsSync(baseDir)) return { count: 0, totalSize: 0, paths };
+
+    async function walk(dir: string): Promise<void> {
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                await walk(fullPath);
+            } else if (entry.isFile()) {
+                const stat = await fs.promises.stat(fullPath);
+                totalSize += stat.size;
+                paths.push(fullPath);
+            }
+        }
+    }
+
+    await walk(baseDir);
+    return { count: paths.length, totalSize, paths };
+}
+
+async function pruneEmptyDirs(dir: string, baseDir = path.resolve(UPLOAD_DIR)): Promise<void> {
+    if (!fs.existsSync(dir) || path.resolve(dir) === baseDir) return;
+    const entries = await fs.promises.readdir(dir);
+    if (entries.length === 0) {
+        await fs.promises.rmdir(dir);
+        await pruneEmptyDirs(path.dirname(dir), baseDir);
+    }
+}
+
 function buildDownloadWorkersText(current: number): string {
     return [
         '⚙️ **Telegram 并发下载设置**',
@@ -90,37 +177,8 @@ function isOn(value: unknown, defaultValue = true): boolean {
     return ON_VALUES.has(String(value).toLowerCase());
 }
 
-async function getPathRuleSettings(): Promise<{ bySource: boolean; byType: boolean }> {
-    const bySource = await getSetting('storage_path_by_source', process.env.STORAGE_PATH_BY_SOURCE || 'true');
-    const byType = await getSetting('storage_path_by_type', process.env.STORAGE_PATH_BY_TYPE || 'true');
-    return { bySource: isOn(bySource), byType: isOn(byType) };
-}
-
-function buildPathRulesKeyboard(rules: { bySource: boolean; byType: boolean }): Api.ReplyInlineMarkup {
-    return new Api.ReplyInlineMarkup({
-        rows: [
-            new Api.KeyboardButtonRow({
-                buttons: [
-                    new Api.KeyboardButtonCallback({ text: `${rules.bySource ? '✅' : '⬜'} 按来源/频道`, data: Buffer.from('pr_toggle_source') }),
-                    new Api.KeyboardButtonCallback({ text: `${rules.byType ? '✅' : '⬜'} 按类型`, data: Buffer.from('pr_toggle_type') }),
-                ],
-            }),
-        ],
-    });
-}
-
-function buildPathRulesText(rules: { bySource: boolean; byType: boolean }): string {
-    const example = [rules.bySource ? 'telegram/资源下载' : null, rules.byType ? 'archives' : null].filter(Boolean).join('/') || '文件名直接保存';
-    return [
-        '📁 **保存路径规则**',
-        '',
-        `按来源/频道：${rules.bySource ? '✅ 开启' : '⬜ 关闭'}`,
-        `按文件类型：${rules.byType ? '✅ 开启' : '⬜ 关闭'}`,
-        '',
-        `示例：${example}`,
-        '',
-        '说明：修改后只影响后续新上传/转存文件。',
-    ].join('\n');
+async function getPathCenterState(): Promise<{ automaticBySource: boolean; automaticByType: boolean }> {
+    return { automaticBySource: true, automaticByType: true };
 }
 
 function buildDuplicateModeKeyboard(mode: DuplicateMode): Api.ReplyInlineMarkup {
@@ -180,8 +238,16 @@ function buildCleanupSettingsText(enabled: boolean): string {
     ].join('\n');
 }
 
+function getCallbackChatKey(update: Api.UpdateBotCallbackQuery): string {
+    const peer: any = update.peer as any;
+    const value = peer?.userId || peer?.chatId || peer?.channelId || update.userId;
+    if (value && typeof value.toJSNumber === 'function') return String(value.toJSNumber());
+    if (value !== undefined && value !== null) return String(value);
+    return String(update.userId.toJSNumber());
+}
+
 export async function handleStart(message: Api.Message, senderId: number): Promise<void> {
-    if (isAuthenticated(senderId)) {
+    if (await isAuthenticatedAsync(senderId)) {
         await message.reply({ message: buildWelcomeBack() });
     } else {
         passwordInputState.set(senderId, { password: '' });
@@ -194,22 +260,23 @@ export async function handleHelp(message: Api.Message): Promise<void> {
 
 export async function handleStorage(message: Api.Message): Promise<void> {
     try {
-        const activeAccountId = storageManager.getActiveAccountId();
+        const scope = await getCurrentStorageScope();
         const diskPath = os.platform() === 'win32' ? 'C:' : '/';
         const diskSpace = await checkDiskSpace(diskPath);
 
         // Fetch stats for the active account
         const result = await query(`
-            SELECT COUNT(*) as file_count, COALESCE(SUM(size), 0) as total_size 
-            FROM files 
-            WHERE storage_account_id IS NOT DISTINCT FROM $1
-        `, [activeAccountId]);
+            SELECT COUNT(*) as file_count, COALESCE(SUM(size), 0) as total_size
+            FROM files
+            WHERE ${scope.clause}
+        `, scope.params);
         const flcloudsStats = result.rows[0];
         const totalSize = parseInt(flcloudsStats.total_size);
         const fileCount = parseInt(flcloudsStats.file_count);
         const usedPercent = Math.round(((diskSpace.size - diskSpace.free) / diskSpace.size) * 100);
 
         const queueStats = getDownloadQueueStats();
+        const localStats = await scanLocalDownloadFiles();
 
         const reply = buildStorageReport({
             diskTotal: diskSpace.size,
@@ -217,14 +284,86 @@ export async function handleStorage(message: Api.Message): Promise<void> {
             diskUsedPercent: usedPercent,
             fileCount,
             totalFileSize: totalSize,
+            localFileCount: localStats.count,
+            localTotalSize: localStats.totalSize,
             queueActive: queueStats.active,
             queuePending: queueStats.pending,
         });
 
-        await message.reply({ message: reply });
+        await message.reply({
+            message: reply,
+            buttons: buildStorageMaintenanceKeyboard(localStats.count),
+        });
     } catch (error) {
         console.error('🤖 获取存储统计失败:', error);
         await message.reply({ message: MSG.ERR_STORAGE });
+    }
+}
+
+export async function handleStorageCleanupCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
+    const userId = update.userId.toJSNumber();
+    if (!(await isAuthenticatedAsync(userId))) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+        return;
+    }
+
+    try {
+        const stats = await scanLocalDownloadFiles();
+        if (data === 'storage_clear_cancel') {
+            await client.editMessage(update.peer, {
+                message: update.msgId,
+                text: stats.count > 0 ? `已取消清理。当前本地下载文件：${stats.count} 个，占用 ${formatBytes(stats.totalSize)}。` : '已取消清理。当前没有本地下载文件。',
+                buttons: buildStorageMaintenanceKeyboard(stats.count),
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已取消' }));
+            return;
+        }
+
+        if (data === 'storage_clear_ask') {
+            await client.editMessage(update.peer, {
+                message: update.msgId,
+                text: [
+                    '⚠️ **确认删除本地服务器全部下载文件？**',
+                    '',
+                    `将删除 uploads 本地目录中的 **${stats.count}** 个文件，占用 **${formatBytes(stats.totalSize)}**。`,
+                    '这只清理服务器本地下载/缓存文件，不会主动删除 OneDrive 等云端存储里的文件记录。',
+                    '',
+                    '如确认，请点击下方红色确认按钮。',
+                ].join('\n'),
+                buttons: buildStorageMaintenanceKeyboard(stats.count, true),
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '需要二次确认' }));
+            return;
+        }
+
+        if (data === 'storage_clear_confirm') {
+            let deletedCount = 0;
+            let deletedBytes = 0;
+            for (const filePath of stats.paths) {
+                const size = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+                if (await safeUnlink(filePath, UPLOAD_DIR)) {
+                    deletedCount += 1;
+                    deletedBytes += size;
+                    await pruneEmptyDirs(path.dirname(filePath));
+                }
+            }
+            const after = await scanLocalDownloadFiles();
+            await client.editMessage(update.peer, {
+                message: update.msgId,
+                text: [
+                    '✅ **本地服务器下载文件已清理**',
+                    '',
+                    `已删除：${deletedCount} 个文件`,
+                    `释放空间：${formatBytes(deletedBytes)}`,
+                    `剩余本地文件：${after.count} 个`,
+                ].join('\n'),
+                buttons: buildStorageMaintenanceKeyboard(after.count),
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `已删除 ${deletedCount} 个文件` }));
+        }
+    } catch (error) {
+        console.error('🤖 清理本地下载文件失败:', error);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `清理失败: ${(error as Error).message}`, alert: true }));
     }
 }
 
@@ -245,15 +384,15 @@ export async function handleList(message: Api.Message, args: string[]): Promise<
             }
         }
 
-        const activeAccountId = storageManager.getActiveAccountId();
+        const scope = await getCurrentStorageScope();
         const offset = (page - 1) * limit;
         const result = await query(`
-            SELECT id, name, type, size, folder, created_at 
-            FROM files 
-            WHERE storage_account_id IS NOT DISTINCT FROM $3
-            ORDER BY created_at DESC 
-            LIMIT $1 OFFSET $2
-        `, [limit, offset, activeAccountId]);
+            SELECT id, name, type, size, folder, created_at
+            FROM files
+            WHERE ${scope.clause}
+            ORDER BY created_at DESC
+            LIMIT ${nextParam(scope, 1)} OFFSET ${nextParam(scope, 2)}
+        `, [...scope.params, limit, offset]);
 
         if (result.rows.length === 0) {
             await message.reply({ message: MSG.EMPTY_FILES });
@@ -271,7 +410,7 @@ export async function handleList(message: Api.Message, args: string[]): Promise<
 export async function handleDelete(message: Api.Message, args: string[]): Promise<void> {
     if (args.length === 0) {
         await message.reply({
-            message: '❌ 请提供要删除的文件\n\n用法：\n/delete <列表序号>  例如 /delete 1\n/delete <ID前缀>  例如 /delete a1b2c3d4\n\n提示：先发送 /list 查看文件 ID 和序号。'
+            message: '❌ 请提供要删除的文件 ID 前缀\n\n用法：/delete <至少 8 位 ID 前缀>\n提示：请从网页端文件列表复制文件 ID。'
         });
         return;
     }
@@ -279,61 +418,93 @@ export async function handleDelete(message: Api.Message, args: string[]): Promis
     const selector = args[0].trim();
 
     try {
-        const activeAccountId = storageManager.getActiveAccountId();
-        let result;
-        if (/^\d+$/.test(selector) && Number(selector) >= 1 && Number(selector) <= 50) {
-            result = await query(`
-                SELECT id, name, path, thumbnail_path, source, storage_account_id
-                FROM files
-                WHERE storage_account_id IS NOT DISTINCT FROM $2
-                ORDER BY created_at DESC
-                LIMIT 1 OFFSET $1
-            `, [Number(selector) - 1, activeAccountId]);
-        } else {
-            if (selector.length < 4) {
-                await message.reply({ message: '❌ ID 前缀至少需要 4 位。也可以用 /delete 1 删除 /list 中第 1 个文件。' });
-                return;
-            }
-            result = await query(`
-                SELECT id, name, path, thumbnail_path, source, storage_account_id
-                FROM files
-                WHERE id::text LIKE $1 AND storage_account_id IS NOT DISTINCT FROM $2
-                LIMIT 1
-            `, [selector + '%', activeAccountId]);
+        const scope = await getCurrentStorageScope();
+        if (/^\d+$/.test(selector)) {
+            await message.reply({ message: '❌ 为避免误删，Telegram Bot 不再支持按列表序号删除。请从网页端复制至少 8 位文件 ID 前缀。' });
+            return;
         }
+        if (selector.length < 8) {
+            await message.reply({ message: '❌ ID 前缀至少需要 8 位。请从网页端文件列表复制更长的文件 ID。' });
+            return;
+        }
+        const result = await query(`
+            SELECT *
+            FROM files
+            WHERE ${scope.clause} AND id::text LIKE ${nextParam(scope, 1)}
+            ORDER BY created_at DESC
+            LIMIT 3
+        `, [...scope.params, selector + '%']);
 
         if (result.rows.length === 0) {
-            await message.reply({ message: /^\d+$/.test(selector) ? `❌ 未找到列表序号 ${selector} 对应的文件` : `❌ 未找到 ID 以 "${selector}" 开头的文件` });
+            await message.reply({ message: `❌ 未找到 ID 以 "${selector}" 开头的文件` });
+            return;
+        }
+        if (result.rows.length > 1) {
+            await message.reply({ message: `❌ ID 前缀 "${selector}" 匹配到多个文件，请复制更长的 ID 前缀后重试。` });
             return;
         }
 
         const file = result.rows[0];
-
-        // 删除实际文件
-        const cloudSources = ['onedrive', 'aliyun_oss', 's3', 'webdav', 'google_drive'];
-        if (cloudSources.includes(file.source)) {
-            try {
-                const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
-                await provider.deleteFile(file.path);
-            } catch (err) {
-                console.warn(`🤖 ${file.source} 文件物理删除失败或文件已不存在:`, err);
-            }
-        } else if (file.path) {
-            await safeUnlink(file.path, UPLOAD_DIR);
-        }
-
-        // 删除缩略图
-        if (file.thumbnail_path) {
-            await safeUnlink(file.thumbnail_path, THUMBNAIL_DIR);
-        }
-
-        // 从数据库删除记录
-        await query(`DELETE FROM files WHERE id = $1`, [file.id]);
-
-        await message.reply({ message: buildDeleteSuccess(file.name, file.id) });
+        const confirmId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+        pendingDeleteConfirmations.set(confirmId, { fileId: file.id, name: file.name, size: Number(file.size || 0), selector, createdAt: Date.now() });
+        await message.reply({
+            message: [
+                '⚠️ **确认删除这个文件？**',
+                '',
+                `📄 ${file.name}`,
+                `🆔 ${String(file.id).slice(0, 12)}`,
+                `📦 ${formatBytes(Number(file.size || 0))}`,
+                file.folder ? `📁 ${file.folder}` : '',
+                '',
+                '删除会移除数据库记录并尝试删除实际文件。请确认无误后点击按钮。',
+            ].filter(Boolean).join('\n'),
+            buttons: buildDeleteConfirmKeyboard(confirmId),
+        });
     } catch (error) {
         console.error('🤖 删除文件失败:', error);
         await message.reply({ message: `${MSG.ERR_DELETE}: ${(error as Error).message}` });
+    }
+}
+
+export async function handleDeleteConfirmCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
+    const userId = update.userId.toJSNumber();
+    if (!(await isAuthenticatedAsync(userId))) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+        return;
+    }
+    const match = data.match(/^del_(confirm|cancel)_(.+)$/);
+    if (!match) return;
+    const [, action, confirmId] = match;
+    const pending = pendingDeleteConfirmations.get(confirmId);
+    if (!pending || Date.now() - pending.createdAt > DELETE_CONFIRM_TTL_MS) {
+        pendingDeleteConfirmations.delete(confirmId);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '删除确认已过期', alert: true }));
+        return;
+    }
+    if (action === 'cancel') {
+        pendingDeleteConfirmations.delete(confirmId);
+        await client.editMessage(update.peer, { message: update.msgId, text: `已取消删除：${pending.name}`, buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已取消' }));
+        return;
+    }
+    try {
+        const scope = await getCurrentStorageScope();
+        const result = await query(`SELECT * FROM files WHERE ${scope.clause} AND id = ${nextParam(scope, 1)} LIMIT 1`, [...scope.params, pending.fileId]);
+        const file = result.rows[0];
+        if (!file) {
+            pendingDeleteConfirmations.delete(confirmId);
+            await client.editMessage(update.peer, { message: update.msgId, text: '❌ 文件已不存在或不在当前存储范围内。', buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '文件不存在', alert: true }));
+            return;
+        }
+        try { await removePhysicalFile(file); } catch (err) { console.warn('🤖 文件物理删除失败或文件已不存在:', err); }
+        await query('DELETE FROM files WHERE id = $1', [file.id]);
+        pendingDeleteConfirmations.delete(confirmId);
+        await client.editMessage(update.peer, { message: update.msgId, text: buildDeleteSuccess(file.name, file.id), buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已删除' }));
+    } catch (error) {
+        console.error('🤖 确认删除文件失败:', error);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `删除失败: ${(error as Error).message}`, alert: true }));
     }
 }
 
@@ -343,14 +514,28 @@ export async function handleTasks(message: Api.Message): Promise<void> {
         const activeCount = status.active.length;
         const pendingCount = status.pending.length;
         const historyCount = status.history.length;
+        const senderId = message.senderId?.toJSNumber();
+        const jobs = senderId ? await listTelegramBackgroundJobs(senderId, 5) : [];
 
-        if (activeCount === 0 && pendingCount === 0 && historyCount === 0) {
+        if (activeCount === 0 && pendingCount === 0 && historyCount === 0 && jobs.length === 0) {
             await message.reply({ message: MSG.EMPTY_TASKS });
             return;
         }
 
-        const reply = buildTasksReport(status.active, status.pending, status.history);
-        await message.reply({ message: reply });
+        const sections = [buildTasksReport(status.active, status.pending, status.history)];
+        if (jobs.length > 0) {
+            sections.push([
+                '📡 **频道后台任务**',
+                ...jobs.map((job: any, index: number) => [
+                    `${index + 1}. ${job.kind} · ${job.status}`,
+                    `   来源：${job.source}`,
+                    `   进度：${job.enqueued_count || 0}/${job.total_count || 0}　跳过：${job.skipped_count || 0}`,
+                    job.error ? `   ⚠️ ${job.error}` : '',
+                    `   ID: ${String(job.id).slice(0, 8)}`,
+                ].filter(Boolean).join('\n')),
+            ].join('\n'));
+        }
+        await message.reply({ message: sections.filter(Boolean).join('\n\n') });
 
     } catch (error) {
         console.error('🤖 获取任务列表失败:', error);
@@ -378,19 +563,19 @@ export async function handleStopTasks(message: Api.Message): Promise<void> {
 export async function handlePauseTasks(message: Api.Message, args: string[] = []): Promise<void> {
     const taskId = args[0];
     const result = pauseDownloadTasks(taskId);
-    await message.reply({ message: `⏸️ 已暂停下载队列${taskId ? `\n任务: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}\n\n当前正在下载的文件会继续完成，新的等待任务暂不开始。` });
+    await message.reply({ message: `⏸️ 已暂停全局下载队列${taskId ? `\n任务卡: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}\n\n当前正在下载的文件会继续完成，新的等待任务暂不开始。` });
 }
 
 export async function handleResumeTasks(message: Api.Message, args: string[] = []): Promise<void> {
     const taskId = args[0];
     const result = resumeDownloadTasks(taskId);
-    await message.reply({ message: `▶️ 已继续下载队列${taskId ? `\n任务: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}` });
+    await message.reply({ message: `▶️ 已继续全局下载队列${taskId ? `\n任务卡: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}` });
 }
 
 export async function handleCancelTask(message: Api.Message, args: string[]): Promise<void> {
     const selector = args.join(' ').trim() || 'all';
     const result = cancelDownloadTask(selector);
-    await message.reply({ message: result.total > 0 ? `🛑 已取消任务\n\n匹配: ${selector}\n处理中: ${result.active}\n等待中: ${result.pending}` : `📮 没有找到匹配的任务：${selector}` });
+    await message.reply({ message: result.total > 0 ? `🛑 已取消匹配任务\n\n匹配: ${selector}\n处理中: ${result.active}\n等待中: ${result.pending}` : `📮 没有找到匹配的任务，未清空全局队列：${selector}` });
 }
 
 export async function handleRetryFailedTasks(message: Api.Message, args: string[]): Promise<void> {
@@ -415,38 +600,83 @@ export async function handleDownloadWorkers(message: Api.Message): Promise<void>
 }
 
 export async function handlePathRules(message: Api.Message): Promise<void> {
-    const rules = await getPathRuleSettings();
+    const pathCenterState = await getPathCenterState();
     await message.reply({
-        message: buildPathRulesText(rules),
-        buttons: buildPathRulesKeyboard(rules),
+        message: buildPathSettingsText(pathCenterState, message.chatId?.toString() || 'unknown'),
+        buttons: buildPathSettingsKeyboard(pathCenterState),
     });
+}
+
+export async function handlePathOnce(message: Api.Message, args: string[]): Promise<void> {
+    const folder = args.join(' ').trim();
+    if (!folder) {
+        await message.reply({ message: '❌ 用法：/p <目录>\n例如：/p PIXIV/每日Top50' });
+        return;
+    }
+    try {
+        const normalized = await setNextTelegramPathPersistent(message.chatId?.toString() || 'unknown', folder);
+        await message.reply({ message: `📌 已设置下一次下载目录：\`${normalized}\`\n${buildPathPreviewLine(normalized)}\n\n此设置会在下一次成功进入下载流程时自动失效。` });
+    } catch (error) {
+        await message.reply({ message: `❌ 路径无效：${(error as Error).message}` });
+    }
+}
+
+export async function handlePathSession(message: Api.Message, args: string[]): Promise<void> {
+    const folder = args.join(' ').trim();
+    if (!folder) {
+        await message.reply({ message: '❌ 用法：/ps <目录>\n例如：/ps 相册/2026-07' });
+        return;
+    }
+    try {
+        const normalized = await setSessionTelegramPathPersistent(message.chatId?.toString() || 'unknown', folder);
+        await message.reply({ message: `📍 已设置本会话下载目录：\`${normalized}\`\n${buildPathPreviewLine(normalized)}\n\n后续此聊天中的下载会优先保存到该目录，发送 /pc 可清除。` });
+    } catch (error) {
+        await message.reply({ message: `❌ 路径无效：${(error as Error).message}` });
+    }
+}
+
+export async function handlePathClear(message: Api.Message): Promise<void> {
+    clearTelegramPathState(message.chatId?.toString() || 'unknown');
+    await message.reply({ message: '🧹 已清除下一次/本会话自定义下载目录，后续恢复使用默认自动分类目录。' });
 }
 
 export async function handlePathRulesCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
     const userId = update.userId.toJSNumber();
-    if (!isAuthenticated(userId)) {
+    if (!(await isAuthenticatedAsync(userId))) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
         return;
     }
 
     try {
-        const rules = await getPathRuleSettings();
-        if (data === 'pr_toggle_source') {
-            rules.bySource = !rules.bySource;
-            await setSetting('storage_path_by_source', String(rules.bySource));
-        } else if (data === 'pr_toggle_type') {
-            rules.byType = !rules.byType;
-            await setSetting('storage_path_by_type', String(rules.byType));
+        const pathCenterState = await getPathCenterState();
+        const chatKey = getCallbackChatKey(update);
+        if (data === 'pr_clear_custom') {
+            clearTelegramPathState(chatKey);
+        } else if (data === 'pr_recent') {
+            const recent = await getRecentTelegramPathsPersistent(chatKey);
+            await client.sendMessage(update.peer, {
+                message: recent.length > 0
+                    ? ['🕘 **最近使用目录**', '', ...recent.map((item, index) => `${index + 1}. ${item}`), '', '要使用其中一个目录，请直接复制发送，或发送 `/p <目录>` / `/ps <目录>`。'].join('\n')
+                    : '🕘 暂无最近使用目录。设置过 `/p`、`/ps`、订阅专属目录或下载任务专属目录后会自动记录。'
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已发送最近目录' }));
+            return;
+        } else if (data === 'pr_help_once' || data === 'pr_help_session') {
+            const mode = data === 'pr_help_once' ? 'once' : 'session';
+            setPendingTelegramPathInput(chatKey, userId, mode);
+            await client.sendMessage(update.peer, { message: await buildPendingPathPromptPersistent(mode, chatKey) });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '请直接发送目录，或发送“取消”退出' }));
+            return;
         }
 
         await client.editMessage(update.peer, {
             message: update.msgId,
-            text: buildPathRulesText(rules),
-            buttons: buildPathRulesKeyboard(rules),
+            text: buildPathSettingsText(pathCenterState, chatKey),
+            buttons: buildPathSettingsKeyboard(pathCenterState),
         });
-        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '保存路径规则已更新' }));
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '保存位置已更新' }));
     } catch (error) {
-        console.error('🤖 设置保存路径规则失败:', error);
+        console.error('🤖 设置保存位置失败:', error);
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `设置失败: ${(error as Error).message}`, alert: true }));
     }
 }
@@ -461,7 +691,7 @@ export async function handleDuplicateMode(message: Api.Message): Promise<void> {
 
 export async function handleDuplicateModeCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
     const userId = update.userId.toJSNumber();
-    if (!isAuthenticated(userId)) {
+    if (!(await isAuthenticatedAsync(userId))) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
         return;
     }
@@ -493,7 +723,7 @@ export async function handleCleanupSettings(message: Api.Message): Promise<void>
 
 export async function handleCleanupSettingsCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
     const userId = update.userId.toJSNumber();
-    if (!isAuthenticated(userId)) {
+    if (!(await isAuthenticatedAsync(userId))) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
         return;
     }
@@ -521,7 +751,7 @@ export async function handleCleanupSettingsCallback(client: TelegramClient, upda
 
 export async function handleDownloadWorkersCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
     const userId = update.userId.toJSNumber();
-    if (!isAuthenticated(userId)) {
+    if (!(await isAuthenticatedAsync(userId))) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({
             queryId: update.queryId,
             message: MSG.AUTH_REQUIRED,

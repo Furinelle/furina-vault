@@ -53,7 +53,7 @@ export const RenameModal = ({ isOpen, onClose, onConfirm, currentName, type }: R
             setError(type === "file" ? "文件名不能为空" : "文件夹名不能为空");
             return;
         }
-        if (/[\/\\:*?"<>|]/.test(trimmed)) {
+        if (/[\\:*?"<>|/]/.test(trimmed)) {
             setError("名称包含非法字符");
             return;
         }

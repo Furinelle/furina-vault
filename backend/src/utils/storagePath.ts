@@ -98,12 +98,9 @@ export function getDetailedTypeFolder(mimeType?: string | null, fileName?: strin
 }
 
 export async function getStoragePathRules(): Promise<StoragePathRules> {
-    const bySource = await getSetting('storage_path_by_source', process.env.STORAGE_PATH_BY_SOURCE ?? 'true');
-    const byType = await getSetting('storage_path_by_type', process.env.STORAGE_PATH_BY_TYPE ?? 'true');
-    return {
-        bySource: isEnabled(String(bySource ?? 'true'), true),
-        byType: isEnabled(String(byType ?? 'true'), true),
-    };
+    // 默认自动分类：来源/频道 + 文件类型。
+    // 自定义保存路径由调用方直接覆盖，保存到用户指定目录本身，不再追加频道名或类型目录。
+    return { bySource: true, byType: true };
 }
 
 function normalizeSegment(value: string | null | undefined, fallback: string): string {

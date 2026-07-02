@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -7,14 +8,26 @@ import { createPortal } from "react-dom";
 interface DeleteAlertProps {
     isOpen: boolean;
     onClose: () => void;
-    onConfirm: () => void;
+    onConfirm: () => void | Promise<void>;
     fileName?: string;
 }
 
 export const DeleteAlert = ({ isOpen, onClose, onConfirm, fileName }: DeleteAlertProps) => {
     const { t } = useTranslation();
+    const [isDeleting, setIsDeleting] = useState(false);
 
     if (!isOpen) return null;
+
+    const handleConfirm = async () => {
+        if (isDeleting) return;
+        setIsDeleting(true);
+        try {
+            await onConfirm();
+            onClose();
+        } finally {
+            setIsDeleting(false);
+        }
+    };
 
     const modalContent = (
         <AnimatePresence>
@@ -26,7 +39,7 @@ export const DeleteAlert = ({ isOpen, onClose, onConfirm, fileName }: DeleteAler
                     exit={{ opacity: 0 }}
                     transition={{ duration: 0.2 }}
                     className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-                    onClick={onClose}
+                    onClick={isDeleting ? undefined : onClose}
                 />
 
                 {/* Modal Container */}
@@ -77,18 +90,16 @@ export const DeleteAlert = ({ isOpen, onClose, onConfirm, fileName }: DeleteAler
                         <Button
                             variant="outline"
                             className="h-10 px-5 text-sm font-medium border-border/80 hover:bg-muted"
-                            onClick={onClose}
+                            onClick={isDeleting ? undefined : onClose}
                         >
                             {t("delete.cancel") || "取消"}
                         </Button>
                         <Button
                             className="h-10 px-5 text-sm font-medium bg-red-600 hover:bg-red-700 text-white shadow-sm border border-red-700/50"
-                            onClick={() => {
-                                onConfirm();
-                                onClose();
-                            }}
+                            onClick={handleConfirm}
+                            disabled={isDeleting}
                         >
-                            {t("delete.confirm") || "确认删除"}
+                            {isDeleting ? "删除中..." : (t("delete.confirm") || "确认删除")}
                         </Button>
                     </div>
                 </motion.div>

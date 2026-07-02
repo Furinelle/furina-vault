@@ -1,67 +1,78 @@
 import { API_BASE } from './config';
 
-const TOKEN_KEY = 'flclouds_token';
-const TOKEN_EXPIRY_KEY = 'flclouds_token_expiry';
+export interface AuthStatus {
+    setupRequired: boolean;
+    passwordRequired: boolean;
+}
 
 class AuthService {
-    private token: string | null = null;
-
     constructor() {
-        // 从 localStorage 恢复 token
-        this.token = localStorage.getItem(TOKEN_KEY);
-        const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY);
-
-        // 检查是否过期
-        if (expiry && new Date() > new Date(expiry)) {
-            this.clearToken();
-        }
+        // Cookie-only auth: clear legacy localStorage tokens if present.
+        this.clearToken();
     }
 
     getToken(): string | null {
-        return this.token;
+        return null;
     }
 
-    setToken(token: string, expiresAt: string) {
-        this.token = token;
-        localStorage.setItem(TOKEN_KEY, token);
-        localStorage.setItem(TOKEN_EXPIRY_KEY, expiresAt);
+    setToken() {
+        // Authentication is stored only in the HttpOnly flclouds_token cookie.
     }
 
     clearToken() {
-        this.token = null;
-        localStorage.removeItem(TOKEN_KEY);
-        localStorage.removeItem(TOKEN_EXPIRY_KEY);
+        localStorage.removeItem('flclouds_token');
+        localStorage.removeItem('flclouds_token_expiry');
     }
 
     isAuthenticated(): boolean {
-        if (!this.token) return false;
-
-        const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY);
-        if (expiry && new Date() > new Date(expiry)) {
-            this.clearToken();
-            return false;
-        }
-
+        // The backend /verify endpoint is the source of truth for the HttpOnly cookie.
         return true;
     }
-
     // 获取认证头
     getAuthHeaders(): HeadersInit {
-        if (this.token) {
-            return { 'Authorization': `Bearer ${this.token}` };
-        }
         return {};
     }
 
-    // 检查是否需要密码
-    async checkPasswordRequired(): Promise<boolean> {
+    // 获取认证初始化状态
+    async getAuthStatus(): Promise<AuthStatus> {
         try {
             const response = await fetch(`${API_BASE}/api/auth/status`);
-            if (!response.ok) return true;
+            if (!response.ok) return { setupRequired: false, passwordRequired: true };
             const data = await response.json();
-            return data.passwordRequired !== false;
+            return {
+                setupRequired: data.setupRequired === true,
+                passwordRequired: data.passwordRequired !== false,
+            };
         } catch {
-            return true;
+            return { setupRequired: false, passwordRequired: true };
+        }
+    }
+
+    // 兼容旧调用：检查是否需要密码
+    async checkPasswordRequired(): Promise<boolean> {
+        const status = await this.getAuthStatus();
+        return status.passwordRequired;
+    }
+
+    // 首次启动创建唯一管理员凭证
+    async setup(webPassword: string, telegramPin: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            const response = await fetch(`${API_BASE}/api/auth/setup`, {
+                credentials: 'include',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ webPassword, telegramPin }),
+            });
+
+            const data = await response.json();
+            if (!response.ok) {
+                return { success: false, error: data.error || '初始化失败' };
+            }
+
+            this.setToken();
+            return { success: true };
+        } catch {
+            return { success: false, error: '网络错误' };
         }
     }
 
@@ -85,9 +96,9 @@ class AuthService {
                 return { success: true, requiresTOTP: true };
             }
 
-            this.setToken(data.token, data.expiresAt);
+            this.setToken();
             return { success: true };
-        } catch (error) {
+        } catch {
             return { success: false, error: '网络错误' };
         }
     }
@@ -108,17 +119,15 @@ class AuthService {
                 return { success: false, error: data.error || '验证失败' };
             }
 
-            this.setToken(data.token, data.expiresAt);
+            this.setToken();
             return { success: true };
-        } catch (error) {
+        } catch {
             return { success: false, error: '网络错误' };
         }
     }
 
     // 验证 Token
     async verify(): Promise<boolean> {
-        if (!this.token) return false;
-
         try {
             const response = await fetch(`${API_BASE}/api/auth/verify`, {
                 credentials: 'include',
@@ -188,7 +197,7 @@ class AuthService {
             }
 
             return { success: true };
-        } catch (error) {
+        } catch {
             return { success: false, error: '网络错误' };
         }
     }
@@ -212,7 +221,7 @@ class AuthService {
             }
 
             return { success: true };
-        } catch (error) {
+        } catch {
             return { success: false, error: '网络错误' };
         }
     }

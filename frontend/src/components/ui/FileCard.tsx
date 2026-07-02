@@ -50,8 +50,9 @@ export const FileCard = ({
         e?.stopPropagation();
         try {
             await fileApi.downloadFile(file.id, file.name);
-        } catch (error) {
+        } catch (error: any) {
             console.error("下载失败", error);
+            window.alert(error?.message || "下载失败");
         }
     };
 

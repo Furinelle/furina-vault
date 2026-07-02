@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
+import { pipeline } from 'stream/promises';
 import { query } from '../db/index.js';
 import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
@@ -248,17 +249,45 @@ router.post('/complete', async (req: Request, res: Response) => {
         console.log(`[ChunkedComplete] 🧩 Merging ${session.totalChunks} chunks for: ${session.filename}`);
         console.log(`[ChunkedComplete] 🏠 Final temp path: ${tempMergedPath}`);
 
-        for (let i = 0; i < session.totalChunks; i++) {
-            const chunkPath = path.join(CHUNK_DIR, uploadId, `chunk_${i}`);
-            const chunkData = fs.readFileSync(chunkPath);
-            writeStream.write(chunkData);
+        try {
+            for (let i = 0; i < session.totalChunks; i++) {
+                const chunkPath = path.join(CHUNK_DIR, uploadId, `chunk_${i}`);
+                if (!fs.existsSync(chunkPath)) {
+                    throw new Error(`缺少分块 ${i}`);
+                }
+                const chunkStat = fs.statSync(chunkPath);
+                if (chunkStat.size <= 0 || chunkStat.size > MAX_CHUNK_BYTES) {
+                    throw new Error(`分块 ${i} 大小无效`);
+                }
+                await pipeline(fs.createReadStream(chunkPath), writeStream, { end: false });
+            }
+
+            await new Promise<void>((resolve, reject) => {
+                writeStream.end();
+                writeStream.on('finish', resolve);
+                writeStream.on('error', reject);
+            });
+        } catch (mergeError) {
+            writeStream.destroy();
+            if (fs.existsSync(tempMergedPath)) fs.unlinkSync(tempMergedPath);
+            const chunkDir = path.join(CHUNK_DIR, uploadId);
+            if (fs.existsSync(chunkDir)) fs.rmSync(chunkDir, { recursive: true });
+            uploadSessions.delete(uploadId);
+            return res.status(400).json({ error: mergeError instanceof Error ? mergeError.message : '合并分块失败' });
         }
 
-        await new Promise<void>((resolve, reject) => {
-            writeStream.end();
-            writeStream.on('finish', resolve);
-            writeStream.on('error', reject);
-        });
+        const mergedStat = fs.statSync(tempMergedPath);
+        if (mergedStat.size !== session.totalSize) {
+            if (fs.existsSync(tempMergedPath)) fs.unlinkSync(tempMergedPath);
+            const chunkDir = path.join(CHUNK_DIR, uploadId);
+            if (fs.existsSync(chunkDir)) fs.rmSync(chunkDir, { recursive: true });
+            uploadSessions.delete(uploadId);
+            return res.status(400).json({
+                error: '合并后文件大小与声明大小不一致',
+                expectedSize: session.totalSize,
+                actualSize: mergedStat.size,
+            });
+        }
 
         // 清理分块
         const chunkDir = path.join(CHUNK_DIR, uploadId);
@@ -286,11 +315,13 @@ router.post('/complete', async (req: Request, res: Response) => {
         }
 
         // 5. 在保存到永久存储前生成缩略图和获取尺寸
+        // 方案A：只在本地存储生成缩略图；第三方存储不生成本地缩略图。
         let thumbnailPath = null;
         let width = null;
         let height = null;
+        const provider = storageManager.getProvider();
 
-        if (session.mimeType.startsWith('image/') || session.mimeType.startsWith('video/')) {
+        if (provider.name === 'local' && (session.mimeType.startsWith('image/') || session.mimeType.startsWith('video/'))) {
             try {
                 console.log(`[ChunkedComplete] 🖼️  MIME: ${session.mimeType}, starting generation...`);
                 const thumbResult = await generateThumbnail(tempMergedPath, storedName, session.mimeType);
@@ -310,7 +341,6 @@ router.post('/complete', async (req: Request, res: Response) => {
 
         // 6. 保存到永久存储
         let storedPath = '';
-        const provider = storageManager.getProvider();
         console.log(`[ChunkedComplete] 🛠️  Provider: ${provider.name}, accountId: ${activeAccountId || 'none (local)'}`);
         try {
             storedPath = await provider.saveFile(tempMergedPath, storedName, session.mimeType, storageFolder);

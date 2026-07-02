@@ -2,13 +2,52 @@ import { Router, Request, Response } from 'express';
 import { query } from '../db/index.js';
 import fs from 'fs';
 import path from 'path';
-import { generateSignature, getSignedUrl } from '../middleware/signedUrl.js';
-import { safeUnlink } from '../utils/localPath.js';
+import { getSignedUrl } from '../middleware/signedUrl.js';
+import { getScopedFileById, removePhysicalFile, updateScopedFileById } from '../utils/fileScope.js';
+import { isPathInside } from '../utils/localPath.js';
 
 const router = Router();
 
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './data/uploads');
 const THUMBNAIL_DIR = path.resolve(process.env.THUMBNAIL_DIR || './data/thumbnails');
+
+async function getSafeLocalFilePath(file: any): Promise<string> {
+    const candidate = file.path || path.join(UPLOAD_DIR, file.stored_name);
+    const resolved = path.resolve(candidate);
+    if (!isPathInside(UPLOAD_DIR, resolved)) {
+        throw new Error('Unsafe local file path');
+    }
+    if (!fs.existsSync(resolved)) {
+        return resolved;
+    }
+    const real = await fs.promises.realpath(resolved);
+    if (!isPathInside(UPLOAD_DIR, real)) {
+        throw new Error('Unsafe local file path');
+    }
+    return real;
+}
+
+function parseRangeHeader(range: string | undefined, size: number): { start: number; end: number } | null {
+    if (!range) return null;
+    const match = range.match(/^bytes=(\d*)-(\d*)$/);
+    if (!match) return null;
+    let start: number;
+    let end: number;
+    if (match[1] === '' && match[2] === '') return null;
+    if (match[1] === '') {
+        const suffixLength = Number(match[2]);
+        if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+        start = Math.max(size - suffixLength, 0);
+        end = size - 1;
+    } else {
+        start = Number(match[1]);
+        end = match[2] === '' ? size - 1 : Number(match[2]);
+    }
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= size) {
+        return null;
+    }
+    return { start, end: Math.min(end, size - 1) };
+}
 
 // 获取文件列表
 router.get('/', async (req: Request, res: Response) => {
@@ -168,13 +207,11 @@ router.post('/folders/favorite', async (req: Request, res: Response) => {
 router.get('/:id([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
         res.json({
             ...file,
             size: formatFileSize(file.size),
@@ -194,13 +231,11 @@ router.get('/:id([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
 router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
 
         if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
             try {
@@ -228,7 +263,7 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
         }
 
         // 处理本地文件 (source === 'web' 或 'local')
-        const filePath = file.path || path.join(UPLOAD_DIR, file.stored_name);
+        const filePath = await getSafeLocalFilePath(file);
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: '文件不存在于服务器' });
@@ -246,9 +281,16 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
         const range = req.headers.range;
 
         if (range) {
-            const parts = range.replace(/bytes=/, '').split('-');
-            const start = parseInt(parts[0], 10);
-            const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+            const parsedRange = parseRangeHeader(range, stat.size);
+            if (!parsedRange) {
+                res.status(416);
+                res.set({
+                    'Content-Range': `bytes */${stat.size}`,
+                    'Accept-Ranges': 'bytes',
+                });
+                return res.end();
+            }
+            const { start, end } = parsedRange;
             const chunksize = end - start + 1;
 
             res.status(206);
@@ -275,13 +317,11 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
 router.get('/:id([0-9a-fA-F-]{36})/download-url', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
 
         // 1. 云存储文件：获取临时下载链接
         if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
@@ -321,14 +361,11 @@ router.get('/:id([0-9a-fA-F-]{36})/download', async (req: Request, res: Response
         const { id } = req.params;
         console.log(`[Download] Starting download for ID: ${id}`);
 
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
-            console.log(`[Download] File not found in DB: ${id}`);
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
 
         // 处理云存储文件 (如果直接访问此接口，仍然尝试重定向或流式传输)
         if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
@@ -353,7 +390,7 @@ router.get('/:id([0-9a-fA-F-]{36})/download', async (req: Request, res: Response
         }
 
         // 使用数据库中存储的完整路径（支持文件夹内的文件）
-        const filePath = file.path || path.join(UPLOAD_DIR, file.stored_name);
+        const filePath = await getSafeLocalFilePath(file);
         console.log(`[Download] Serving local file: ${filePath}`);
 
         if (!fs.existsSync(filePath)) {
@@ -377,13 +414,11 @@ router.get('/:id([0-9a-fA-F-]{36})/download', async (req: Request, res: Response
 router.get('/:id([0-9a-fA-F-]{36})/thumbnail', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
 
         if (!file.thumbnail_path) {
             // 如果是 OneDrive 且没有本地缩略图，可以尝试重定向到 OneDrive 的缩略图（如果有 API）
@@ -414,32 +449,16 @@ router.get('/:id([0-9a-fA-F-]{36})/thumbnail', async (req: Request, res: Respons
 router.delete('/:id([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
 
-        const file = result.rows[0];
-
-        if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
-            try {
-                const { storageManager } = await import('../services/storage.js');
-                const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
-                await provider.deleteFile(file.path);
-            } catch (err) {
-                console.error(`${file.source} 文件删除失败 (可能已不存在):`, err);
-            }
-        } else {
-            // 删除实际文件（使用数据库中存储的完整路径）
-            const filePath = file.path || path.join(UPLOAD_DIR, file.stored_name);
-            await safeUnlink(filePath, UPLOAD_DIR);
-        }
-
-        // 删除缩略图 (本地)
-        if (file.thumbnail_path) {
-            const thumbPath = path.join(THUMBNAIL_DIR, path.basename(file.thumbnail_path));
-            await safeUnlink(thumbPath, THUMBNAIL_DIR);
+        try {
+            await removePhysicalFile(file);
+        } catch (err) {
+            console.error(`物理文件删除失败 (可能已不存在):`, err);
         }
 
         // 删除数据库记录
@@ -449,74 +468,6 @@ router.delete('/:id([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
     } catch (error) {
         console.error('删除文件失败:', error);
         res.status(500).json({ error: '删除文件失败' });
-    }
-});
-
-// 批量删除文件和文件夹
-router.post('/batch-delete', async (req: Request, res: Response) => {
-    try {
-        const { fileIds = [], folderNames = [] } = req.body;
-
-        if (!Array.isArray(fileIds) || !Array.isArray(folderNames)) {
-            return res.status(400).json({ error: '参数格式错误' });
-        }
-
-        if (fileIds.length === 0 && folderNames.length === 0) {
-            return res.status(400).json({ error: '请提供要删除的文件或文件夹' });
-        }
-
-        // 1. 获取所有待删除的文件记录
-        let filesToDelete: any[] = [];
-
-        if (fileIds.length > 0) {
-            const result = await query('SELECT * FROM files WHERE id = ANY($1)', [fileIds]);
-            filesToDelete = [...filesToDelete, ...result.rows];
-        }
-
-        if (folderNames.length > 0) {
-            const result = await query('SELECT * FROM files WHERE folder = ANY($1)', [folderNames]);
-            filesToDelete = [...filesToDelete, ...result.rows];
-        }
-
-        // 去重
-        const uniqueFiles = Array.from(new Map(filesToDelete.map(f => [f.id, f])).values());
-
-        if (uniqueFiles.length === 0) {
-            return res.json({ success: true, message: '没有发现待删除的项目' });
-        }
-
-        // 2. 依次物理删除
-        const storagePromises = uniqueFiles.map(async (file) => {
-            try {
-                if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
-                    const { storageManager } = await import('../services/storage.js');
-                    const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
-                    await provider.deleteFile(file.path);
-                } else {
-                    const filePath = file.path || path.join(UPLOAD_DIR, file.stored_name);
-                    await safeUnlink(filePath, UPLOAD_DIR);
-                }
-
-                // 删除缩略图
-                if (file.thumbnail_path) {
-                    const thumbPath = path.join(THUMBNAIL_DIR, path.basename(file.thumbnail_path));
-                    await safeUnlink(thumbPath, THUMBNAIL_DIR);
-                }
-            } catch (err) {
-                console.error(`删除物理文件失败 (ID: ${file.id}):`, err);
-            }
-        });
-
-        await Promise.all(storagePromises);
-
-        // 3. 从数据库批量删除
-        const idsToDelete = uniqueFiles.map(f => f.id);
-        await query('DELETE FROM files WHERE id = ANY($1)', [idsToDelete]);
-
-        res.json({ success: true, message: `成功删除 ${uniqueFiles.length} 个文件` });
-    } catch (error) {
-        console.error('批量删除失败:', error);
-        res.status(500).json({ error: '批量删除失败' });
     }
 });
 
@@ -562,13 +513,11 @@ router.patch('/:id([0-9a-fA-F-]{36})/rename', async (req: Request, res: Response
             return res.status(400).json({ error: '文件名包含非法字符' });
         }
 
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
-        if (result.rows.length === 0) {
+        const file = await getScopedFileById(id);
+
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
-
         // 检查后缀是否一致
         const getExt = (n: string) => {
             const dotIndex = n.lastIndexOf('.');
@@ -582,53 +531,12 @@ router.patch('/:id([0-9a-fA-F-]{36})/rename', async (req: Request, res: Response
             return res.status(400).json({ error: '不允许修改文件后缀' });
         }
 
-        await query('UPDATE files SET name = $1 WHERE id = $2', [trimmedName, id]);
+        await updateScopedFileById(id, 'name = $1', [trimmedName]);
 
         res.json({ success: true, name: trimmedName });
     } catch (error) {
         console.error('重命名文件失败:', error);
         res.status(500).json({ error: '重命名文件失败' });
-    }
-});
-
-// 重命名文件夹
-router.patch('/rename-folder', async (req: Request, res: Response) => {
-    try {
-        const { oldName, newName } = req.body;
-
-        if (!oldName || !newName || typeof oldName !== 'string' || typeof newName !== 'string') {
-            return res.status(400).json({ error: '参数错误' });
-        }
-
-        const trimmedNew = newName.trim();
-        if (trimmedNew.length === 0) {
-            return res.status(400).json({ error: '文件夹名不能为空' });
-        }
-
-        if (/[\/\\:*?"<>|]/.test(trimmedNew)) {
-            return res.status(400).json({ error: '文件夹名包含非法字符' });
-        }
-
-        // 检查旧文件夹是否存在
-        const checkResult = await query('SELECT COUNT(*) as cnt FROM files WHERE folder = $1', [oldName]);
-        if (parseInt(checkResult.rows[0].cnt) === 0) {
-            return res.status(404).json({ error: '文件夹不存在' });
-        }
-
-        // 检查新名称是否已存在
-        if (trimmedNew !== oldName) {
-            const existResult = await query('SELECT COUNT(*) as cnt FROM files WHERE folder = $1', [trimmedNew]);
-            if (parseInt(existResult.rows[0].cnt) > 0) {
-                return res.status(400).json({ error: '该文件夹名已存在' });
-            }
-        }
-
-        await query('UPDATE files SET folder = $1 WHERE folder = $2', [trimmedNew, oldName]);
-
-        res.json({ success: true, name: trimmedNew });
-    } catch (error) {
-        console.error('重命名文件夹失败:', error);
-        res.status(500).json({ error: '重命名文件夹失败' });
     }
 });
 
@@ -648,12 +556,12 @@ router.patch('/:id([0-9a-fA-F-]{36})/move', async (req: Request, res: Response) 
             return res.status(400).json({ error: '文件夹名包含非法字符' });
         }
 
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
-        if (result.rows.length === 0) {
+        const file = await getScopedFileById(id);
+
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        await query('UPDATE files SET folder = $1, updated_at = NOW() WHERE id = $2', [trimmedFolder, id]);
+        await updateScopedFileById(id, 'folder = $1, updated_at = NOW()', [trimmedFolder]);
 
         res.json({ success: true, folder: trimmedFolder });
     } catch (error) {
@@ -662,52 +570,17 @@ router.patch('/:id([0-9a-fA-F-]{36})/move', async (req: Request, res: Response) 
     }
 });
 
-// 移动文件夹
-router.patch('/move-folder', async (req: Request, res: Response) => {
-    try {
-        const { oldName, newName } = req.body;
-
-        if (!oldName || typeof oldName !== 'string') {
-            return res.status(400).json({ error: '原文件夹名称不能为空' });
-        }
-
-        if (newName !== null && typeof newName !== 'string') {
-            return res.status(400).json({ error: '目标文件夹名称格式错误' });
-        }
-
-        const trimmedOld = oldName.trim();
-        const trimmedNew = newName ? newName.trim() : null;
-
-        if (trimmedNew && /[\/\\:*?"<>|]/.test(trimmedNew)) {
-            return res.status(400).json({ error: '目标文件夹名包含非法字符' });
-        }
-
-        const checkResult = await query('SELECT COUNT(*) as cnt FROM files WHERE folder = $1', [trimmedOld]);
-        if (parseInt(checkResult.rows[0].cnt) === 0) {
-            return res.status(404).json({ error: '原文件夹不存在' });
-        }
-
-        await query('UPDATE files SET folder = $1, updated_at = NOW() WHERE folder = $2', [trimmedNew, trimmedOld]);
-
-        res.json({ success: true, folder: trimmedNew });
-    } catch (error) {
-        console.error('移动文件夹失败:', error);
-        res.status(500).json({ error: '移动文件夹失败' });
-    }
-});
 // 创建分享链接
 router.post('/:id([0-9a-fA-F-]{36})/share', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
         const { password, expiration } = req.body;
 
-        const result = await query('SELECT * FROM files WHERE id = $1', [id]);
+        const file = await getScopedFileById(id);
 
-        if (result.rows.length === 0) {
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
-
-        const file = result.rows[0];
 
         // 检查存储源是否支持分享
         const supportedSources = ['onedrive', 'google_drive'];
@@ -781,19 +654,18 @@ router.get('/favorites', async (req: Request, res: Response) => {
 router.post('/:id([0-9a-fA-F-]{36})/favorite', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        
-        // 检查文件是否存在
-        const result = await query('SELECT is_favorite FROM files WHERE id = $1', [id]);
-        
-        if (result.rows.length === 0) {
+
+        // 检查文件是否存在，并限定当前存储源
+        const file = await getScopedFileById(id);
+        if (!file) {
             return res.status(404).json({ error: '文件不存在' });
         }
 
-        const currentFavorite = result.rows[0].is_favorite;
+        const currentFavorite = file.is_favorite;
         const newFavorite = !currentFavorite;
 
         // 更新收藏状态
-        await query('UPDATE files SET is_favorite = $1, updated_at = NOW() WHERE id = $2', [newFavorite, id]);
+        await updateScopedFileById(id, 'is_favorite = $1, updated_at = NOW()', [newFavorite]);
 
         res.json({ success: true, isFavorite: newFavorite });
     } catch (error) {

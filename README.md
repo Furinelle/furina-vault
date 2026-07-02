@@ -43,6 +43,9 @@ vi .env
 - 如需 Telegram Bot，再填写 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_API_ID`、`TELEGRAM_API_HASH`
 - 如需账号级 Telegram 下载器，再填写 `TELEGRAM_USER_API_ID`、`TELEGRAM_USER_API_HASH`
 
+> [!TIP]
+> `ACCESS_PASSWORD_HASH` 现在仅作为旧部署兼容项。全新部署推荐留空，启动后首次访问 Web 页面创建网页管理员密码和 Telegram Bot 4 位 PIN。
+
 ### 3. 构建前端
 
 `VITE_API_URL` 是前端构建时变量。请先在 `.env` 中设置好它，然后用变量传入构建命令：
@@ -99,7 +102,7 @@ docker compose up -d
 | `DB_PASSWORD` | PostgreSQL 数据库密码 | `change_me_to_a_strong_password` | 自行生成强密码，首次部署前写入 `.env` |
 | `CORS_ORIGIN` | 允许跨域的前端来源 | `https://cloud.yourdomain.com` | 你的前端网页公网地址，例如 Nginx/Caddy 指向宿主机 `47832` |
 | `DOMAIN` | 应用主域名，不带协议 | `cloud.yourdomain.com` | 填前端主域名，用于生成链接和展示 |
-| `ACCESS_PASSWORD_HASH` | 可选，网页登录/接口访问密码的 SHA-256 Hash | `sha256_hash_here...` | 见“生成密码哈希”章节；不填则不启用访问密码 |
+| `ACCESS_PASSWORD_HASH` | 可选，旧部署兼容的网页登录密码 SHA-256 Hash | `sha256_hash_here...` | 新部署推荐留空并通过首次 Web 初始化创建管理员；仅迁移旧配置时使用 |
 | `TELEGRAM_BOT_TOKEN` | 可选，Telegram Bot Token | `123456:ABC-DEF...` | 找 [@BotFather](https://t.me/BotFather) 创建机器人后获取 |
 | `TELEGRAM_API_ID` | 可选，Telegram API ID | `123456` | 登录 [my.telegram.org](https://my.telegram.org) 创建应用后获取 |
 | `TELEGRAM_API_HASH` | 可选，Telegram API Hash | `abcdef123456...` | 与 `TELEGRAM_API_ID` 在同一页面获取 |
@@ -216,12 +219,23 @@ docker compose up -d
 
 ## 🔐 安全与访问控制
 
-如果设置了 `ACCESS_PASSWORD_HASH`，访问网页和 API 将需要输入密码。本应用目前使用 SHA-256 算法进行哈希。
+FlClouds 默认采用“首次初始化”模式保护 Web 和 API：
 
-> [!CAUTION]
-> Telegram Bot 键盘只适合四位数字密码输入场景；如果你通过 Bot 使用密码登录，请设置四位数字并生成对应 SHA-256 Hash。
+1. 全新部署时可以不填写 `ACCESS_PASSWORD_HASH`。
+2. 服务启动后，首次访问 Web 页面会要求创建：
+   - 网页管理员密码：至少 8 位，使用 `scrypt` 加盐哈希后保存到数据库。
+   - Telegram Bot 4 位 PIN：仅用于 Bot `/start` 身份验证，同样使用 `scrypt` 加盐哈希保存。
+3. 登录成功后，浏览器会获得 HttpOnly Cookie 会话，前端不再把访问 token 写入 `localStorage`。
+4. 修改类请求会校验 `Origin`，请确保 `.env` 中的 `CORS_ORIGIN` 与前端公网地址一致。
 
-### 生成密码哈希
+> [!IMPORTANT]
+> 生产环境请使用 HTTPS。默认 `COOKIE_SECURE=true` 时，浏览器只会在 HTTPS 下发送登录 Cookie；如果你只在本地 HTTP 调试，可临时设置 `COOKIE_SECURE=false`。
+
+### 旧部署密码兼容
+
+旧版本通过 `ACCESS_PASSWORD_HASH` 配置 SHA-256 密码哈希。当前版本仍兼容这种方式，便于平滑升级；但新部署推荐使用首次初始化创建管理员密码。
+
+如果必须生成旧式 SHA-256 Hash，可使用：
 
 ```bash
 node -e "console.log(require('crypto').createHash('sha256').update('your_password').digest('hex'))"
@@ -233,11 +247,11 @@ Linux/macOS 也可以：
 echo -n "your_password" | sha256sum | awk '{print $1}'
 ```
 
-将生成的 64 位字符串填入 `.env` 的 `ACCESS_PASSWORD_HASH`。
+将生成的 64 位字符串填入 `.env` 的 `ACCESS_PASSWORD_HASH`。使用旧式哈希时，Telegram Bot 会在首次设置独立 PIN 前兼容旧密码验证。
 
 ### 自动密钥说明
 
-FlClouds 会在首次启动时自动生成内部密钥，并保存到 Docker 数据卷的 `/data/secrets/` 目录中。正常部署无需手动配置。迁移服务器时请连同 Docker volume 一起备份，否则已加密的第三方存储凭证可能需要重新添加。
+FlClouds 会在首次启动时自动生成内部密钥，并保存到 Docker 数据卷的 `/data/secrets/` 目录中。正常部署无需手动配置。迁移服务器时请连同 Docker volume 一起备份，否则登录会话、TOTP 密钥和已加密的第三方存储凭证可能需要重新配置。
 
 ### 双重验证 (TOTP)
 
@@ -258,8 +272,16 @@ FlClouds 内置支持 TOTP 双重验证（如 Google Authenticator）：
 | `cloud.example.com` | HTTPS | `127.0.0.1:47832` | 前端/网页入口 |
 | `api.example.com` | HTTPS | `127.0.0.1:51947` | 后端/API 接口 |
 
+如果前后端使用不同域名，请在后端环境变量中设置：
+
+```env
+VITE_API_URL=https://api.example.com
+CORS_ORIGIN=https://cloud.example.com
+COOKIE_SECURE=true
+```
+
 > [!CAUTION]
-> 开启 HTTPS 后，`.env` 中的 `VITE_API_URL` 和 `CORS_ORIGIN` 都应使用 `https://`，否则浏览器可能拦截请求。
+> 开启 HTTPS 后，`.env` 中的 `VITE_API_URL` 和 `CORS_ORIGIN` 都应使用 `https://`，否则浏览器可能拦截请求。修改 `VITE_API_URL` 后必须重新构建前端镜像，因为它会被打包进静态文件。
 
 ---
 
@@ -316,7 +338,9 @@ docker system prune -f
 - ⚙️ Telegram 并发下载 worker 调参，激进模式带二次确认
 - 🧯 重复文件处理、路径规则和本地孤儿文件清理开关
 - 📥 yt-dlp 视频链接下载到当前存储源
-- 🔐 Web / Bot 双重验证与访问密码保护
+- 🔐 首次 Web 初始化管理员密码，HttpOnly Cookie 会话与 Bot 独立 PIN
+- 🛡️ Origin 校验、签名 URL、存储账户作用域隔离与本地路径安全保护
+- ⚡ 前端按需加载与依赖拆包，降低首屏 JS 体积
 - 🧩 Google Drive 等存储源配置与授权刷新
 - 🐳 Docker Compose 容器化部署
 

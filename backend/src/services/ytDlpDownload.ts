@@ -160,10 +160,13 @@ async function uploadDownloadedFile(localFilePath: string, originalFileName: str
 
     let thumbnailPath: string | null = null;
     let dimensions: { width?: number; height?: number } = {};
-    try {
-        thumbnailPath = await generateThumbnail(localFilePath, storedName, mimeType);
-        dimensions = await getImageDimensions(localFilePath, mimeType);
-    } catch {
+    // 方案A：只在本地存储生成缩略图；第三方存储不生成本地缩略图。
+    if (provider.name === 'local' && (mimeType.startsWith('image/') || mimeType.startsWith('video/'))) {
+        try {
+            thumbnailPath = await generateThumbnail(localFilePath, storedName, mimeType);
+            dimensions = await getImageDimensions(localFilePath, mimeType);
+        } catch {
+        }
     }
 
     let finalPath = await provider.saveFile(localFilePath, storedName, mimeType, folder);

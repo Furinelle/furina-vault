@@ -100,6 +100,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         console.log(`[Upload] 🛠️  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || 'none (local)'}`);
 
         // 2. 在保存到永久存储前生成缩略图和获取尺寸
+        // 方案A：只在本地存储生成缩略图；OneDrive/S3/OSS/WebDAV/Google Drive 等第三方存储不生成本地缩略图。
         let thumbnailPath = null;
         let width = null;
         let height = null;
@@ -123,7 +124,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             }
         }
 
-        if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
+        if (provider.name === 'local' && (mimeType.startsWith('image/') || mimeType.startsWith('video/'))) {
             try {
                 const thumbResult = await generateThumbnail(tempPath, storedName, mimeType);
                 if (thumbResult) {

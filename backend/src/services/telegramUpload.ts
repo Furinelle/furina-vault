@@ -9,7 +9,7 @@ import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
 import { getSetting } from '../utils/settings.js';
-import { isAuthenticated } from './telegramState.js';
+import { isAuthenticatedAsync } from './telegramState.js';
 import { formatBytes, getTypeEmoji, getFileType, getMimeTypeFromFilename, sanitizeFilename } from '../utils/telegramUtils.js';
 import {
     MSG,
@@ -32,6 +32,7 @@ import {
 } from '../utils/telegramMessages.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
 import { buildStorageFolderWithRules, getStoragePathRules, getTelegramBatchFolderName, getTelegramChatName, isOpaqueTelegramIdentifier } from '../utils/storagePath.js';
+import { resolveTelegramStorageFolder, resolveTelegramBatchStorageFolder, resolveTelegramTaskStorageFolder, previewTelegramStorageFolder } from '../utils/telegramPathSettings.js';
 import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
@@ -217,7 +218,10 @@ function shouldRefreshLargeTaskStatus(lastStatusRefresh: number, completed: numb
  * 安全编辑消息，捕获 FloodWaitError 并更新全局冷却状态
  */
 async function safeEditMessage(client: TelegramClient, chatId: Api.TypeEntityLike, params: any) {
-    if (Date.now() < floodWaitUntil) return null;
+    if (Date.now() < floodWaitUntil) {
+        console.warn(`[Telegram] ⏳ 跳过编辑消息：仍在 FloodWait 冷却中 chat=${chatId.toString()} msg=${params?.message}`);
+        return null;
+    }
 
     try {
         const result = await client.editMessage(chatId, params);
@@ -233,7 +237,32 @@ async function safeEditMessage(client: TelegramClient, chatId: Api.TypeEntityLik
             floodWaitUntil = Date.now() + (seconds * 1000);
             console.warn(`[Telegram] ⚠️ 触发 FloodWait，冷却时间: ${seconds} 秒`);
         }
+        if (e.errorMessage === 'MESSAGE_NOT_MODIFIED' || e.message?.includes('MESSAGE_NOT_MODIFIED')) {
+            if (process.env.TG_STATUS_DEBUG === '1') {
+                console.log(`[TG][status] edit-noop chat=${chatId.toString()} msg=${params?.message}`);
+            }
+            return { notModified: true };
+        }
+        console.warn(`[Telegram] ⚠️ 编辑消息失败 chat=${chatId.toString()} msg=${params?.message}:`, e?.errorMessage || e?.message || e);
         return null;
+    }
+}
+
+const telegramStorageWriteLocks = new Map<string, Promise<void>>();
+
+async function withTelegramStorageWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = telegramStorageWriteLocks.get(key) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    telegramStorageWriteLocks.set(key, previous.then(() => current, () => current));
+    await previous.catch(() => undefined);
+    try {
+        return await fn();
+    } finally {
+        release();
+        if (telegramStorageWriteLocks.get(key) === current) {
+            telegramStorageWriteLocks.delete(key);
+        }
     }
 }
 
@@ -572,7 +601,13 @@ interface SilentSession {
 }
 
 const silentSessionMap = new Map<string, SilentSession>();
+interface TaskControlScope {
+    chatId: string;
+    userId?: number;
+}
+
 const taskIdToChatId = new Map<string, string>();
+const taskIdControlScopes = new Map<string, TaskControlScope>();
 
 function createSessionTaskId(): string {
     return `t${Date.now().toString(36).slice(-5)}${Math.random().toString(36).slice(2, 5)}`;
@@ -587,13 +622,33 @@ function resolveTaskChatId(taskId?: string): string | undefined {
     return taskIdToChatId.get(taskId.trim());
 }
 
+function registerTaskControlScope(taskId: string, chatId: string, userId?: number): void {
+    taskIdToChatId.set(taskId, chatId);
+    taskIdControlScopes.set(taskId, { chatId, userId });
+}
+
+function removeTaskControlScope(taskId?: string): void {
+    if (!taskId) return;
+    taskIdToChatId.delete(taskId);
+    taskIdControlScopes.delete(taskId);
+}
+
+export function canControlTask(taskId: string | undefined, chatId: string | undefined, userId?: number): boolean {
+    if (!taskId || !chatId) return false;
+    const scope = taskIdControlScopes.get(taskId.trim());
+    if (!scope) return false;
+    if (scope.chatId !== chatId) return false;
+    if (scope.userId !== undefined && userId !== undefined && scope.userId !== userId) return false;
+    return true;
+}
+
 function getSilentSession(chatIdStr: string): SilentSession {
     let s = silentSessionMap.get(chatIdStr);
     if (!s) {
         const taskId = createSessionTaskId();
         s = { total: 0, completed: 0, failed: 0, taskId, knownTaskKeys: new Set(), knownTaskCounts: new Map(), folders: new Set(), providers: new Set() };
         silentSessionMap.set(chatIdStr, s);
-        taskIdToChatId.set(taskId, chatIdStr);
+        registerTaskControlScope(taskId, chatIdStr);
     }
     return s;
 }
@@ -602,7 +657,7 @@ function startSilentSession(chatIdStr: string, total: number): SilentSession {
     const taskId = createSessionTaskId();
     const s = { total, completed: 0, failed: 0, taskId, knownTaskKeys: new Set<string>(), knownTaskCounts: new Map<string, number>(), folders: new Set<string>(), providers: new Set<string>() };
     silentSessionMap.set(chatIdStr, s);
-    taskIdToChatId.set(taskId, chatIdStr);
+    registerTaskControlScope(taskId, chatIdStr);
     return s;
 }
 
@@ -617,7 +672,7 @@ async function finalizeSilentSessionIfDone(client: TelegramClient, chatId: Api.T
     const s = silentSessionMap.get(chatIdStr);
     const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr);
 
-    // 编辑静默通知为完成消息
+    // 编辑静默通知为完成消息；如果编辑失败，补发一条完成消息，避免 Telegram 卡在旧进度。
     if (silentMsgId) {
         const text = buildSilentAllTasksComplete(
             s?.total || 0,
@@ -638,13 +693,23 @@ async function finalizeSilentSessionIfDone(client: TelegramClient, chatId: Api.T
                 })),
             ],
         );
-        const controls = s?.failed ? buildTaskControlButtons(s?.taskId) : new Api.ReplyInlineMarkup({ rows: [] });
-        await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons: controls });
+        // GramJS/Telegram rejects ReplyInlineMarkup with an empty rows array (REPLY_MARKUP_INVALID).
+        // Omit buttons entirely to clear inline controls on successful completion.
+        const controls = s?.failed ? buildTaskControlButtons(s?.taskId) : undefined;
+        const edited = await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons: controls });
+        if (!edited) {
+            try {
+                await client.sendMessage(chatId, { message: text, buttons: controls });
+                console.warn(`[TG][silent] completion-edit-failed fallback-sent chat=${chatIdStr} oldMsg=${silentMsgId}`);
+            } catch (e) {
+                console.error(`[TG][silent] completion-fallback-send-failed chat=${chatIdStr}:`, e);
+            }
+        }
     }
 
     // 清理静默状态
     silentSessionMap.delete(chatIdStr);
-    if (s?.taskId) taskIdToChatId.delete(s.taskId);
+    removeTaskControlScope(s?.taskId);
     silentNoticeMessageIdMap.delete(chatIdStr);
     lastSilentNotificationTimeMap.delete(chatIdStr);
 
@@ -987,7 +1052,7 @@ export async function refreshSilentProgress(client: TelegramClient, chatId: Api.
         queueStats.pauseReason,
     );
     const buttons = isComplete && session.failed === 0
-        ? new Api.ReplyInlineMarkup({ rows: [] })
+        ? undefined
         : buildTaskControlButtons(session.taskId);
     await safeEditMessage(client, chatId, { message: silentMsgId, text, buttons });
 }
@@ -1004,7 +1069,7 @@ async function checkAndResetSession(client: TelegramClient, chatId: Api.TypeEnti
     if (outstanding === 0 && silentSessionMap.has(chatIdStr)) {
         const zombieTaskId = getSessionTaskId(chatIdStr);
         silentSessionMap.delete(chatIdStr);
-        if (zombieTaskId) taskIdToChatId.delete(zombieTaskId);
+        removeTaskControlScope(zombieTaskId);
         silentNoticeMessageIdMap.delete(chatIdStr);
         lastSilentNotificationTimeMap.delete(chatIdStr);
         console.log(`[TG][silent] Auto-cleared zombie session for ${chatIdStr}`);
@@ -1084,28 +1149,33 @@ export function forceStopDownloadTasks(reason?: string) {
     return downloadQueue.forceStopAll(reason);
 }
 
-export function pauseDownloadTasks(_taskId?: string) {
-    // 当前底层下载队列是全局队列；taskId 仅用于用户侧定位任务提示。
+export function pauseDownloadTasks(taskId?: string) {
+    // 当前底层下载队列仍是全局队列。带 taskId 的操作只允许已登记任务触发，文案明确其全局影响。
+    if (taskId && !resolveTaskChatId(taskId)) return { active: 0, pending: 0, total: 0 };
     return downloadQueue.pause();
 }
 
-export function resumeDownloadTasks(_taskId?: string) {
-    // 当前底层下载队列是全局队列；taskId 仅用于用户侧定位任务提示。
+export function resumeDownloadTasks(taskId?: string) {
+    if (taskId && !resolveTaskChatId(taskId)) return { active: 0, pending: 0, total: 0 };
     return downloadQueue.resume();
 }
 
 export function cancelDownloadTask(selector?: string) {
     const normalized = selector?.trim();
     if (normalized && resolveTaskChatId(normalized)) {
-        return downloadQueue.forceStopAll(`用户通过 /task_cancel ${normalized} 取消任务`);
+        // Until the queue is fully per-session, refuse to translate a task card into forceStopAll.
+        return downloadQueue.cancel('no-such-task-selector', `用户通过 /task_cancel ${normalized} 取消任务`);
     }
     return downloadQueue.cancel(normalized, '用户通过 /task_cancel 取消任务');
 }
 
-export async function cancelSilentTask(client: TelegramClient, chatId: Api.TypeEntityLike, taskId: string, fallbackMessageId?: number) {
+export async function cancelSilentTask(client: TelegramClient, chatId: Api.TypeEntityLike, taskId: string, fallbackMessageId?: number, userId?: number) {
     const mappedChatId = resolveTaskChatId(taskId);
     const chatIdStr = mappedChatId || chatId.toString();
     const editChatId = mappedChatId || chatId;
+    if (!canControlTask(taskId, chatIdStr, userId)) {
+        throw new Error('任务不属于当前聊天或已失效');
+    }
     const session = silentSessionMap.get(chatIdStr);
     const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr) || fallbackMessageId;
     const result = cancelDownloadTask(taskId);
@@ -1129,8 +1199,8 @@ export async function cancelSilentTask(client: TelegramClient, chatId: Api.TypeE
     }
 
     silentSessionMap.delete(chatIdStr);
-    if (session?.taskId) taskIdToChatId.delete(session.taskId);
-    taskIdToChatId.delete(taskId);
+    removeTaskControlScope(session?.taskId);
+    removeTaskControlScope(taskId);
     silentNoticeMessageIdMap.delete(chatIdStr);
     lastSilentNotificationTimeMap.delete(chatIdStr);
     clearConsolidatedState(chatIdStr);
@@ -1155,6 +1225,7 @@ interface FileUploadItem {
     error?: string;
     retried?: boolean;           // 是否已重试过
     targetDir?: string;          // 批量上传时文件的目标目录
+    folderOverride?: string | null; // 任务级保存目录覆盖，不影响全局路径规则
 }
 
 interface MediaGroupQueue {
@@ -1165,6 +1236,7 @@ interface MediaGroupQueue {
     createdAt: number;
     folderName?: string;  // 多文件上传的文件夹名称（来自消息 caption）
     folderPath?: string;  // 实际创建的文件夹路径
+    storageFolder?: string | null; // 批量任务整批共用的第三方存储目录
 }
 
 // 多文件上传队列 (key: mediaGroupId)
@@ -1437,19 +1509,23 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
         let storedName: string | undefined; // This will hold the unique name for final storage
 
         try {
-            // 获取唯一的存储文件名
             const activeAccountId = storageManager.getActiveAccountId();
             const chatName = await getTelegramChatName(file.message);
             const batchFolder = null;
             const storageRules = await getStoragePathRules();
-            const storageFolder = buildStorageFolderWithRules({
+            const automaticFolder = buildStorageFolderWithRules({
                 source: 'telegram',
                 chatName,
                 folder: batchFolder,
                 mimeType: file.mimeType,
                 fileName: file.fileName,
             }, storageRules);
-            storedName = await getUniqueStoredName(file.fileName, storageFolder, activeAccountId);
+            const chatIdForPath = queue?.chatId?.toString() || file.message.chatId?.toString() || 'unknown';
+            const storageFolder = file.folderOverride !== undefined
+                ? file.folderOverride
+                : queue?.storageFolder !== undefined
+                    ? queue.storageFolder
+                    : resolveTelegramStorageFolder(chatIdForPath, automaticFolder);
 
             const downloadSource = await resolveDownloadSource(client, file.message);
             const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, file.fileName, file.targetDir, undefined, signal);
@@ -1459,7 +1535,6 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
             }
 
             localFilePath = result.filePath;
-            // storedName 已在上方生成，结果中的 storedName 是原始名，由于我们已手动生成唯一名，忽略
             const actualSize = result.actualSize;
             const fileType = getFileType(file.mimeType);
             const duplicateMode = await getDuplicateMode();
@@ -1480,46 +1555,53 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
                 }
             }
 
-            // 生成缩略图和获取尺寸
-            let thumbnailPath: string | null = null;
-            let dimensions: { width?: number; height?: number } = {};
-            try {
-                thumbnailPath = await generateThumbnail(localFilePath, storedName, file.mimeType);
-                dimensions = await getImageDimensions(localFilePath, file.mimeType);
-            } catch (thumbErr) {
-                console.warn('🤖 生成缩略图/获取尺寸失败，继续上传:', thumbErr);
-            }
-
             const provider = storageManager.getProvider();
-            let finalPath = localFilePath;
-            let sourceRef = provider.name;
+            const storageLockKey = `${provider.name}:${activeAccountId || 'local'}:${storageFolder || ''}`;
+            return await withTelegramStorageWriteLock(storageLockKey, async () => {
+                storedName = await getUniqueStoredName(file.fileName, storageFolder, activeAccountId);
 
-            try {
-                finalPath = await provider.saveFile(localFilePath, storedName, file.mimeType, storageFolder);
-                if (fs.existsSync(localFilePath)) {
-                    fs.unlinkSync(localFilePath);
+                // 生成缩略图和获取尺寸。方案A：只在本地存储生成；第三方存储不生成本地缩略图。
+                let thumbnailPath: string | null = null;
+                let dimensions: { width?: number; height?: number } = {};
+                if (provider.name === 'local' && (file.mimeType.startsWith('image/') || file.mimeType.startsWith('video/'))) {
+                    try {
+                        thumbnailPath = await generateThumbnail(localFilePath!, storedName, file.mimeType);
+                        dimensions = await getImageDimensions(localFilePath!, file.mimeType);
+                    } catch (thumbErr) {
+                        console.warn('🤖 生成缩略图/获取尺寸失败，继续上传:', thumbErr);
+                    }
                 }
-                localFilePath = undefined;
-            } catch (err) {
-                console.error('保存文件到存储提供商失败:', err);
-                throw err;
-            }
 
-            await query(`
-                INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            `, [file.fileName, storedName, fileType, file.mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+                let finalPath = localFilePath!;
+                let sourceRef = provider.name;
 
-            file.status = 'success';
-            file.size = actualSize;
-            file.fileType = fileType;
-            if (queue?.chatId) {
-                const chatIdStr = queue.chatId.toString();
-                const batchId = (file.message as any).groupedId?.toString();
-                if (batchId) updateBatch(chatIdStr, batchId, { folderPath: storageFolder || undefined, providerName: provider.name });
-                rememberTransferDestination(chatIdStr, storageFolder, provider.name);
-            }
-            return true;
+                try {
+                    finalPath = await provider.saveFile(localFilePath!, storedName, file.mimeType, storageFolder);
+                    if (fs.existsSync(localFilePath!)) {
+                        fs.unlinkSync(localFilePath!);
+                    }
+                    localFilePath = undefined;
+                } catch (err) {
+                    console.error('保存文件到存储提供商失败:', err);
+                    throw err;
+                }
+
+                await query(`
+                    INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                `, [file.fileName, storedName, fileType, file.mimeType, actualSize, finalPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+
+                file.status = 'success';
+                file.size = actualSize;
+                file.fileType = fileType;
+                if (queue?.chatId) {
+                    const chatIdStr = queue.chatId.toString();
+                    const batchId = (file.message as any).groupedId?.toString();
+                    if (batchId) updateBatch(chatIdStr, batchId, { folderPath: storageFolder || undefined, providerName: provider.name });
+                    rememberTransferDestination(chatIdStr, storageFolder, provider.name);
+                }
+                return true;
+            });
 
         } catch (error) {
             console.error('🤖 文件上传失败:', error);
@@ -1634,13 +1716,16 @@ async function processBatchUpload(client: TelegramClient, mediaGroupId: string):
         const chatName = await getTelegramChatName(firstBatchFile.message);
         const batchFolder = null;
         const storageRules = await getStoragePathRules();
-        const folderPreview = buildStorageFolderWithRules({
+        const automaticPreview = buildStorageFolderWithRules({
             source: 'telegram',
             chatName,
             folder: batchFolder,
             mimeType: firstBatchFile.mimeType,
             fileName: firstBatchFile.fileName,
         }, storageRules);
+        const storageFolder = resolveTelegramBatchStorageFolder(chatId.toString(), automaticPreview);
+        queue.storageFolder = storageFolder;
+        const folderPreview = storageFolder;
         updateBatch(chatId.toString(), batchId, { folderName: queue.folderName, folderPath: folderPreview || undefined });
         queue.folderPath = folderPreview || undefined;
         rememberTransferDestination(chatId.toString(), folderPreview, storageManager.getProvider().name);
@@ -1778,12 +1863,13 @@ export async function getTelegramDownloadPreview(messages: Api.Message[]): Promi
         }
         mediaCount += 1;
         const chatName = await getTelegramChatName(message);
-        const storageFolder = buildStorageFolderWithRules({
+        const automaticFolder = buildStorageFolderWithRules({
             source: 'telegram',
             chatName,
             mimeType: fileInfo.mimeType,
             fileName: fileInfo.fileName,
         }, storageRules);
+        const storageFolder = previewTelegramStorageFolder(message.chatId?.toString() || 'unknown', automaticFolder);
         const duplicate = await findDuplicateFile(fileInfo.fileName, storageFolder, getEstimatedFileSize(message), activeAccountId);
         if (duplicate) duplicateCount += 1;
     }
@@ -1804,6 +1890,7 @@ export async function downloadTelegramChannelRange(
     limit: number = 50,
     direction: 'older' | 'newer' = 'older',
     explicitIds?: number[],
+    folderOverride?: string | null,
 ): Promise<{ requested: number; found: number; skipped: number; failed: number; successful: number; successfulMessageIds: number[]; failedMessageIds: number[]; skippedMessageIds: number[]; firstId: number; lastId: number }> {
     const userClient = getTelegramUserClient();
     if (!userClient || !isTelegramUserClientReady()) {
@@ -1833,6 +1920,8 @@ export async function downloadTelegramChannelRange(
     let found = 0;
     let skipped = 0;
     const chatIdStr = chatId.toString();
+    const taskFolderOverride = folderOverride !== undefined ? folderOverride : undefined;
+    let taskResolvedStorageFolder: string | null | undefined;
     const downloadableRefs: DownloadableMessageRef[] = [];
     const successfulMessageIds: number[] = [];
     const failedMessageIds: number[] = [];
@@ -1863,10 +1952,27 @@ export async function downloadTelegramChannelRange(
 
     const batchId = `tg-range-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     if (downloadableRefs.length > 0) {
+        const firstRef = downloadableRefs[0];
+        if (taskFolderOverride !== undefined) {
+            taskResolvedStorageFolder = taskFolderOverride;
+        } else if (firstRef) {
+            const firstMessage = (await userClient.getMessages(sourceEntity as any, { ids: [firstRef.id] }))[0] as Api.Message | undefined;
+            if (firstMessage) {
+                const chatName = await getTelegramChatName(firstMessage);
+                const storageRules = await getStoragePathRules();
+                const automaticPreview = buildStorageFolderWithRules({
+                    source: 'telegram',
+                    chatName,
+                    mimeType: firstRef.fileInfo.mimeType,
+                    fileName: firstRef.fileInfo.fileName,
+                }, storageRules);
+                taskResolvedStorageFolder = resolveTelegramTaskStorageFolder(chatIdStr, automaticPreview).folder;
+            }
+        }
         registerBatch(chatIdStr, batchId, {
             id: batchId,
             folderName: sourceEntity.toString(),
-            folderPath: undefined,
+            folderPath: taskResolvedStorageFolder || undefined,
             totalFiles: downloadableRefs.length,
             completed: 0,
             successful: 0,
@@ -1931,17 +2037,22 @@ export async function downloadTelegramChannelRange(
                 status: 'pending',
             };
             try {
-                if (!getConsolidatedBatches(chatIdStr).find(batch => batch.id === batchId)?.folderPath) {
+                if (taskResolvedStorageFolder !== undefined) {
+                    updateBatch(chatIdStr, batchId, { folderPath: taskResolvedStorageFolder || undefined });
+                } else if (!getConsolidatedBatches(chatIdStr).find(batch => batch.id === batchId)?.folderPath) {
                     const chatName = await getTelegramChatName(message);
                     const storageRules = await getStoragePathRules();
-                    const folderPreview = buildStorageFolderWithRules({
+                    const automaticPreview = buildStorageFolderWithRules({
                         source: 'telegram',
                         chatName,
                         mimeType,
                         fileName,
                     }, storageRules);
-                    updateBatch(chatIdStr, batchId, { folderPath: folderPreview || undefined });
+                    const resolved = resolveTelegramTaskStorageFolder(chatIdStr, automaticPreview).folder;
+                    taskResolvedStorageFolder = resolved;
+                    updateBatch(chatIdStr, batchId, { folderPath: resolved || undefined });
                 }
+                uploadItem.folderOverride = taskResolvedStorageFolder !== undefined ? taskResolvedStorageFolder : taskFolderOverride;
                 await processFileUpload(userClient, uploadItem);
                 if (uploadItem.status === 'success') {
                     successful += 1;
@@ -1990,7 +2101,7 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
     const senderId = message.senderId?.toJSNumber();
     if (!senderId) return;
 
-    if (!isAuthenticated(senderId)) {
+    if (!(await isAuthenticatedAsync(senderId))) {
         await message.reply({ message: MSG.AUTH_REQUIRED_UPLOAD });
         return;
     }
@@ -2057,6 +2168,8 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
 
         if (message.chatId) {
             await trySilentMode(client, message.chatId, message);
+            const taskId = getSessionTaskId(message.chatId.toString());
+            if (taskId) registerTaskControlScope(taskId, message.chatId.toString(), senderId);
         }
     } else {
         let finalFileName = fileName;
@@ -2094,6 +2207,8 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
         const useConsolidated = () => getActiveUploadCount(chatIdStr) >= 2 || getActiveBatchCount(chatIdStr) > 0;
 
         await trySilentMode(client, chatId, message);
+        const silentTaskId = getSessionTaskId(chatIdStr);
+        if (silentTaskId) registerTaskControlScope(silentTaskId, chatIdStr, senderId);
 
         if (!silentSessionMap.has(chatIdStr) && getBackgroundFileCount(chatIdStr) <= 3) {
             await runStatusAction(chatId, async () => {
@@ -2162,12 +2277,13 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
                 const activeAccountId = storageManager.getActiveAccountId();
                 const chatName = await getTelegramChatName(message);
                 const storageRules = await getStoragePathRules();
-                const storageFolder = buildStorageFolderWithRules({
+                const automaticFolder = buildStorageFolderWithRules({
                     source: 'telegram',
                     chatName,
                     mimeType,
                     fileName: finalFileName,
                 }, storageRules);
+                const storageFolder = resolveTelegramStorageFolder(chatIdStr, automaticFolder);
                 // 关键在这里：获取唯一文件名
                 const storedName = await getUniqueStoredName(finalFileName, storageFolder, activeAccountId);
 
@@ -2219,14 +2335,17 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
                     });
                 }
 
+                const provider = storageManager.getProvider();
                 let thumbnailPath: string | null = null;
                 let dimensions: { width?: number; height?: number } = {};
-                try {
-                    thumbnailPath = await generateThumbnail(localFilePath, storedName, mimeType);
-                    dimensions = await getImageDimensions(localFilePath, mimeType);
-                } catch (thumbErr) { }
+                // 方案A：只在本地存储生成缩略图；第三方存储不生成本地缩略图。
+                if (provider.name === 'local' && (mimeType.startsWith('image/') || mimeType.startsWith('video/'))) {
+                    try {
+                        thumbnailPath = await generateThumbnail(localFilePath, storedName, mimeType);
+                        dimensions = await getImageDimensions(localFilePath, mimeType);
+                    } catch (thumbErr) { }
+                }
 
-                const provider = storageManager.getProvider();
                 let finalPath = localFilePath;
                 let sourceRef = provider.name;
 

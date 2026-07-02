@@ -26,17 +26,17 @@ function buildTaskControlLines(taskId?: string, queuePaused = false, pauseReason
     if (!taskId) return [`💡 发送 /tasks 查看实时任务状态`];
     if (queuePaused) {
         return [
-            `⏸️ **当前状态：已暂停**`,
+            `⏸️ **当前状态：全局下载队列已暂停**`,
             pauseReason ? `📌 原因：${pauseReason}` : `📌 等待中的下载任务不会继续开始`,
-            `▶️ 点击下方“继续”可恢复后台下载队列`,
-            `🛑 点击“取消”可停止当前后台任务并清空等待项`,
+            `▶️ 点击下方“继续”会恢复全局下载队列`,
+            `🛑 点击“取消”只会结束这张后台任务卡；不会再误清空其它任务`,
         ];
     }
     return [
-        `💡 下载队列控制：请优先点下方按钮`,
-        `⏸ 暂停：暂时停止继续下载，已在处理的任务会尽快停住`,
-        `▶️ 继续：从暂停处恢复后台下载队列`,
-        `🛑 取消：停止当前后台任务并清空等待项`,
+        `💡 队列控制：按钮只对当前聊天的任务卡有效`,
+        `⏸ 暂停：暂停全局下载队列，已在处理的文件会尽快停住`,
+        `▶️ 继续：恢复全局下载队列`,
+        `🛑 取消：结束当前任务卡并移除按钮，不会误取消其它聊天任务`,
     ];
 }
 
@@ -162,20 +162,16 @@ export function buildWelcomeBack(): string {
         `您已通过验证，可以直接使用：`,
         ``,
         `📤  发送/转发文件即可上传 (最大 2GB，账号级下载器不受此限制)`,
-        `🔐  /setup_2fa — 配置双重验证`,
-        `📥  /ytdlp — 解析并下载链接`,
+        `📁  /path_rules — 保存路径/自定义目录`,
         `📡  /tg_sub — 订阅频道自动同步`,
-        `🗓️  /tg_date — 按日期下载频道文件`,
-        `🏷️  /tg_tag — 按标签下载频道文件`,
-        `🧾  /tg_jobs — Telegram 后台任务`,
-        `📊  /storage — 存储空间概览`,
-        `📋  /list — 最近上传记录`,
-        `🔧  /tasks — 实时任务队列`,
-        `🛑  /stop_tasks — 强制停止下载任务`,
+        `📦  /tg_download — 按日期/标签下载频道文件`,
         `⚙️  /download_workers — 下载并发设置`,
-        `📁  /path_rules — 保存路径规则`,
         `🧬  /duplicate_mode — 重复文件处理`,
         `🧹  /cleanup_settings — 自动清理设置`,
+        `📊  /storage — 存储统计/清理本地文件`,
+        `🔧  /tasks — 实时任务队列`,
+        `🔐  /setup_2fa — 配置双重验证`,
+        `📥  /ytdlp — 解析并下载链接`,
         `❓  /help — 完整帮助`,
     ].join('\n');
 }
@@ -210,21 +206,20 @@ export function buildHelp(): string {
         `**🛠 可用命令**`,
         `  /start — 身份认证 / 开始使用`,
         `  /setup\\_2fa — 配置双重验证 (TOTP)`,
-        `  /ytdlp <url> — 下载视频链接到存储`,
+        `  /path_rules — 保存路径/自定义目录面板`,
+        `  /p <目录> — 下一次下载保存到指定目录`,
+        `  /ps <目录> — 本会话持续保存到指定目录`,
+        `  /pc — 清除自定义目录`,
         `  /tg_sub <频道> — 订阅频道新文件自动同步`,
-        `  /tg_subs — 查看频道订阅`,
-        `  /tg_unsub <频道或ID> — 取消订阅`,
-        `  /tg_date <频道> <开始日期> <结束日期> — 按日期下载频道文件`,
-        `  /tg_tag <频道> <#标签> — 下载频道内指定标签的全部文件`,
-        `  /tg_jobs — 查看 Telegram 后台任务`,
-        `  /storage — 服务器 & 存储统计`,
-        `  /list [n] — 最近上传 (默认 10 条)`,
-        `  /tasks — 实时传输任务队列`,
-        `  /stop_tasks — 停止所有下载任务`,
+        `  /tg_download — 按日期/标签下载频道文件`,
+        `  /tg_download date <频道> <开始日期> <结束日期> — 按日期下载`,
+        `  /tg_download tag <频道> <#标签> — 按标签下载`,
         `  /download_workers — 设置下载并发`,
-        `  /path_rules — 设置保存路径规则`,
         `  /duplicate_mode — 设置重复文件处理`,
         `  /cleanup_settings — 设置自动清理开关`,
+        `  /storage — 存储统计/清理本地文件`,
+        `  /tasks — 实时传输任务队列`,
+        `  /ytdlp <url> — 下载视频链接到存储`,
         `  /delete <ID或序号> — 删除指定文件`,
         `  /help — 显示此帮助`,
         ``,
@@ -253,6 +248,8 @@ interface StorageReportData {
     diskUsedPercent: number;
     fileCount: number;
     totalFileSize: number;
+    localFileCount: number;
+    localTotalSize: number;
     queueActive: number;
     queuePending: number;
 }
@@ -271,9 +268,14 @@ export function buildStorageReport(data: StorageReportData): string {
         `  可　用　${formatBytes(data.diskFree)}`,
         `  ${usageBar}`,
         ``,
-        `**📁 FlClouds 文件**`,
+        `**📁 存储源文件**`,
         `  文件数　${data.fileCount} 个`,
         `  占　用　${formatBytes(data.totalFileSize)}`,
+        ``,
+        `**🖥️ 本地服务器下载文件**`,
+        `  文件数　${data.localFileCount} 个`,
+        `  占　用　${formatBytes(data.localTotalSize)}`,
+        `  位置　uploads 本地缓存/下载目录`,
         ``,
         `**📡 下载队列**`,
         `  🔄 处理中 ${data.queueActive}　⏳ 等待中 ${data.queuePending}`,

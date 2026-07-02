@@ -5,10 +5,14 @@ import { authService } from '../../services/auth';
 
 interface LoginPageProps {
     onLogin: (password: string) => Promise<{ success: boolean; error?: string; requiresTOTP?: boolean }>;
+    setupRequired?: boolean;
+    onSetup?: (webPassword: string, telegramPin: string) => Promise<{ success: boolean; error?: string }>;
 }
 
-export const LoginPage = ({ onLogin }: LoginPageProps) => {
+export const LoginPage = ({ onLogin, setupRequired = false, onSetup }: LoginPageProps) => {
     const [password, setPassword] = useState('');
+    const [confirmPassword, setConfirmPassword] = useState('');
+    const [telegramPin, setTelegramPin] = useState('');
     const [totpToken, setTotpToken] = useState('');
     const [showPassword, setShowPassword] = useState(false);
     const [loading, setLoading] = useState(false);
@@ -17,6 +21,42 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
 
     const handlePasswordSubmit = async (e: FormEvent) => {
         e.preventDefault();
+
+        if (setupRequired) {
+            if (!password || password.length < 8) {
+                setError('网页管理员密码至少需要 8 位');
+                return;
+            }
+            if (password !== confirmPassword) {
+                setError('两次输入的网页密码不一致');
+                return;
+            }
+            if (!/^\d{4}$/.test(telegramPin)) {
+                setError('Telegram Bot 密码必须是 4 位数字');
+                return;
+            }
+            if (password === telegramPin) {
+                setError('网页密码不能与 Telegram Bot 4 位密码相同');
+                return;
+            }
+            if (!onSetup) {
+                setError('初始化接口未就绪');
+                return;
+            }
+            setLoading(true);
+            setError('');
+            try {
+                const result = await onSetup(password, telegramPin);
+                if (!result.success) {
+                    setError(result.error || '初始化失败');
+                    setLoading(false);
+                }
+            } catch {
+                setError('初始化请求失败');
+                setLoading(false);
+            }
+            return;
+        }
 
         if (!password.trim()) {
             setError('请输入密码');
@@ -37,7 +77,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                 setLoading(false);
             }
             // 如果成功且不需要 TOTP，App.tsx 会处理状态跳转
-        } catch (err) {
+        } catch {
             setError('登录请求失败');
             setLoading(false);
         }
@@ -64,7 +104,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                 // 验证成功，页面会自动因为认证状态改变而卸载
                 window.location.reload(); // 简单处理，或者在 App.tsx 中通过状态流转
             }
-        } catch (err) {
+        } catch {
             setError('验证请求失败');
             setLoading(false);
         }
@@ -94,7 +134,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                     </motion.div>
                     <h1 className="text-2xl font-bold tracking-tight text-foreground">FlClouds</h1>
                     <p className="text-muted-foreground mt-1">
-                        {step === 'password' ? '请输入访问密码' : '双重身份验证'}
+                        {setupRequired ? '首次启动，请创建唯一管理员密码' : (step === 'password' ? '请输入访问密码' : '双重身份验证')}
                     </p>
                 </div>
 
@@ -123,7 +163,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                             {/* Password Input */}
                             <div className="space-y-2">
                                 <label htmlFor="password" className="text-sm font-medium text-foreground">
-                                    访问密码
+                                    {setupRequired ? '网页管理员密码' : '访问密码'}
                                 </label>
                                 <div className="relative">
                                     <input
@@ -131,7 +171,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                                         type={showPassword ? 'text' : 'password'}
                                         value={password}
                                         onChange={(e) => setPassword(e.target.value)}
-                                        placeholder="请输入密码"
+                                        placeholder={setupRequired ? '至少 8 位，建议使用强密码' : '请输入密码'}
                                         className="w-full h-12 px-4 pr-12 rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
                                         autoFocus
                                         disabled={loading}
@@ -146,6 +186,43 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                                 </div>
                             </div>
 
+                            {setupRequired && (
+                                <div className="space-y-4 mt-4">
+                                    <div className="space-y-2">
+                                        <label htmlFor="confirm-password" className="text-sm font-medium text-foreground">
+                                            确认网页密码
+                                        </label>
+                                        <input
+                                            id="confirm-password"
+                                            type={showPassword ? 'text' : 'password'}
+                                            value={confirmPassword}
+                                            onChange={(e) => setConfirmPassword(e.target.value)}
+                                            placeholder="再次输入网页管理员密码"
+                                            className="w-full h-12 px-4 rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                                            disabled={loading}
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label htmlFor="telegram-pin" className="text-sm font-medium text-foreground">
+                                            Telegram Bot 密码（4 位数字）
+                                        </label>
+                                        <input
+                                            id="telegram-pin"
+                                            type="password"
+                                            inputMode="numeric"
+                                            pattern="[0-9]*"
+                                            maxLength={4}
+                                            value={telegramPin}
+                                            onChange={(e) => setTelegramPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                                            placeholder="0000"
+                                            className="w-full h-12 px-4 rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                                            disabled={loading}
+                                        />
+                                        <p className="text-xs text-muted-foreground">首次创建后会二次加密存入数据库，不再允许无密码访问。</p>
+                                    </div>
+                                </div>
+                            )}
+
                             <motion.button
                                 type="submit"
                                 disabled={loading}
@@ -158,7 +235,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
                                 ) : (
                                     <>
                                         <LogIn className="w-5 h-5" />
-                                        <span>下一步</span>
+                                        <span>{setupRequired ? '创建管理员并进入' : '下一步'}</span>
                                     </>
                                 )}
                             </motion.button>
@@ -236,7 +313,7 @@ export const LoginPage = ({ onLogin }: LoginPageProps) => {
 
                 {/* Footer */}
                 <p className="text-center text-xs text-muted-foreground mt-6">
-                    登录状态将保留 7 天
+                    {setupRequired ? '生产环境首次访问必须先创建网页密码和 Telegram Bot 4 位密码' : '登录状态将保留 7 天'}
                 </p>
             </motion.div>
         </div>

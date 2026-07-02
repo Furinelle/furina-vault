@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, lazy, Suspense } from "react";
 import { AppLayout } from "./components/layout/AppLayout";
 import { Button } from "./components/ui/Button";
 import { FileCard } from "./components/ui/FileCard";
@@ -6,11 +6,9 @@ import { FolderCard, type FolderData } from "./components/ui/FolderCard";
 import { UploadZone } from "./components/ui/UploadZone";
 import { Search, RefreshCw, ArrowLeft, ChevronDown, ChevronRight, CheckSquare, Cloud, HardDrive, Database, Package, Network, FolderPlus } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
-import { PreviewModal } from "./components/ui/PreviewModal";
 import { BulkActionToolbar } from "./components/ui/BulkActionToolbar";
 import { useTranslation } from "react-i18next";
 import { EmptyState } from "./components/ui/EmptyState";
-import { SettingsPage } from "./components/pages/SettingsPage";
 import { LoginPage } from "./components/pages/LoginPage";
 import { ViewToggle } from "./components/ui/ViewToggle";
 import { FileMenu } from "./components/ui/FileMenu";
@@ -18,16 +16,27 @@ import { DeleteAlert } from "./components/ui/DeleteAlert";
 import { FolderPromptModal } from "./components/ui/FolderPromptModal";
 import { RenameModal } from "./components/ui/RenameModal";
 import { MoveModal } from "./components/ui/MoveModal";
-import { CreateFolderModal } from "./components/ui/CreateFolderModal";
-import { UploadQueueModal, type QueueItem } from "./components/ui/UploadQueueModal";
 import { Notification, type NotificationType } from "./components/ui/Notification";
 import { fileApi, type FileData, type StorageStats as StorageStatsType } from "./services/api";
 import { authService } from "./services/auth";
+import type { QueueItem } from "./components/ui/UploadQueueModal";
+
+const SettingsPage = lazy(() => import("./components/pages/SettingsPage").then(module => ({ default: module.SettingsPage })));
+const PreviewModal = lazy(() => import("./components/ui/PreviewModal").then(module => ({ default: module.PreviewModal })));
+const UploadQueueModal = lazy(() => import("./components/ui/UploadQueueModal").then(module => ({ default: module.UploadQueueModal })));
+const CreateFolderModal = lazy(() => import("./components/ui/CreateFolderModal").then(module => ({ default: module.CreateFolderModal })));
+
+const LazyFallback = () => (
+  <div className="flex min-h-32 items-center justify-center text-muted-foreground">
+    <RefreshCw className="h-5 w-5 animate-spin" />
+  </div>
+);
 
 function App() {
   // 认证状态
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [needsPassword, setNeedsPassword] = useState(true);
+  const [setupRequired, setSetupRequired] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
 
   const [files, setFiles] = useState<FileData[]>([]);
@@ -105,12 +114,15 @@ function App() {
   useEffect(() => {
     const checkAuth = async () => {
       try {
-        // 检查是否需要密码
-        const passwordRequired = await authService.checkPasswordRequired();
-        setNeedsPassword(passwordRequired);
+        // 检查认证/首次初始化状态
+        const authStatus = await authService.getAuthStatus();
+        setNeedsPassword(authStatus.passwordRequired);
+        setSetupRequired(authStatus.setupRequired);
 
-        if (!passwordRequired) {
-          // 不需要密码，直接进入
+        if (authStatus.setupRequired) {
+          setIsAuthenticated(false);
+        } else if (!authStatus.passwordRequired) {
+          // 不需要密码，直接进入（仅兼容历史/开发模式）
           setIsAuthenticated(true);
         } else if (authService.isAuthenticated()) {
           // 已有 token，验证是否有效
@@ -206,6 +218,16 @@ function App() {
   const handleLogin = async (password: string) => {
     const result = await authService.login(password);
     if (result.success && !result.requiresTOTP) {
+      setIsAuthenticated(true);
+    }
+    return result;
+  };
+
+  const handleInitialSetup = async (webPassword: string, telegramPin: string) => {
+    const result = await authService.setup(webPassword, telegramPin);
+    if (result.success) {
+      setSetupRequired(false);
+      setNeedsPassword(true);
       setIsAuthenticated(true);
     }
     return result;
@@ -354,46 +376,49 @@ function App() {
   };
 
   const handleConfirmDelete = async () => {
-    if (deletingFile) {
-      try {
-        await fileApi.deleteFile(deletingFile.id);
-        setFiles((prev) => prev.filter((f) => f.id !== deletingFile.id));
-        setDeletingFile(null);
-        // 刷新存储统计
-        loadStorageStats();
-      } catch (error: any) {
-        if (error.message === 'UNAUTHORIZED') {
-          authService.clearToken();
-          setIsAuthenticated(false);
-        } else {
-          console.error('删除失败:', error);
-        }
+    if (!deletingFile) return;
+    try {
+      await fileApi.deleteFile(deletingFile.id);
+      setFiles((prev) => prev.filter((f) => f.id !== deletingFile.id));
+      setDeletingFile(null);
+      setNotification({ show: true, message: '文件已删除', type: 'success' });
+      await loadStorageStats();
+    } catch (error: any) {
+      if (error.message === 'UNAUTHORIZED') {
+        authService.clearToken();
+        setIsAuthenticated(false);
+      } else {
+        console.error('删除失败:', error);
+        setNotification({ show: true, message: error.message || '删除失败', type: 'error' });
+        throw error;
       }
     }
   };
 
-  const handleBatchDelete = async () => {
-    if (selectedFileIds.length === 0 && selectedFolderNames.length === 0) return;
+  const handleBatchDelete = async (fileIds = selectedFileIds, folderNames = selectedFolderNames) => {
+    if (fileIds.length === 0 && folderNames.length === 0) return;
 
-    // 简单确认
-    if (!confirm(`确定要删除选中的 ${selectedFileIds.length + selectedFolderNames.length} 个项目吗？`)) {
+    const itemCount = fileIds.length + folderNames.length;
+    const folderHint = folderNames.length > 0 ? `
+包含 ${folderNames.length} 个文件夹，文件夹内文件也会删除。` : '';
+    if (!confirm(`确定要删除选中的 ${itemCount} 个项目吗？此操作无法撤销。${folderHint}`)) {
       return;
     }
 
     try {
-      await fileApi.batchDelete(selectedFileIds, selectedFolderNames);
-      // 刷新列表和存储统计
+      const result = await fileApi.batchDelete(fileIds, folderNames);
       await Promise.all([loadFiles(), loadStorageStats()]);
-      // 清空选择状态
       setSelectedFileIds([]);
       setSelectedFolderNames([]);
       setIsSelectionMode(false);
+      setNotification({ show: true, message: result.message || '删除完成', type: 'success' });
     } catch (error: any) {
       if (error.message === 'UNAUTHORIZED') {
         authService.clearToken();
         setIsAuthenticated(false);
       } else {
         console.error('批量删除失败:', error);
+        setNotification({ show: true, message: error.message || '批量删除失败', type: 'error' });
       }
     } finally {
       setLoading(false);
@@ -696,7 +721,7 @@ function App() {
 
   // 需要密码但未认证，显示登录页
   if (needsPassword && !isAuthenticated) {
-    return <LoginPage onLogin={handleLogin} />;
+    return <LoginPage onLogin={handleLogin} setupRequired={setupRequired} onSetup={handleInitialSetup} />;
   }
 
   return (
@@ -706,7 +731,9 @@ function App() {
 
           {/* Main Content Area */}
           {currentCategory === "settings" ? (
-            <SettingsPage storageStats={storageStats} />
+            <Suspense fallback={<LazyFallback />}>
+              <SettingsPage storageStats={storageStats} />
+            </Suspense>
           ) : (
             <>
               {/* Header Actions */}
@@ -952,11 +979,7 @@ function App() {
                                   onRename={() => setRenamingFolder(folder.name)}
                                   onToggleFavorite={() => handleToggleFolderFavorite(folder.name)}
                                   onMove={() => setMovingFolder(folder.name)}
-                                  onDelete={() => {
-                                    setSelectedFolderNames([folder.name]);
-                                    setSelectedFileIds([]);
-                                    handleBatchDelete();
-                                  }}
+                                  onDelete={() => handleBatchDelete([], [folder.name])}
                                   isSelectionMode={isSelectionMode}
                                   isSelected={selectedFolderNames.includes(folder.name)}
                                   onSelect={toggleFolderSelection}
@@ -1041,19 +1064,27 @@ function App() {
           )}
         </div>
 
-        <PreviewModal 
-    file={selectedFile} 
-    onClose={() => setSelectedFile(null)} 
-    onToggleFavorite={handleToggleFavorite}
-/>
+        <Suspense fallback={null}>
+          {selectedFile && (
+            <PreviewModal
+              file={selectedFile}
+              onClose={() => setSelectedFile(null)}
+              onToggleFavorite={handleToggleFavorite}
+            />
+          )}
+        </Suspense>
 
         {/* 这里的 isOpen 逻辑是：如果有正在上传的，或者用户没点关闭（且有内容），就显示？ */}
         {/* 现在的逻辑是：多文件触发 setIsQueueModalOpen(true)，关闭则 false。 */}
-        <UploadQueueModal
-          isOpen={isQueueModalOpen}
-          onClose={handleCloseQueue}
-          items={uploadQueue}
-        />
+        <Suspense fallback={null}>
+          {isQueueModalOpen && (
+            <UploadQueueModal
+              isOpen={isQueueModalOpen}
+              onClose={handleCloseQueue}
+              items={uploadQueue}
+            />
+          )}
+        </Suspense>
 
         <DeleteAlert
           isOpen={!!deletingFile}
@@ -1085,11 +1116,15 @@ function App() {
           onCancel={() => startUpload(pendingFiles)}
         />
 
-        <CreateFolderModal
-          isOpen={isCreateFolderModalOpen}
-          onClose={() => setIsCreateFolderModalOpen(false)}
-          onConfirm={handleCreateFolder}
-        />
+        <Suspense fallback={null}>
+          {isCreateFolderModalOpen && (
+            <CreateFolderModal
+              isOpen={isCreateFolderModalOpen}
+              onClose={() => setIsCreateFolderModalOpen(false)}
+              onConfirm={handleCreateFolder}
+            />
+          )}
+        </Suspense>
 
         <MoveModal
           isOpen={!!movingFile || !!movingFolder}

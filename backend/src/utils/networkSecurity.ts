@@ -53,3 +53,19 @@ export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
     }
     return parsed;
 }
+
+export async function assertPublicHttpsUrl(rawUrl: string): Promise<URL> {
+    const parsed = await assertPublicHttpUrl(rawUrl);
+    if (parsed.protocol !== 'https:') {
+        throw new Error('生产存储端点仅允许 https 链接');
+    }
+    return parsed;
+}
+
+export async function assertPublicStorageEndpoint(rawUrl: string): Promise<URL> {
+    const parsed = await assertPublicHttpUrl(rawUrl);
+    if (parsed.protocol !== 'https:' && process.env.ALLOW_INSECURE_STORAGE_ENDPOINTS !== 'true') {
+        throw new Error('存储端点仅允许 https；如确需 http，请显式设置 ALLOW_INSECURE_STORAGE_ENDPOINTS=true');
+    }
+    return parsed;
+}

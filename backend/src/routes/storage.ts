@@ -9,6 +9,8 @@ import axios from 'axios';
 import crypto from 'crypto';
 import { getSetting, setSetting } from '../utils/settings.js';
 import { getTelegramUserSessionFilePath, isTelegramUserClientReady } from '../services/telegramUserClient.js';
+import { assertPublicStorageEndpoint } from '../utils/networkSecurity.js';
+import { getCurrentStorageScope } from '../utils/fileScope.js';
 
 // ESM compatibility
 const checkDiskSpace = (checkDiskSpaceModule as any).default || checkDiskSpaceModule;
@@ -54,13 +56,15 @@ router.get('/stats', requireAuth, async (_req: Request, res: Response) => {
         const diskPath = os.platform() === 'win32' ? 'C:' : path.resolve(UPLOAD_DIR);
         const diskSpace = await checkDiskSpace(diskPath);
 
-        // 获取 FlClouds 使用的空间
+        // 获取当前存储范围内 FlClouds 使用的空间
+        const scope = await getCurrentStorageScope();
         const result = await query(`
-            SELECT 
+            SELECT
                 COUNT(*) as file_count,
                 COALESCE(SUM(size), 0) as total_size
             FROM files
-        `);
+            WHERE ${scope.clause}
+        `, scope.params);
 
         const flcloudsStats = result.rows[0];
 
@@ -90,15 +94,17 @@ router.get('/stats', requireAuth, async (_req: Request, res: Response) => {
 // 获取文件类型统计
 router.get('/stats/types', requireAuth, async (_req: Request, res: Response) => {
     try {
+        const scope = await getCurrentStorageScope();
         const result = await query(`
-            SELECT 
+            SELECT
                 type,
                 COUNT(*) as count,
                 COALESCE(SUM(size), 0) as total_size
             FROM files
+            WHERE ${scope.clause}
             GROUP BY type
             ORDER BY total_size DESC
-        `);
+        `, scope.params);
 
         const stats = result.rows.map(row => ({
             type: row.type,
@@ -206,7 +212,7 @@ router.get('/onedrive/callback', async (req: Request, res: Response) => {
         const { code, state, error, error_description } = req.query;
 
         if (error) {
-            return res.send(`授权失败: ${error_description || error}`);
+            return res.type('text/plain').send(`授权失败: ${String(error_description || error)}`);
         }
 
         if (!code) {
@@ -258,7 +264,7 @@ router.get('/onedrive/callback', async (req: Request, res: Response) => {
                 return res.status(400).send('授权失败：Microsoft 返回 AADSTS7000215，Client Secret 无效。请在 Azure/Entra「证书和密码」中新建客户端密码，并复制“值 Value”（不是“机密 ID/Secret ID”）后重新授权。');
             }
 
-            return res.status(err.response?.status || 400).send(`授权失败：${errorDescription}`);
+            return res.status(err.response?.status || 400).type('text/plain').send(`授权失败：${String(errorDescription)}`);
         }
 
         // 尝试获取账户名称（可选，如果缺少 User.Read 权限则跳过）
@@ -353,7 +359,7 @@ router.get('/google-drive/callback', async (req: Request, res: Response) => {
         const { code, state, error } = req.query;
 
         if (error) {
-            return res.send(`授权失败: ${error}`);
+            return res.type('text/plain').send(`授权失败: ${String(error)}`);
         }
 
         if (!code) {
@@ -399,7 +405,8 @@ router.get('/google-drive/callback', async (req: Request, res: Response) => {
                 <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
                     <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
                         <h2 style="color: #16a34a; margin-bottom: 10px;">🎉 授权成功！</h2>
-                        <p style="color: #15803d; margin-bottom: 20px;">Google Drive 已成功连接并启用。</p>
+                        <p style="color: #15803d; margin-bottom: 8px;">Google Drive 已成功连接并启用。</p>
+                        <p style="color: #166534; font-size: 14px; margin-bottom: 20px;">窗口将自动关闭。如果未关闭，请手动关闭，主页面会自动刷新账户列表。</p>
                         <button onclick="window.close()" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">关闭此窗口</button>
                         <script>
                             const notifyParent = () => {
@@ -470,6 +477,8 @@ router.post('/config/s3', requireAuth, async (req: Request, res: Response) => {
             return res.status(400).json({ error: '缺少必要参数' });
         }
 
+        await assertPublicStorageEndpoint(endpoint);
+
         const { storageManager } = await import('../services/storage.js');
         const accountId = await storageManager.addS3Account(name, endpoint, region, accessKeyId, accessKeySecret, bucket, forcePathStyle || false);
 
@@ -488,6 +497,8 @@ router.post('/config/webdav', requireAuth, async (req: Request, res: Response) =
         if (!name || !url) {
             return res.status(400).json({ error: '缺少必要参数 (名称和 URL)' });
         }
+
+        await assertPublicStorageEndpoint(url);
 
         const { storageManager } = await import('../services/storage.js');
         const accountId = await storageManager.addWebDAVAccount(name, url, username, password);
@@ -563,8 +574,9 @@ router.delete('/accounts/:id', requireAuth, async (req: Request, res: Response) 
         const accountName = accountRes.rows[0].name;
         const accountType = accountRes.rows[0].type;
 
-        // 删除该账户关联的文件记录
-        await query('UPDATE files SET storage_account_id = NULL WHERE storage_account_id = $1', [id]);
+        // 删除该账户关联的 FlClouds 文件索引。不要把外部文件记录置 NULL，避免变成“本地/空账户”幽灵文件。
+        // 这里只清理数据库索引，不删除云端原文件；如需删除云端文件，应另做高危二次确认流程。
+        const fileRes = await query('DELETE FROM files WHERE storage_account_id = $1', [id]);
 
         // 删除账户
         await query('DELETE FROM storage_accounts WHERE id = $1', [id]);
@@ -573,7 +585,7 @@ router.delete('/accounts/:id', requireAuth, async (req: Request, res: Response) 
         storageManager.removeProvider(`${accountType}:${id}`);
 
         console.log(`[Storage] Account deleted: ${accountName} (${id})`);
-        res.json({ success: true, message: `已删除账户: ${accountName}` });
+        res.json({ success: true, message: `已删除账户: ${accountName}，已清理 ${fileRes.rowCount || 0} 条关联文件索引` });
     } catch (error) {
         console.error('删除账户失败:', error);
         res.status(500).json({ error: '删除账户失败' });

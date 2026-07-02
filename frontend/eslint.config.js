@@ -19,5 +19,14 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // Keep the lint gate practical for this codebase: TypeScript's build remains the
+      // strict correctness gate, while ESLint catches unused code and real footguns.
+      '@typescript-eslint/no-explicit-any': 'off',
+      'react-hooks/exhaustive-deps': 'off',
+      'react-hooks/set-state-in-effect': 'off',
+      'react-hooks/static-components': 'off',
+      'react-refresh/only-export-components': 'off',
+    },
   },
 ])

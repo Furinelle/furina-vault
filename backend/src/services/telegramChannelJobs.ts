@@ -3,10 +3,46 @@ import { query } from '../db/index.js';
 import { storageManager } from './storage.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
 import { downloadTelegramChannelRange, getTelegramDownloadPreview } from './telegramUpload.js';
+import { getSetting } from '../utils/settings.js';
 
 const SUBSCRIPTION_INTERVAL_MS = Math.max(60_000, parseInt(process.env.TELEGRAM_SUBSCRIPTION_INTERVAL_MS || '300000', 10) || 300_000);
 const SUBSCRIPTION_SCAN_LIMIT = Math.max(1, parseInt(process.env.TELEGRAM_SUBSCRIPTION_SCAN_LIMIT || '100', 10) || 100);
 let subscriptionTimer: NodeJS.Timeout | null = null;
+
+function parseTelegramSourceAllowlist(raw: string | undefined): string[] {
+    return (raw || '')
+        .split(',')
+        .map(item => item.trim())
+        .filter(Boolean)
+        .map(item => normalizeSource(item).toLowerCase());
+}
+
+async function getTelegramSourceAllowlist(): Promise<string[]> {
+    const envList = parseTelegramSourceAllowlist(process.env.TELEGRAM_ALLOWED_SOURCES || process.env.TELEGRAM_SOURCE_ALLOWLIST || '');
+    if (envList.length > 0) return envList;
+    const stored = await getSetting<string>('telegram_allowed_sources', '');
+    return parseTelegramSourceAllowlist(stored || '');
+}
+
+async function assertTelegramSourceAllowed(source: string): Promise<void> {
+    const normalized = normalizeSource(source).toLowerCase();
+    const allowlist = await getTelegramSourceAllowlist();
+    if (allowlist.length === 0) {
+        // Empty allowlist keeps compatibility for public @usernames/links, but refuses numeric/private peers.
+        if (/^-?\d+$/.test(normalized)) {
+            throw new Error('未配置 Telegram 来源白名单，禁止使用数字 ID/私聊/私密群组来源。请配置 TELEGRAM_ALLOWED_SOURCES。');
+        }
+        return;
+    }
+    if (!allowlist.includes(normalized)) {
+        throw new Error(`来源 ${source} 不在 Telegram 下载白名单中`);
+    }
+}
+
+function maxProcessedMessageId(result: { successfulMessageIds: number[]; skippedMessageIds: number[] }): number {
+    return Math.max(0, ...result.successfulMessageIds, ...result.skippedMessageIds);
+}
+
 
 function requireUserClient(): TelegramClient {
     const userClient = getTelegramUserClient();
@@ -157,27 +193,28 @@ async function updateJob(jobId: string, updates: Record<string, unknown>) {
     await query(`UPDATE telegram_background_jobs SET ${setSql}, updated_at = NOW() WHERE id = $1`, [jobId, ...entries.map(([, value]) => value)]);
 }
 
-export async function subscribeTelegramChannel(userId: number, chatId: string | undefined, sourceInput: string) {
+export async function subscribeTelegramChannel(userId: number, chatId: string | undefined, sourceInput: string, folderOverride?: string | null) {
     const userClient = requireUserClient();
     const source = normalizeSource(sourceInput);
+    await assertTelegramSourceAllowed(source);
     const entity: any = await userClient.getEntity(source as any);
     const latestMessageId = await getLatestMessageId(userClient, source);
     const title = getEntityTitle(entity, source);
 
     const result = await query(
-        `INSERT INTO telegram_channel_subscriptions (user_id, chat_id, source, title, last_message_id, enabled)
-         VALUES ($1, $2, $3, $4, $5, true)
+        `INSERT INTO telegram_channel_subscriptions (user_id, chat_id, source, title, last_message_id, folder_override, enabled)
+         VALUES ($1, $2, $3, $4, $5, $6, true)
          ON CONFLICT (user_id, source)
-         DO UPDATE SET chat_id = EXCLUDED.chat_id, title = EXCLUDED.title, enabled = true, updated_at = NOW()
-         RETURNING id, source, title, last_message_id, enabled`,
-        [userId, chatId || null, source, title, latestMessageId]
+         DO UPDATE SET chat_id = EXCLUDED.chat_id, title = EXCLUDED.title, folder_override = EXCLUDED.folder_override, enabled = true, updated_at = NOW()
+         RETURNING id, source, title, last_message_id, folder_override, enabled`,
+        [userId, chatId || null, source, title, latestMessageId, folderOverride || null]
     );
     return result.rows[0];
 }
 
 export async function listTelegramSubscriptions(userId: number, includeDisabled = false) {
     const result = await query(
-        `SELECT id, source, title, last_message_id, enabled, updated_at
+        `SELECT id, source, title, last_message_id, folder_override, enabled, updated_at
          FROM telegram_channel_subscriptions
          WHERE user_id = $1
            AND ($2::boolean OR enabled = true)
@@ -185,6 +222,18 @@ export async function listTelegramSubscriptions(userId: number, includeDisabled 
         [userId, includeDisabled]
     );
     return result.rows;
+}
+
+export async function updateTelegramSubscriptionFolder(userId: number, selector: string, folderOverride: string | null) {
+    const trimmed = selector.trim();
+    const result = await query(
+        `UPDATE telegram_channel_subscriptions
+         SET folder_override = $2, updated_at = NOW()
+         WHERE user_id = $1 AND id::text LIKE $3 AND enabled = true
+         RETURNING id, source, title, last_message_id, folder_override, enabled`,
+        [userId, folderOverride || null, `${trimmed}%`]
+    );
+    return result.rows[0] || null;
 }
 
 export async function unsubscribeTelegramChannel(userId: number, selector: string) {
@@ -202,9 +251,10 @@ export async function unsubscribeTelegramChannel(userId: number, selector: strin
     return result.rows[0] || null;
 }
 
-export async function enqueueTelegramDateDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, startDateText: string, endDateText: string) {
+export async function enqueueTelegramDateDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, startDateText: string, endDateText: string, folderOverride?: string | null) {
     const userClient = requireUserClient();
     const source = normalizeSource(sourceInput);
+    await assertTelegramSourceAllowed(source);
     const startDate = parseDateOnly(startDateText);
     const endDate = parseDateOnly(endDateText, true);
     if (startDate > endDate) throw new Error('开始日期不能晚于结束日期');
@@ -212,12 +262,12 @@ export async function enqueueTelegramDateDownload(botClient: TelegramClient, req
     const baseMessages = await getMessagesByDateRange(userClient, source, startDate, endDate);
     const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
     const messageIds = messages.map(message => message.id);
-    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, { startDate: startDateText, endDate: endDateText, messageIds });
+    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, { startDate: startDateText, endDate: endDateText, messageIds, folderOverride: folderOverride || null });
     await persistDownloadItems(jobId, source, messages);
     await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: messages.length });
 
     try {
-        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id));
+        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id), folderOverride);
         await updateDownloadItemsStatus(jobId, result.successfulMessageIds, 'success');
         await updateDownloadItemsStatus(jobId, result.failedMessageIds, 'failed', '下载失败');
         await updateDownloadItemsStatus(jobId, result.skippedMessageIds, 'skipped');
@@ -259,20 +309,21 @@ async function getMessagesByHashtag(userClient: TelegramClient, source: string, 
     return result.sort((a, b) => a.id - b.id);
 }
 
-export async function enqueueTelegramTagDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, tagInput: string) {
+export async function enqueueTelegramTagDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, tagInput: string, folderOverride?: string | null) {
     const userClient = requireUserClient();
     const source = normalizeSource(sourceInput);
+    await assertTelegramSourceAllowed(source);
     const tag = normalizeHashtag(tagInput);
 
     const baseMessages = await getMessagesByHashtag(userClient, source, tag);
     const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
     const messageIds = messages.map(message => message.id);
-    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, { tag, messageIds });
+    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, { tag, messageIds, folderOverride: folderOverride || null });
     await persistDownloadItems(jobId, source, messages);
     await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: messages.length });
 
     try {
-        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id));
+        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id), folderOverride);
         await updateDownloadItemsStatus(jobId, result.successfulMessageIds, 'success');
         await updateDownloadItemsStatus(jobId, result.failedMessageIds, 'failed', '下载失败');
         await updateDownloadItemsStatus(jobId, result.skippedMessageIds, 'skipped');
@@ -307,7 +358,7 @@ async function runSubscriptionScan(botClient: TelegramClient) {
     if (!userClient || !isTelegramUserClientReady()) return;
 
     const result = await query(
-        `SELECT id, user_id, chat_id, source, last_message_id
+        `SELECT id, user_id, chat_id, source, last_message_id, folder_override
          FROM telegram_channel_subscriptions
          WHERE enabled = true
          ORDER BY updated_at ASC`
@@ -315,6 +366,7 @@ async function runSubscriptionScan(botClient: TelegramClient) {
 
     for (const row of result.rows) {
         try {
+            await assertTelegramSourceAllowed(row.source);
             const latestMessageId = await getLatestMessageId(userClient, row.source);
             const lastMessageId = Number(row.last_message_id || 0);
             if (!latestMessageId || latestMessageId <= lastMessageId) continue;
@@ -328,7 +380,7 @@ async function runSubscriptionScan(botClient: TelegramClient) {
 
             const targetChat = row.chat_id || row.user_id;
             const requestMessage = ({ chatId: targetChat, id: latestMessageId } as unknown) as Api.Message;
-            const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, 'newer', ids);
+            const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, 'newer', ids, row.folder_override || null);
             await updateDownloadItemsStatus(jobId, downloadResult.successfulMessageIds, 'success');
             await updateDownloadItemsStatus(jobId, downloadResult.failedMessageIds, 'failed', '下载失败');
             await updateDownloadItemsStatus(jobId, downloadResult.skippedMessageIds, 'skipped');
@@ -339,9 +391,11 @@ async function runSubscriptionScan(botClient: TelegramClient) {
                 error: downloadResult.failed > 0 ? `${downloadResult.failed} 个文件下载失败` : null,
                 finished_at: new Date(),
             });
-            await query('UPDATE telegram_channel_subscriptions SET last_message_id = $1, updated_at = NOW() WHERE id = $2', [latestMessageId, row.id]);
+            const scannedMaxId = ids.length > 0 ? ids[ids.length - 1] : lastMessageId;
+            const safeAdvanceId = downloadResult.failed > 0 ? Math.max(lastMessageId, maxProcessedMessageId(downloadResult)) : scannedMaxId;
+            await query('UPDATE telegram_channel_subscriptions SET last_message_id = $1, updated_at = NOW() WHERE id = $2', [safeAdvanceId, row.id]);
             if (downloadResult.found > 0) {
-                await botClient.sendMessage(targetChat, { message: `✅ 订阅 ${row.source} 已同步 ${downloadResult.found} 个新文件，跳过 ${downloadResult.skipped} 条。` }).catch(() => undefined);
+                await botClient.sendMessage(targetChat, { message: `✅ 订阅 ${row.source} 已同步 ${downloadResult.found} 个新文件，跳过 ${downloadResult.skipped} 条${downloadResult.failed ? `，失败 ${downloadResult.failed} 条` : ''}${safeAdvanceId < latestMessageId ? '。本轮达到扫描上限或存在失败项，剩余将在后续继续处理。' : '。'}` }).catch(() => undefined);
             }
         } catch (error) {
             console.error('🤖 Telegram 订阅同步失败:', error);

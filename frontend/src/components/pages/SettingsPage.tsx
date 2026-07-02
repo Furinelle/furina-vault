@@ -273,7 +273,7 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
     };
 
     const handleDeleteAccount = async (accountId: string, accountName: string) => {
-        if (!window.confirm(`确定要删除账户 "${accountName}" 吗？\n\n该账户中已上传的文件记录会保留，但将不再关联到任何账户。`)) return;
+        if (!window.confirm(`确定要删除账户 "${accountName}" 吗？\n\n将删除该账户在 FlClouds 中的文件索引记录，但不会删除云端原文件。`)) return;
         try {
             const result = await fileApi.deleteAccount(accountId);
             alert(result.message);

@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS files (
     height INT,
     source VARCHAR(50) DEFAULT 'web',
     folder VARCHAR(255),
-    storage_account_id UUID REFERENCES storage_accounts(id),
+    storage_account_id UUID REFERENCES storage_accounts(id) ON DELETE CASCADE,
     is_favorite BOOLEAN DEFAULT false,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS telegram_channel_subscriptions (
     source TEXT NOT NULL,
     title TEXT,
     last_message_id INT DEFAULT 0,
+    folder_override TEXT,
     enabled BOOLEAN DEFAULT true,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS telegram_channel_subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_tg_channel_subscriptions_enabled ON telegram_channel_subscriptions(enabled);
 CREATE INDEX IF NOT EXISTS idx_tg_channel_subscriptions_user_id ON telegram_channel_subscriptions(user_id);
+ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS folder_override TEXT;
 
 CREATE OR REPLACE TRIGGER telegram_channel_subscriptions_updated_at
     BEFORE UPDATE ON telegram_channel_subscriptions

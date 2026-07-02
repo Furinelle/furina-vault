@@ -55,14 +55,26 @@ app.use(cors({
             if (!origin || allowedOrigins.includes(origin)) {
                 return callback(null, true);
             }
-            return callback(new Error(`CORS origin not allowed: ${origin}`));
+            return callback(null, false);
         },
-    credentials: true,
+    credentials: !allowAnyOrigin,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'X-API-Key', 'X-Upload-Id', 'X-Chunk-Index', 'Authorization'],
 }));
 
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '2mb' }));
+
+// Browser-side CSRF/origin guard for state-changing requests. Non-browser API clients
+// often omit Origin; those requests still require normal authentication/API keys.
+app.use((req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    const origin = req.headers.origin;
+    if (!origin) return next();
+    if (!allowAnyOrigin && !allowedOrigins.includes(origin)) {
+        return res.status(403).json({ error: 'Origin not allowed' });
+    }
+    next();
+});
 
 // 安全头部
 app.use(helmet({
