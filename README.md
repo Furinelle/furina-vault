@@ -13,8 +13,23 @@
 </p>
 
 <p align="center">
-  <strong>FlClouds</strong> 是一款面向个人和小团队的 Telegram 转存与私有云存储系统，支持频道/群组媒体转存、账号级 Telegram 下载、按日期抓取、订阅同步、自动按来源与文件类型归档，并提供 Web 管理、图片/视频预览和大文件上传能力。
+  <strong>FlClouds</strong> 是面向个人和小团队的 Telegram 转存与私有云存储系统。它提供 Web 文件管理、Telegram Bot 上传、yt-dlp 链接下载、频道/群组媒体转存、订阅同步、自动归档和多存储源接入。
 </p>
+
+---
+
+## ✨ 功能概览
+
+| 模块 | 能力 |
+| :--- | :--- |
+| Web 管理 | 文件上传、分片大文件上传、文件夹、预览、删除、存储源管理 |
+| 存储源 | 本地、OneDrive、Google Drive、阿里云 OSS、S3 兼容存储、WebDAV |
+| Telegram Bot 基础能力 | 私聊发文件转存、任务队列、存储统计、删除文件、yt-dlp 下载 |
+| Telegram 账号级下载器 | 频道/群组按日期或标签批量抓取、订阅同步、大文件更稳定下载 |
+| 自动归档 | 默认按来源/频道和文件类型保存，例如 `telegram/channel/images/file.jpg` |
+| 安全 | 首次初始化管理员、HttpOnly Cookie、Origin 校验、签名 URL、TOTP 双重验证 |
+
+> **账号级下载器不是 Bot 基础功能的前提。** 不生成用户账号 session 时，Bot 仍可收文件、管理任务、查看统计、删除文件和运行 `/ytdlp`；只有频道/群组批量抓取、订阅同步、以及突破 Bot 限制的大文件下载需要账号级下载器。
 
 ---
 
@@ -34,15 +49,11 @@ cp .env.example .env
 vi .env
 ```
 
-至少建议先填写：
-
 | 使用场景 | 需要填写/执行 |
 | :--- | :--- |
 | 基础 Web 部署 | `DB_PASSWORD`、`VITE_API_URL`、`CORS_ORIGIN`、`DOMAIN` |
 | 启用 Telegram Bot 基础能力 | 额外填写 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_API_ID`、`TELEGRAM_API_HASH` |
 | 启用账号级 Telegram 下载器 | 在 Bot 基础配置之后，运行登录脚本生成 `TELEGRAM_USER_SESSION_FILE` |
-
-> Bot 基础能力包括：收文件、任务管理、存储统计、删除文件、yt-dlp 下载等。账号级下载器主要用于频道/群组批量抓取、订阅同步和超过 Bot 限制的大文件下载。
 
 ### 3. 构建前端
 
@@ -67,19 +78,13 @@ docker build -t flclouds-backend:latest ./backend
 
 ### 5. 生成用户账号 session（可选）
 
-如果你要启用账号级 Telegram 下载器，请在启动服务前生成 session。该命令会使用 `docker-compose.yml` 中的 `/data` 持久化卷，默认写入 `.env` 里的 `TELEGRAM_USER_SESSION_FILE` 路径。
+仅在需要账号级 Telegram 下载器时执行。该命令会使用 `docker-compose.yml` 中的 `/data` 持久化卷，默认写入 `.env` 里的 `TELEGRAM_USER_SESSION_FILE` 路径。
 
 ```bash
 docker compose run --rm --no-deps backend npm run login:telegram-user
 ```
 
-按提示登录 Telegram 后，确认 `.env` 中包含：
-
-```env
-TELEGRAM_USER_SESSION_FILE=/data/telegram_user_session.txt
-```
-
-如果暂时不使用账号级下载器，可以跳过这一步。
+如果暂时只用 Bot 基础能力，可以跳过这一步。
 
 ### 6. 启动服务
 
@@ -94,30 +99,58 @@ docker compose up -d
 
 ## 🛠️ 环境变量配置
 
-| 变量名 | 说明 | 示例 | 获取说明 |
-| :--- | :--- | :--- | :--- |
-| `VITE_API_URL` | 前端访问后端的地址，必须包含协议 | `https://api.yourdomain.com` | 你的后端反代公网地址，例如 Nginx/Caddy 指向宿主机 `51947` |
-| `DB_PASSWORD` | PostgreSQL 数据库密码 | `change_me_to_a_strong_password` | 自行生成强密码，首次部署前写入 `.env` |
-| `CORS_ORIGIN` | 允许跨域的前端来源 | `https://cloud.yourdomain.com` | 你的前端网页公网地址，例如 Nginx/Caddy 指向宿主机 `47832` |
-| `DOMAIN` | 应用主域名，不带协议 | `cloud.yourdomain.com` | 填前端主域名，用于生成链接和展示 |
-| `TELEGRAM_BOT_TOKEN` | 可选，Telegram Bot Token；启用 Bot 基础能力时填写 | `123456:ABC-DEF...` | 找 [@BotFather](https://t.me/BotFather) 创建机器人后获取 |
-| `TELEGRAM_API_ID` | 可选，Telegram API ID；Bot 和账号级下载器共用 | `123456` | 登录 [my.telegram.org](https://my.telegram.org) 创建应用后获取 |
-| `TELEGRAM_API_HASH` | 可选，Telegram API Hash；Bot 和账号级下载器共用 | `abcdef123456...` | 与 `TELEGRAM_API_ID` 在同一页面获取 |
-| `TELEGRAM_USER_SESSION_FILE` | 可选，用户账号 session 文件路径；不生成 session 时 Bot 基础功能仍可用 | `/data/telegram_user_session.txt` | 仅在需要频道/群组批量抓取、订阅同步或突破 Bot 大文件限制时，运行 `docker compose run --rm --no-deps backend npm run login:telegram-user` 生成 |
-| `TELEGRAM_DOWNLOAD_WORKERS` | 可选，Telegram 并发分片请求数，建议 4-8 | `4` | 主要影响 Telegram 文件下载速度；调太高可能触发限流 |
-| `DUPLICATE_FILE_MODE` | 可选，重复文件处理策略 | `copy` | `copy` 生成副本，`skip` 跳过同名同目录同大小文件；也可用 `/duplicate_mode` 调整 |
-| `AUTO_CLEANUP_ORPHANS` | 可选，是否自动清理本地孤儿文件 | `true` | 只扫描本地 `UPLOAD_DIR`，不清理第三方云存储；可用 `/cleanup_settings` 关闭 |
-| `YTDLP_BIN` | 可选，yt-dlp 可执行文件路径 | `yt-dlp` | 镜像内默认已安装；只有自定义环境找不到命令时才需要改 |
-| `YTDLP_WORK_DIR` | 可选，yt-dlp 下载临时目录 | `./data/uploads/ytdlp` | 默认即可；需要独立磁盘目录时再改 |
-| `YTDLP_MAX_CONCURRENT` | 可选，yt-dlp 并发任务数 | `1` | 按服务器 CPU、带宽和目标站点限速情况调整 |
-| `TELEGRAM_RATE_WINDOW_MS` / `TELEGRAM_RATE_MAX` | 可选，Telegram Bot 普通消息限流窗口/次数 | `60000` / `30` | 防止单用户刷命令压垮服务 |
-| `TELEGRAM_HEAVY_RATE_WINDOW_MS` / `TELEGRAM_HEAVY_RATE_MAX` | 可选，Telegram Bot 重型命令限流窗口/次数 | `600000` / `5` | 作用于 `/ytdlp`、`/tg_date`、`/tg_tag`、`/cleanup_settings` |
+### 必填项
+
+| 变量名 | 说明 | 示例 |
+| :--- | :--- | :--- |
+| `DB_PASSWORD` | PostgreSQL 数据库密码 | `change_me_to_a_strong_password` |
+| `VITE_API_URL` | 前端访问后端的公网 API 地址，必须包含协议 | `https://api.yourdomain.com` |
+| `CORS_ORIGIN` | 允许跨域的前端来源 | `https://cloud.yourdomain.com` |
+| `DOMAIN` | 应用主域名，不带协议 | `cloud.yourdomain.com` |
+
+### Telegram 相关
+
+| 变量名 | 什么时候需要 | 说明 |
+| :--- | :--- | :--- |
+| `TELEGRAM_BOT_TOKEN` | 启用 Bot 基础能力 | 从 [@BotFather](https://t.me/BotFather) 获取 |
+| `TELEGRAM_API_ID` | 启用 Bot 或账号级下载器 | 从 [my.telegram.org](https://my.telegram.org) 获取；Bot 与账号级下载器共用 |
+| `TELEGRAM_API_HASH` | 启用 Bot 或账号级下载器 | 与 `TELEGRAM_API_ID` 同页获取；Bot 与账号级下载器共用这一组 API 配置 |
+| `TELEGRAM_USER_SESSION_FILE` | 可选，启用账号级下载器 | 默认 `/data/telegram_user_session.txt`；运行登录脚本生成 |
+| `TELEGRAM_DOWNLOAD_WORKERS` | 可选，调 Telegram 下载并发 | 默认 `4`，建议 `4` 或 `8`；`12/16` 更激进，可能触发限流 |
+
+### 常用可选项
+
+| 变量名 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `PORT` | `51947` | 后端监听端口 |
+| `UPLOAD_DIR` | `/data/uploads` | 文件保存根目录（容器内路径） |
+| `THUMBNAIL_DIR` | `/data/thumbnails` | 缩略图目录 |
+| `CHUNK_DIR` | `/data/chunks` | 分片上传缓存目录 |
+| `DUPLICATE_FILE_MODE` | `copy` | 重复文件策略：`copy` 生成副本，`skip` 跳过同名同目录同大小文件 |
+| `AUTO_CLEANUP_ORPHANS` | `true` | 是否自动清理本地 uploads 中未登记到数据库的孤儿文件 |
+| `YTDLP_BIN` | `yt-dlp` | yt-dlp 可执行文件路径 |
+| `YTDLP_WORK_DIR` | `./data/uploads/ytdlp` | yt-dlp 下载临时目录 |
+| `YTDLP_MAX_CONCURRENT` | `1` | yt-dlp 并发任务数 |
+
+### 限流与安全项
+
+| 变量名 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `TELEGRAM_RATE_WINDOW_MS` / `TELEGRAM_RATE_MAX` | `60000` / `30` | Bot 普通消息限流：默认每分钟 30 次 |
+| `TELEGRAM_HEAVY_RATE_WINDOW_MS` / `TELEGRAM_HEAVY_RATE_MAX` | `600000` / `5` | Bot 重型命令限流：默认每 10 分钟 5 次 |
+| `TRUST_PROXY` | `loopback` | Express 反代信任范围；本机 Nginx/Caddy 反代推荐保持默认 |
+| `COOKIE_SECURE` | `true` | 登录 Cookie 仅通过 HTTPS 发送；本地 HTTP 调试可临时设为 `false` |
+| `JSON_BODY_LIMIT` | `2mb` | 普通 JSON API 请求体大小限制，不是文件大小限制 |
+| `MAX_UPLOAD_CHUNK_MB` | `64` | Web 分片上传单片最大 MB |
+| `MAX_UPLOAD_SESSIONS` | `200` | 同时存在的上传会话上限 |
+| `MAX_TOTAL_CHUNKS` | `50000` | 单个上传任务允许的最大分片数 |
+| `ORPHAN_CLEANUP_MIN_AGE_MS` | `600000` | 本地孤儿文件清理保护期，默认 10 分钟内不清理 |
 
 ---
 
-## 🤖 Telegram Bot 配置指南
+## 🤖 Telegram 配置与能力
 
-集成 Telegram Bot 后，你可以通过聊天窗口上传文件、查看任务、删除文件、查看存储统计、调用 yt-dlp 下载视频链接。
+### Bot 与账号级下载器的区别
 
 | 能力 | 只启用 Bot | 额外启用账号级下载器 |
 | :--- | :---: | :---: |
@@ -128,92 +161,98 @@ docker compose up -d
 | 频道订阅自动同步 | ❌ | ✅ |
 | 超过 Bot 限制的大文件下载 | 可能失败 | 更稳定 |
 
-账号级下载器不是 Bot 基础功能的前提；它只在需要用户账号可见性的频道/群组媒体、订阅同步或大文件下载时使用。
-
-### 1. 获取 Bot Token
+### 获取 Bot Token
 
 1. 在 Telegram 中搜索 [@BotFather](https://t.me/BotFather) 并开始对话。
 2. 发送 `/newbot`，按提示创建机器人。
 3. 复制 BotFather 返回的 `HTTP API TOKEN`。
 4. 写入 `.env` 的 `TELEGRAM_BOT_TOKEN`。
 
-### 2. 获取 API ID 和 API Hash
+### 获取 API ID 和 API Hash
 
 1. 访问 [my.telegram.org](https://my.telegram.org) 并登录 Telegram 账号。
 2. 进入 `API development tools`。
 3. 创建应用后复制 `api_id` 和 `api_hash`。
 4. 写入 `.env` 的 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`。
-5. 如果启用账号级下载器，继续运行 `docker compose run --rm --no-deps backend npm run login:telegram-user` 生成用户账号 session；它会复用同一组 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`。
+5. 如果启用账号级下载器，继续运行 `docker compose run --rm --no-deps backend npm run login:telegram-user` 生成用户账号 session。
 
-### 3. 账号级下载器什么时候需要？
+### 账号级下载器什么时候需要？
 
-账号级下载器会用你登录的 Telegram 用户账号读取媒体。**不生成 session 时，Bot 基础能力仍然可用**；只有下面这些场景建议启用：
+账号级下载器会用你登录的 Telegram 用户账号读取媒体。只有下面这些场景建议启用：
 
 - 频道/群组转存：用户账号需要加入对应频道/群组，并确保能看到历史媒体。
-- 按日期/标签批量抓取：`/tg_date`、`/tg_preview_date`、`/tg_download` 依赖用户账号访问来源消息。
+- 按日期/标签批量抓取：`/tg_download date`、`/tg_download tag` 依赖用户账号访问来源消息。
 - 频道订阅同步：`/tg_sub` 后台扫描依赖用户账号读取频道/群组新消息。
 - 大文件下载：Bot 直接下载受 Telegram Bot 限制影响，账号级下载器通常更稳定。
 
-私聊发普通文件给 Bot、任务管理、存储统计、删除文件、`/ytdlp` 不依赖账号级下载器。
-
-> 不再提供桥接群/频道自动转发配置，避免额外权限和隐私复杂度。
-
-### 4. Telegram 并发下载调参
+### Telegram 并发下载调参
 
 `TELEGRAM_DOWNLOAD_WORKERS` 控制并发分片请求数，默认 `4`。
 
 - `4`：默认推荐，稳定优先
-- `8`：更均衡，适合日常大文件
+- `8`：速度与稳定性均衡
 - `12` / `16`：激进模式，需要二次确认，可能更容易遇到 Telegram 限流、断流或账号风险
 
 > Telegram 单次 `upload.getFile` 请求最大约 512KB。这里调的是并发分片数，不是单请求大小。
 
 ---
 
-## 🤖 Telegram Bot 可用命令
+## 🧭 Telegram Bot 命令
 
-| 命令 | 描述 |
+### 基础命令
+
+| 命令 | 说明 | 依赖账号级下载器 |
+| :--- | :--- | :---: |
+| `/start` | 身份认证 / 开始使用 | 否 |
+| `/help` | 查看 Bot 内置帮助 | 否 |
+| `/setup_2fa` | 配置双重验证 (TOTP) | 否 |
+| `/storage` | 查看存储统计，可清理本地文件 | 否 |
+| `/tasks` | 查看实时传输任务队列 | 否 |
+| `/task_pause [任务ID]` | 暂停全局队列或指定任务卡的新下载 | 否 |
+| `/task_resume [任务ID]` | 继续全局队列或指定任务卡 | 否 |
+| `/task_cancel <任务ID或all>` | 取消匹配任务 | 否 |
+| `/stop_tasks` | 停止所有下载任务；别名 `/stop`、`/cancel_tasks` | 否 |
+| `/download_workers` | 设置 Telegram 下载并发；别名 `/workers` | 否 |
+| `/duplicate_mode` | 设置重复文件处理；别名 `/duplicate`、`/dup` | 否 |
+| `/cleanup_settings` | 设置本地孤儿文件自动清理开关；别名 `/cleanup` | 否 |
+| `/ytdlp <url>` | 解析并下载视频链接到当前存储源 | 否 |
+| `/delete <ID或序号>` | 删除指定文件 | 否 |
+
+### 保存位置命令
+
+| 命令 | 说明 |
 | :--- | :--- |
-| `/start` | 验证身份并开始使用 Bot |
-| `/help` | 获取详细帮助信息与使用说明 |
-| `/setup_2fa` | 配置或准备双重验证 (TOTP) |
-| `/storage` | 查看当前服务器磁盘与存储统计 |
-| `/list` | 查看最近上传的文件列表 |
-| `/tasks` | 查看当前传输任务队列和下载进度 |
-| `/stop_tasks` | 强制停止所有下载任务 |
-| `/download_workers` | 打开并发下载调参面板 (4 / 8 / 12 / 16) |
-| `/duplicate_mode` | 设置重复文件跳过或生成副本 |
-| `/cleanup_settings` | 设置自动清理开关，本地存储用户可关闭以防默认删除文件 |
-| `/tg_date` | 按日期向导抓取 Telegram 频道/群组媒体，需要账号级下载器 |
-| `/tg_preview_date` | 预览指定日期范围内可下载的 Telegram 媒体，需要账号级下载器 |
-| `/tg_sub` | 管理 Telegram 频道订阅，支持查看、添加和取消订阅，需要账号级下载器 |
-| `/delete <ID>` | 删除指定文件，支持 ID 前缀 |
-| `/ytdlp <url>` | 解析视频链接并下载到当前存储源 |
+| `/path_rules` | 打开保存位置 / 自定义目录面板；别名 `/path`、`/save_rules` |
+| `/p <目录>` | 仅下一次下载保存到指定目录 |
+| `/ps <目录>` | 当前会话持续保存到指定目录 |
+| `/pc` | 清除下一次 / 本会话自定义目录 |
 
-> [!TIP]
+默认未设置自定义目录时，文件会自动按来源/频道和文件类型归档；设置自定义目录后，文件直接保存到指定目录，不再追加频道名或类型目录。
+
+### 频道/群组转存与订阅命令
+
+这些命令需要账号级 Telegram 下载器：
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `/tg_download` | 打开按日期 / 标签下载向导；别名 `/tg_dl` |
+| `/tg_download date <频道> <开始日期> <结束日期>` | 按日期范围抓取媒体，例如 `/tg_download date @channel 2026-01-01 2026-01-31` |
+| `/tg_download tag <频道> <#标签>` | 按标签抓取媒体，例如 `/tg_download tag @channel #壁纸` |
+| `/tg_sub` | 打开订阅管理向导；别名 `/tg_subscribe` |
+| `/tg_sub <频道>` | 添加频道/群组订阅 |
+| `/tg_subs` | 查看订阅列表；别名 `/tg_subscriptions` |
+| `/tg_unsub <频道或订阅ID前缀>` | 取消订阅；别名 `/tg_unsubscribe` |
+| `/tg_retry [数量] [任务ID]` | 重试最近失败的 Telegram 下载任务 |
+
+兼容旧命令：`/tg_date` 和 `/tg_tag` 仍可用，但 README 推荐统一使用 `/tg_download date` / `/tg_download tag`。
+
 > 多文件上传数量达到 9 个及以上时，Bot 会自动进入静默排队模式，避免刷屏；可随时用 `/tasks` 查看进度。
-
----
-
-## 📡 Telegram 转存与订阅
-
-频道/群组批量转存与订阅同步需要账号级 Telegram 下载器。启用后，系统会把频道/群组中的媒体转存到 FlClouds，并交给当前启用的存储源保存。
-
-- `/tg_date`：按向导输入频道、开始日期和结束日期，抓取指定日期范围内的媒体
-- `/tg_preview_date`：先预览日期范围内的媒体数量与概况，再决定是否下载
-- `/tg_sub`：管理频道订阅；回复序号取消订阅，回复 `@channel_username` 或 `https://t.me/channel_username` 添加订阅
-- 后台任务会记录入队、跳过、重复和失败状态，可通过 `/tasks` 查看进度
-- 文件默认按来源/频道和类型归档，例如 `telegram/channel_username/images/`、`telegram/channel_username/videos/`
-
-当来源名称缺失或包含特殊字符时，系统会使用安全 fallback，避免生成非法路径或重复嵌套目录。
 
 ---
 
 ## 📥 yt-dlp 视频下载
 
 通过集成 [yt-dlp](https://github.com/yt-dlp/yt-dlp)，你可以直接在 Telegram Bot 中发送视频链接，让服务器解析并下载到当前存储源。
-
-**使用方法**：
 
 ```text
 /ytdlp https://example.com/video
@@ -236,10 +275,6 @@ FlClouds 默认采用“首次初始化”模式保护 Web 和 API：
 > [!IMPORTANT]
 > 生产环境请使用 HTTPS。默认 `COOKIE_SECURE=true` 时，浏览器只会在 HTTPS 下发送登录 Cookie；如果你只在本地 HTTP 调试，可临时设置 `COOKIE_SECURE=false`。
 
-### 旧部署密码迁移
-
-旧版本已写入数据库的 SHA-256 密码哈希仍可被识别，登录成功后建议尽快在设置中更新为新密码。全新部署请直接使用首次初始化流程创建网页管理员密码和 Telegram Bot 4 位 PIN。
-
 ### 自动密钥说明
 
 FlClouds 会在首次启动时自动生成内部密钥，并保存到 Docker 数据卷的 `/data/secrets/` 目录中。正常部署无需手动配置。迁移服务器时请连同 Docker volume 一起备份，否则登录会话、TOTP 密钥和已加密的第三方存储凭证可能需要重新配置。
@@ -260,8 +295,8 @@ FlClouds 内置支持 TOTP 双重验证（如 Google Authenticator）：
 
 | 访问域名 | 协议 | 转发至宿主机 IP:端口 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `cloud.example.com` | HTTPS | `127.0.0.1:47832` | 前端/网页入口 |
-| `api.example.com` | HTTPS | `127.0.0.1:51947` | 后端/API 接口 |
+| `cloud.example.com` | HTTPS | `127.0.0.1:47832` | 前端 / 网页入口 |
+| `api.example.com` | HTTPS | `127.0.0.1:51947` | 后端 / API 接口 |
 
 如果前后端使用不同域名，请在后端环境变量中设置：
 
@@ -273,18 +308,6 @@ COOKIE_SECURE=true
 
 > [!CAUTION]
 > 开启 HTTPS 后，`.env` 中的 `VITE_API_URL` 和 `CORS_ORIGIN` 都应使用 `https://`，否则浏览器可能拦截请求。修改 `VITE_API_URL` 后必须重新构建前端镜像，因为它会被打包进静态文件。
-
----
-
-## 📦 Docker 镜像说明
-
-默认从源码本地构建并使用以下镜像 tag：
-
-- `flclouds-frontend:latest`
-- `flclouds-backend:latest`
-- `postgres:16-alpine`
-
-如果你修改了前端 API 地址或前端源码，请重新执行前端构建步骤。
 
 ---
 
@@ -314,26 +337,6 @@ docker compose up -d
 ```bash
 docker system prune -f
 ```
-
----
-
-## ✨ 功能特性
-
-- 📦 大文件切片上传与断点续传
-- 🖼️ 图片缩略图、视频预览与流式播放
-- 🤖 Telegram Bot 上传、下载、删除、任务队列与存储统计
-- 👤 Telegram 用户账号级 MTProto 下载器，支持频道/群组媒体转存
-- 📅 按日期抓取、下载前预览与频道订阅同步
-- 🔁 桥接群/频道转发，改善多人私聊媒体不可见问题
-- 🗂️ 按来源/频道和文件类型自动归档，特殊名称安全 fallback
-- ⚙️ Telegram 并发下载 worker 调参，激进模式带二次确认
-- 🧯 重复文件处理、路径规则和本地孤儿文件清理开关
-- 📥 yt-dlp 视频链接下载到当前存储源
-- 🔐 首次 Web 初始化管理员密码，HttpOnly Cookie 会话与 Bot 独立 PIN
-- 🛡️ Origin 校验、签名 URL、存储账户作用域隔离与本地路径安全保护
-- ⚡ 前端按需加载与依赖拆包，降低首屏 JS 体积
-- 🧩 Google Drive 等存储源配置与授权刷新
-- 🐳 Docker Compose 容器化部署
 
 ---
 
