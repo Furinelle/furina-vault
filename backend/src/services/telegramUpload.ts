@@ -10,7 +10,8 @@ import { storageManager } from '../services/storage.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
 import { getSetting } from '../utils/settings.js';
 import { isAuthenticatedAsync } from './telegramState.js';
-import { formatBytes, getTypeEmoji, getFileType, getMimeTypeFromFilename, sanitizeFilename } from '../utils/telegramUtils.js';
+import { formatBytes, getTypeEmoji, getFileType, sanitizeFilename } from '../utils/telegramUtils.js';
+import { extractFileInfo, getDownloadableMedia, getEstimatedFileSize, isTelegramPhotoMedia, type TelegramFileInfo } from '../utils/telegramMedia.js';
 import {
     MSG,
     buildUploadSuccess,
@@ -65,10 +66,25 @@ function appendTelegramDebugLog(line: string) {
 }
 
 
+export interface TelegramDownloadMessageRef {
+    id: number;
+    source?: Api.TypeEntityLike | string;
+    origin?: 'channel' | 'comment';
+    channelPostId?: number;
+    fileInfo?: TelegramFileInfo;
+    totalSize?: number;
+    message?: Api.Message;
+}
+
 interface DownloadableMessageRef {
     id: number;
-    fileInfo: { fileName: string; mimeType: string };
+    sourceKey: string;
+    sourceEntity: Api.TypeEntityLike | string;
+    origin: 'channel' | 'comment';
+    channelPostId?: number;
+    fileInfo: TelegramFileInfo;
     totalSize: number;
+    message?: Api.Message;
 }
 
 function clampDownloadWorkers(value: unknown): number {
@@ -1247,119 +1263,6 @@ const mediaGroupQueues = new Map<string, MediaGroupQueue>();
 // 多文件上传处理延迟（毫秒），等待所有文件消息到达
 const MEDIA_GROUP_DELAY = 1500;
 
-function getDownloadableMedia(message: Api.Message): any | null {
-    if (!message.media) return null;
-    const media: any = message.media;
-    if (message.document || message.photo || message.video || message.audio || message.voice || message.sticker) {
-        return message.media;
-    }
-    if (media.document || media.photo) {
-        return media.document || media.photo;
-    }
-    if (media.webpage?.document || media.webpage?.photo) {
-        return media.webpage.document || media.webpage.photo;
-    }
-    return null;
-}
-
-function isTelegramPhotoMedia(media: any): boolean {
-    const inner = media?.photo || media;
-    return media?.className === 'MessageMediaPhoto' || inner?.className === 'Photo' || Boolean(inner?.sizes);
-}
-
-// 获取文件预估大小
-function getEstimatedFileSize(message: Api.Message): number {
-    const media = getDownloadableMedia(message);
-    if (isTelegramPhotoMedia(media)) {
-        return 0;
-    }
-    const document = (media as any)?.document || media;
-    if (document?.size) {
-        return Number(document.size) || 0;
-    }
-    return 0;
-}
-
-// 进度条函数已移至 telegramMessages.ts (generateProgressBar)
-
-function getDocumentFilename(document: any, fallback: string): string {
-    const fileNameAttr = document.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
-    return fileNameAttr?.fileName || fallback;
-}
-
-// 提取文件信息
-function extractFileInfo(message: Api.Message): { fileName: string; mimeType: string } | null {
-    const downloadableMedia = getDownloadableMedia(message);
-    if (!downloadableMedia) return null;
-
-    let fileName = 'unknown';
-    let mimeType = 'application/octet-stream';
-
-    try {
-        if (message.document) {
-            const doc = message.document as Api.Document;
-            const fileNameAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
-            fileName = fileNameAttr?.fileName || `file_${message.id}`;
-            mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
-
-            // 如果是音频/视频但没有文件名属性，尝试根据类型生成
-            if (fileName.startsWith('file_')) {
-                const videoAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeVideo');
-                const audioAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeAudio');
-                if (videoAttr) fileName = `video_${message.id}.mp4`;
-                else if (audioAttr) fileName = `audio_${message.id}.mp3`;
-            }
-        } else if (message.photo) {
-            const date = new Date();
-            const timestamp = date.toISOString().replace(/[-:T]/g, '').slice(0, 14);
-            fileName = `Img_${timestamp}.jpg`;
-            mimeType = 'image/jpeg';
-        } else if (message.video) {
-            const video = message.video as Api.Document;
-            const fileNameAttr = video.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
-            fileName = fileNameAttr?.fileName || `video_${message.id}.mp4`;
-            mimeType = video.mimeType || 'video/mp4';
-        } else if (message.audio) {
-            const audio = message.audio as Api.Document;
-            const fileNameAttr = audio.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
-            fileName = fileNameAttr?.fileName || `audio_${message.id}.mp3`;
-            mimeType = audio.mimeType || 'audio/mpeg';
-        } else if (message.voice) {
-            fileName = `voice_${message.id}.ogg`;
-            mimeType = 'audio/ogg';
-        } else if (message.sticker) {
-            fileName = `sticker_${message.id}.webp`;
-            mimeType = 'image/webp';
-        } else {
-            const media = message.media as any;
-            if (media.document && media.document instanceof Api.Document) {
-                const doc = media.document;
-                const fileNameAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
-                fileName = fileNameAttr?.fileName || `file_${message.id}`;
-                mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
-            } else {
-                const document = (downloadableMedia as any).document || (downloadableMedia as any);
-                const photo = (downloadableMedia as any).photo || (downloadableMedia as any);
-                if (document?.className === 'Document' || document?.attributes) {
-                    fileName = getDocumentFilename(document, `file_${message.id}`);
-                    mimeType = document.mimeType || getMimeTypeFromFilename(fileName);
-                } else if (photo?.className === 'Photo' || photo?.sizes) {
-                    const date = new Date((message.date || Math.floor(Date.now() / 1000)) * 1000);
-                    const timestamp = date.toISOString().replace(/[-:T]/g, '').slice(0, 14);
-                    fileName = `Img_${timestamp}_${message.id}.jpg`;
-                    mimeType = 'image/jpeg';
-                } else {
-                    return null;
-                }
-            }
-        }
-    } catch (e) {
-        console.error('🤖 提取文件信息出错:', e);
-        return null;
-    }
-
-    return { fileName: sanitizeFilename(fileName), mimeType };
-}
 
 // 下载并保存文件
 async function downloadAndSaveFile(
@@ -1884,6 +1787,26 @@ export async function getTelegramDownloadPreview(messages: Api.Message[]): Promi
     };
 }
 
+function sourceKeyForDownloadRef(source: Api.TypeEntityLike | string): string {
+    if (typeof source === 'string') return source;
+    const anySource: any = source as any;
+    const id = anySource?.channelId || anySource?.chatId || anySource?.userId || anySource?.id;
+    if (id !== undefined && id !== null) {
+        return `${anySource?.className || 'peer'}:${id.toString()}`;
+    }
+    return JSON.stringify(source);
+}
+
+function normalizeTelegramDownloadRefs(
+    refs: TelegramDownloadMessageRef[] | undefined,
+    defaultSourceEntity: Api.TypeEntityLike | string,
+): TelegramDownloadMessageRef[] | undefined {
+    if (!refs) return undefined;
+    return refs
+        .filter(ref => ref.id > 0)
+        .map(ref => ({ ...ref, source: ref.source || defaultSourceEntity }));
+}
+
 export async function downloadTelegramChannelRange(
     botClient: TelegramClient,
     requestMessage: Api.Message,
@@ -1893,6 +1816,7 @@ export async function downloadTelegramChannelRange(
     direction: 'older' | 'newer' = 'older',
     explicitIds?: number[],
     folderOverride?: string | null,
+    explicitRefs?: TelegramDownloadMessageRef[],
 ): Promise<{ requested: number; found: number; skipped: number; failed: number; successful: number; successfulMessageIds: number[]; failedMessageIds: number[]; skippedMessageIds: number[]; firstId: number; lastId: number }> {
     const userClient = getTelegramUserClient();
     if (!userClient || !isTelegramUserClientReady()) {
@@ -1900,17 +1824,17 @@ export async function downloadTelegramChannelRange(
     }
 
     const safeLimit = Math.max(1, Math.floor(limit || TG_BATCH_DEFAULT_LIMIT));
-    const ids = explicitIds?.filter(id => id > 0) || Array.from({ length: safeLimit }, (_, index) => (
+    const sourceEntity = source.startsWith('@') || /^-?\d+$/.test(source) || /^https?:\/\//i.test(source)
+        ? source
+        : `@${source}`;
+    const normalizedExplicitRefs = normalizeTelegramDownloadRefs(explicitRefs, sourceEntity);
+    const ids = normalizedExplicitRefs?.map(ref => ref.id) || explicitIds?.filter(id => id > 0) || Array.from({ length: safeLimit }, (_, index) => (
         direction === 'newer' ? startMessageId + index : startMessageId - index
     )).filter(id => id > 0);
 
     if (ids.length === 0) {
         throw new Error('起始消息 ID 无效');
     }
-
-    const sourceEntity = source.startsWith('@') || /^-?\d+$/.test(source) || /^https?:\/\//i.test(source)
-        ? source
-        : `@${source}`;
 
     const chatId = requestMessage.chatId;
     if (!chatId) {
@@ -1929,25 +1853,54 @@ export async function downloadTelegramChannelRange(
     const failedMessageIds: number[] = [];
     const skippedMessageIds: number[] = [];
 
-    for (let offset = 0; offset < ids.length; offset += TG_LARGE_TASK_SEGMENT_SIZE) {
-        const scanIds = ids.slice(offset, offset + TG_LARGE_TASK_SEGMENT_SIZE);
-        const scanMessages = await userClient.getMessages(sourceEntity as any, { ids: scanIds });
-        const returnedIds = new Set<number>();
-        for (const sourceMessage of scanMessages) {
-            if (!sourceMessage) continue;
-            returnedIds.add(sourceMessage.id);
-            const fileInfo = extractFileInfo(sourceMessage);
+    if (normalizedExplicitRefs) {
+        for (const ref of normalizedExplicitRefs) {
+            const refSource = ref.source || sourceEntity;
+            const fileInfo = ref.fileInfo;
             if (!fileInfo) {
                 skipped += 1;
-                skippedMessageIds.push(sourceMessage.id);
+                skippedMessageIds.push(ref.id);
                 continue;
             }
-            downloadableRefs.push({ id: sourceMessage.id, fileInfo, totalSize: getEstimatedFileSize(sourceMessage) });
+            downloadableRefs.push({
+                id: ref.id,
+                sourceKey: sourceKeyForDownloadRef(refSource),
+                sourceEntity: refSource,
+                origin: ref.origin || 'channel',
+                channelPostId: ref.channelPostId,
+                fileInfo,
+                totalSize: ref.totalSize || 0,
+                message: ref.message,
+            });
         }
-        for (const requestedId of scanIds) {
-            if (!returnedIds.has(requestedId)) {
-                skipped += 1;
-                skippedMessageIds.push(requestedId);
+    } else {
+        for (let offset = 0; offset < ids.length; offset += TG_LARGE_TASK_SEGMENT_SIZE) {
+            const scanIds = ids.slice(offset, offset + TG_LARGE_TASK_SEGMENT_SIZE);
+            const scanMessages = await userClient.getMessages(sourceEntity as any, { ids: scanIds });
+            const returnedIds = new Set<number>();
+            for (const sourceMessage of scanMessages) {
+                if (!sourceMessage) continue;
+                returnedIds.add(sourceMessage.id);
+                const fileInfo = extractFileInfo(sourceMessage);
+                if (!fileInfo) {
+                    skipped += 1;
+                    skippedMessageIds.push(sourceMessage.id);
+                    continue;
+                }
+                downloadableRefs.push({
+                    id: sourceMessage.id,
+                    sourceKey: sourceKeyForDownloadRef(sourceEntity),
+                    sourceEntity,
+                    origin: 'channel',
+                    fileInfo,
+                    totalSize: getEstimatedFileSize(sourceMessage),
+                });
+            }
+            for (const requestedId of scanIds) {
+                if (!returnedIds.has(requestedId)) {
+                    skipped += 1;
+                    skippedMessageIds.push(requestedId);
+                }
             }
         }
     }
@@ -1958,7 +1911,7 @@ export async function downloadTelegramChannelRange(
         if (taskFolderOverride !== undefined) {
             taskResolvedStorageFolder = taskFolderOverride;
         } else if (firstRef) {
-            const firstMessage = (await userClient.getMessages(sourceEntity as any, { ids: [firstRef.id] }))[0] as Api.Message | undefined;
+            const firstMessage = (await userClient.getMessages(firstRef.sourceEntity as any, { ids: [firstRef.id] }))[0] as Api.Message | undefined;
             if (firstMessage) {
                 const chatName = await getTelegramChatName(firstMessage);
                 const storageRules = await getStoragePathRules();
@@ -2014,16 +1967,36 @@ export async function downloadTelegramChannelRange(
         const segment = downloadableRefs.slice(offset, offset + TG_LARGE_TASK_SEGMENT_SIZE);
         const segmentBytes = segment.reduce((sum, item) => sum + (item.totalSize || 0), 0);
         await waitForDiskWatermark(segmentBytes);
-        const segmentIds = segment.map(item => item.id);
-        const segmentMessages = await userClient.getMessages(sourceEntity as any, { ids: segmentIds });
-        const segmentMessageById = new Map<number, Api.Message>();
-        for (const segmentMessage of segmentMessages) {
-            if (segmentMessage) segmentMessageById.set(segmentMessage.id, segmentMessage as Api.Message);
+        const segmentMessagesBySource = new Map<string, Map<number, Api.Message>>();
+        const refsBySource = new Map<string, DownloadableMessageRef[]>();
+        for (const item of segment) {
+            const items = refsBySource.get(item.sourceKey) || [];
+            items.push(item);
+            refsBySource.set(item.sourceKey, items);
+        }
+        for (const [sourceKey, sourceItems] of refsBySource) {
+            const preloadedMessageById = new Map<number, Api.Message>();
+            const missingSourceItems: DownloadableMessageRef[] = [];
+            for (const sourceItem of sourceItems) {
+                if (sourceItem.message) {
+                    preloadedMessageById.set(sourceItem.id, sourceItem.message);
+                } else {
+                    missingSourceItems.push(sourceItem);
+                }
+            }
+            if (missingSourceItems.length > 0) {
+                const segmentIds = missingSourceItems.map(item => item.id);
+                const segmentMessages = await userClient.getMessages(sourceItems[0].sourceEntity as any, { ids: segmentIds });
+                for (const segmentMessage of segmentMessages) {
+                    if (segmentMessage) preloadedMessageById.set(segmentMessage.id, segmentMessage as Api.Message);
+                }
+            }
+            segmentMessagesBySource.set(sourceKey, preloadedMessageById);
         }
 
         await Promise.all(segment.map(async (item) => {
             const { fileName, mimeType } = item.fileInfo;
-            const message = segmentMessageById.get(item.id);
+            const message = segmentMessagesBySource.get(item.sourceKey)?.get(item.id);
             if (!message) {
                 skipped += 1;
                 failed += 1;

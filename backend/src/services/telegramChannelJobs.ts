@@ -2,11 +2,13 @@ import { Api, TelegramClient } from 'telegram';
 import { query } from '../db/index.js';
 import { storageManager } from './storage.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
-import { downloadTelegramChannelRange, getTelegramDownloadPreview } from './telegramUpload.js';
+import { downloadTelegramChannelRange, getTelegramDownloadPreview, type TelegramDownloadMessageRef } from './telegramUpload.js';
 import { getSetting } from '../utils/settings.js';
+import { extractFileInfo, getEstimatedFileSize } from '../utils/telegramMedia.js';
 
 const SUBSCRIPTION_INTERVAL_MS = Math.max(60_000, parseInt(process.env.TELEGRAM_SUBSCRIPTION_INTERVAL_MS || '300000', 10) || 300_000);
 const SUBSCRIPTION_SCAN_LIMIT = Math.max(1, parseInt(process.env.TELEGRAM_SUBSCRIPTION_SCAN_LIMIT || '100', 10) || 100);
+export const TELEGRAM_COMMENTS_MAX_PER_POST = Math.max(1, parseInt(process.env.TELEGRAM_COMMENTS_MAX_PER_POST || '200', 10) || 200);
 let subscriptionTimer: NodeJS.Timeout | null = null;
 
 function parseTelegramSourceAllowlist(raw: string | undefined): string[] {
@@ -158,6 +160,117 @@ async function persistDownloadItems(jobId: string, source: string, messages: Api
     }
 }
 
+interface TelegramCommentScanOptions {
+    includeComments?: boolean;
+    commentsMaxPerPost?: number;
+}
+
+interface TelegramDownloadScanResult {
+    messages: Api.Message[];
+    refs: TelegramDownloadMessageRef[];
+    commentMessagesScanned: number;
+    commentMediaFound: number;
+}
+
+async function getDiscussionMediaRefs(
+    userClient: TelegramClient,
+    source: string,
+    postMessages: Api.Message[],
+    options: TelegramCommentScanOptions & { tag?: string; startDate?: Date; endDate?: Date } = {},
+): Promise<{ refs: TelegramDownloadMessageRef[]; scanned: number; mediaFound: number }> {
+    if (!options.includeComments || postMessages.length === 0) {
+        return { refs: [], scanned: 0, mediaFound: 0 };
+    }
+
+    const maxPerPost = Math.max(1, Math.floor(options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST));
+    const refs: TelegramDownloadMessageRef[] = [];
+    let scanned = 0;
+    let mediaFound = 0;
+    const seen = new Set<string>();
+
+    for (const post of postMessages) {
+        const declaredReplies = Number((post as any).replies?.replies || 0);
+        if (declaredReplies <= 0) continue;
+
+        let offsetId = 0;
+        let scannedForPost = 0;
+        while (scannedForPost < maxPerPost) {
+            const batch = await userClient.getMessages(source as any, {
+                limit: Math.min(100, maxPerPost - scannedForPost),
+                offsetId,
+                replyTo: post.id,
+            });
+            if (!batch.length) break;
+
+            for (const comment of batch) {
+                if (!comment) continue;
+                scanned += 1;
+                scannedForPost += 1;
+                offsetId = comment.id;
+
+                if (options.startDate || options.endDate) {
+                    const commentDate = new Date((comment.date || 0) * 1000);
+                    if (options.startDate && commentDate < options.startDate) continue;
+                    if (options.endDate && commentDate > options.endDate) continue;
+                }
+                if (options.tag && !messageMatchesHashtag(comment, options.tag)) continue;
+
+                const fileInfo = extractFileInfo(comment);
+                if (!fileInfo) continue;
+
+                const sourceKey = `${comment.chatId?.toString() || source}:${comment.id}`;
+                if (seen.has(sourceKey)) continue;
+                seen.add(sourceKey);
+                mediaFound += 1;
+                refs.push({
+                    id: comment.id,
+                    source: comment.chatId || source,
+                    origin: 'comment',
+                    channelPostId: post.id,
+                    fileInfo,
+                    totalSize: getEstimatedFileSize(comment),
+                    message: comment,
+                });
+            }
+
+            if (batch.length === 0 || scannedForPost >= maxPerPost) break;
+        }
+    }
+
+    return { refs, scanned, mediaFound };
+}
+
+function toChannelDownloadRef(source: string, message: Api.Message): TelegramDownloadMessageRef | null {
+    const fileInfo = extractFileInfo(message);
+    if (!fileInfo) return null;
+    return {
+        id: message.id,
+        source,
+        origin: 'channel',
+        fileInfo,
+        totalSize: getEstimatedFileSize(message),
+    };
+}
+
+async function buildDownloadScanResult(
+    userClient: TelegramClient,
+    source: string,
+    messages: Api.Message[],
+    options: TelegramCommentScanOptions & { tag?: string; startDate?: Date; endDate?: Date } = {},
+): Promise<TelegramDownloadScanResult> {
+    const refs = messages
+        .map(message => toChannelDownloadRef(source, message))
+        .filter((ref): ref is TelegramDownloadMessageRef => Boolean(ref));
+    const commentScan = await getDiscussionMediaRefs(userClient, source, messages, options);
+    refs.push(...commentScan.refs);
+    return {
+        messages,
+        refs,
+        commentMessagesScanned: commentScan.scanned,
+        commentMediaFound: commentScan.mediaFound,
+    };
+}
+
 async function updateDownloadItemsStatus(jobId: string, messageIds: number[] | undefined, status: 'success' | 'failed' | 'skipped', error?: string) {
     const ids = Array.from(new Set((messageIds || []).filter(id => id > 0)));
     if (ids.length === 0) return;
@@ -263,7 +376,7 @@ export async function unsubscribeTelegramChannel(userId: number, selector: strin
     return result.rows[0] || null;
 }
 
-export async function enqueueTelegramDateDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, startDateText: string, endDateText: string, folderOverride?: string | null) {
+export async function enqueueTelegramDateDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, startDateText: string, endDateText: string, folderOverride?: string | null, options: TelegramCommentScanOptions = {}) {
     const userClient = requireUserClient();
     const source = normalizeSource(sourceInput);
     await assertTelegramSourceAllowed(source);
@@ -273,13 +386,23 @@ export async function enqueueTelegramDateDownload(botClient: TelegramClient, req
 
     const baseMessages = await getMessagesByDateRange(userClient, source, startDate, endDate);
     const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
-    const messageIds = messages.map(message => message.id);
-    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, { startDate: startDateText, endDate: endDateText, messageIds, folderOverride: folderOverride || null });
+    const scan = await buildDownloadScanResult(userClient, source, messages, { ...options, startDate, endDate });
+    const messageIds = scan.refs.map(ref => ref.id);
+    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, {
+        startDate: startDateText,
+        endDate: endDateText,
+        messageIds,
+        folderOverride: folderOverride || null,
+        includeComments: Boolean(options.includeComments),
+        commentsMaxPerPost: options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+        commentMessagesScanned: scan.commentMessagesScanned,
+        commentMediaFound: scan.commentMediaFound,
+    });
     await persistDownloadItems(jobId, source, messages);
-    await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: messages.length });
+    await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: scan.refs.length });
 
     try {
-        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id), folderOverride);
+        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, scan.refs.length, 'older', messageIds, folderOverride, scan.refs);
         await updateDownloadItemsStatus(jobId, result.successfulMessageIds, 'success');
         await updateDownloadItemsStatus(jobId, result.failedMessageIds, 'failed', '下载失败');
         await updateDownloadItemsStatus(jobId, result.skippedMessageIds, 'skipped');
@@ -290,7 +413,7 @@ export async function enqueueTelegramDateDownload(botClient: TelegramClient, req
             error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
             finished_at: new Date(),
         });
-        return { jobId, ...result };
+        return { jobId, commentMessagesScanned: scan.commentMessagesScanned, commentMediaFound: scan.commentMediaFound, ...result };
     } catch (error) {
         await updateJob(jobId, { status: 'failed', error: error instanceof Error ? error.message : String(error), finished_at: new Date() });
         throw error;
@@ -321,7 +444,7 @@ async function getMessagesByHashtag(userClient: TelegramClient, source: string, 
     return result.sort((a, b) => a.id - b.id);
 }
 
-export async function enqueueTelegramTagDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, tagInput: string, folderOverride?: string | null) {
+export async function enqueueTelegramTagDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, tagInput: string, folderOverride?: string | null, options: TelegramCommentScanOptions = {}) {
     const userClient = requireUserClient();
     const source = normalizeSource(sourceInput);
     await assertTelegramSourceAllowed(source);
@@ -329,13 +452,22 @@ export async function enqueueTelegramTagDownload(botClient: TelegramClient, requ
 
     const baseMessages = await getMessagesByHashtag(userClient, source, tag);
     const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
-    const messageIds = messages.map(message => message.id);
-    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, { tag, messageIds, folderOverride: folderOverride || null });
+    const scan = await buildDownloadScanResult(userClient, source, messages, { ...options, tag });
+    const messageIds = scan.refs.map(ref => ref.id);
+    const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, {
+        tag,
+        messageIds,
+        folderOverride: folderOverride || null,
+        includeComments: Boolean(options.includeComments),
+        commentsMaxPerPost: options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+        commentMessagesScanned: scan.commentMessagesScanned,
+        commentMediaFound: scan.commentMediaFound,
+    });
     await persistDownloadItems(jobId, source, messages);
-    await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: messages.length });
+    await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: scan.refs.length });
 
     try {
-        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, messages.length, 'older', messages.map(message => message.id), folderOverride);
+        const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, scan.refs.length, 'older', messageIds, folderOverride, scan.refs);
         await updateDownloadItemsStatus(jobId, result.successfulMessageIds, 'success');
         await updateDownloadItemsStatus(jobId, result.failedMessageIds, 'failed', '下载失败');
         await updateDownloadItemsStatus(jobId, result.skippedMessageIds, 'skipped');
@@ -346,7 +478,7 @@ export async function enqueueTelegramTagDownload(botClient: TelegramClient, requ
             error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
             finished_at: new Date(),
         });
-        return { jobId, tag, ...result };
+        return { jobId, tag, commentMessagesScanned: scan.commentMessagesScanned, commentMediaFound: scan.commentMediaFound, ...result };
     } catch (error) {
         await updateJob(jobId, { status: 'failed', error: error instanceof Error ? error.message : String(error), finished_at: new Date() });
         throw error;

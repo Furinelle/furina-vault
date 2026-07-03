@@ -215,6 +215,8 @@ export function buildHelp(): string {
         `  /tg_download — 按日期/标签下载频道文件`,
         `  /tg_download date <频道> <开始日期> <结束日期> — 按日期下载`,
         `  /tg_download tag <频道> <#标签> — 按标签下载`,
+        `  /tg_download 向导中可选择“频道 + 评论区”；开启后只下载评论区里的文件/图片/视频/音频，文字评论会忽略`,
+        `  评论区每个帖子默认最多扫描 ${process.env.TELEGRAM_COMMENTS_MAX_PER_POST || '200'} 条评论，可用 TELEGRAM_COMMENTS_MAX_PER_POST 调整`,
         `  /download_workers — 设置单文件分片并发`,
         `  /file_concurrency — 设置同时下载文件数`,
         `  /duplicate_mode — 设置重复文件处理`,

@@ -18,6 +18,7 @@ import {
     subscribeTelegramChannel,
     unsubscribeTelegramChannel,
     updateTelegramSubscriptionFolder,
+    TELEGRAM_COMMENTS_MAX_PER_POST,
 } from './telegramChannelJobs.js';
 import { cleanupOrphanFiles, isAutoCleanupEnabled, startPeriodicCleanup } from './orphanCleanup.js';
 import { MSG, buildStartPrompt, buildAuthSuccess, build2FASetupCaption, buildCleanupNotice } from '../utils/telegramMessages.js';
@@ -33,7 +34,7 @@ const SESSION_FILE = process.env.TELEGRAM_SESSION_FILE || './data/telegram_sessi
 let client: TelegramClient | null = null;
 
 type TelegramWizardKind = 'tg_sub_manage' | 'tg_download' | 'tg_date' | 'tg_tag';
-type TelegramWizardStep = 'mode' | 'source' | 'path' | 'start_date' | 'end_date' | 'tag';
+type TelegramWizardStep = 'mode' | 'source' | 'path' | 'comments' | 'start_date' | 'end_date' | 'tag';
 
 interface TelegramWizardState {
     kind: TelegramWizardKind;
@@ -42,6 +43,8 @@ interface TelegramWizardState {
     startDate?: string;
     tag?: string;
     customFolder?: string;
+    includeComments?: boolean;
+    commentsMaxPerPost?: number;
     subscriptionId?: string;
     subscriptionTitle?: string;
     subscriptionSource?: string;
@@ -54,6 +57,22 @@ function buildTelegramDownloadModeKeyboard(): Api.ReplyInlineMarkup {
                 buttons: [
                     new Api.KeyboardButtonCallback({ text: '🗓️ 按日期下载', data: Buffer.from('tgd_mode_date') }),
                     new Api.KeyboardButtonCallback({ text: '🏷️ 按标签下载', data: Buffer.from('tgd_mode_tag') }),
+                ],
+            }),
+            new Api.KeyboardButtonRow({
+                buttons: [new Api.KeyboardButtonCallback({ text: '取消', data: Buffer.from('tgd_cancel') })],
+            }),
+        ],
+    });
+}
+
+function buildTelegramCommentsKeyboard(): Api.ReplyInlineMarkup {
+    return new Api.ReplyInlineMarkup({
+        rows: [
+            new Api.KeyboardButtonRow({
+                buttons: [
+                    new Api.KeyboardButtonCallback({ text: '仅频道正文', data: Buffer.from('tgd_comments_off') }),
+                    new Api.KeyboardButtonCallback({ text: '频道 + 评论区', data: Buffer.from('tgd_comments_on') }),
                 ],
             }),
             new Api.KeyboardButtonRow({
@@ -187,6 +206,8 @@ function buildTelegramWizardPrompt(state: TelegramWizardState): string {
             '请发送频道用户名或链接：',
             '例如：`@channel_username` 或 `https://t.me/channel_username`',
             '',
+            '也可以直接发送：`@频道 comments` 或 `@频道 no-comments`。',
+            '',
             '发送“取消”可退出。',
         ].join('\n');
     }
@@ -203,6 +224,22 @@ function buildTelegramWizardPrompt(state: TelegramWizardState): string {
             '发送 `跳过` / `skip` 使用默认保存路径规则。',
             '',
             `说明：这里设置的目录只对${scopeText}生效，不会改变全局 /path_rules，也不会影响其它下载。`,
+            '发送“取消”可退出。',
+        ].join('\n');
+    }
+
+    if (state.step === 'comments') {
+        return [
+            title,
+            `📍 频道：${state.subscriptionSource || state.source}`,
+            state.customFolder ? `📁 保存目录：${state.customFolder}` : '📁 保存策略：默认自动分类',
+            '',
+            '是否同时扫描频道帖子下方的评论区文件？',
+            '',
+            `默认关闭；开启后每个频道帖子最多扫描 ${state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST} 条评论。`,
+            '文字评论、普通链接和其它无文件消息会自动忽略。',
+            '',
+            '也可以发送：`开` / `关` / `yes` / `no`。',
             '发送“取消”可退出。',
         ].join('\n');
     }
@@ -251,9 +288,12 @@ function isDateOnly(text: string): boolean {
 async function replyWithJobResult(statusMessage: Api.Message, fallbackMessage: Api.Message, promise: Promise<any>, kind: 'date' | 'tag'): Promise<void> {
     promise
         .then(result => {
+            const commentLine = result.commentMediaFound || result.commentMessagesScanned
+                ? `\n评论区: 扫描 ${result.commentMessagesScanned || 0} 条，发现 ${result.commentMediaFound || 0} 个文件`
+                : '';
             const text = kind === 'tag'
-                ? `✅ 标签下载任务完成\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}`
-                : `✅ 日期范围任务完成\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}`;
+                ? `✅ 标签下载任务完成\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`
+                : `✅ 日期范围任务完成\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`;
             statusMessage.edit({ text }).catch(() => fallbackMessage.reply({ message: text }).catch(() => undefined));
         })
         .catch(error => {
@@ -305,7 +345,18 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
     }
 
     if (state.step === 'source') {
-        state.source = input;
+        const sourceParts = input.split(/\s+/).filter(Boolean);
+        const commentFlag = sourceParts[sourceParts.length - 1]?.toLowerCase();
+        if (['comments', '--comments', 'include-comments', '评论', '评论区'].includes(commentFlag)) {
+            state.includeComments = true;
+            state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
+            sourceParts.pop();
+        } else if (['no-comments', '--no-comments', 'channel-only', '仅频道'].includes(commentFlag)) {
+            state.includeComments = false;
+            state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
+            sourceParts.pop();
+        }
+        state.source = sourceParts.join(' ') || input;
         if (state.kind === 'tg_sub_manage') {
             if (/^\d+$/.test(input)) {
                 const rows = await listTelegramSubscriptions(senderId);
@@ -387,11 +438,25 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
             return true;
         }
 
-        if (state.kind === 'tg_tag') {
-            state.step = 'tag';
-        } else {
-            state.step = 'start_date';
+        if (state.kind === 'tg_tag' || state.kind === 'tg_date') {
+            state.step = state.includeComments !== undefined ? (state.kind === 'tg_tag' ? 'tag' : 'start_date') : 'comments';
+            await message.reply({ message: buildTelegramWizardPrompt(state), buttons: state.step === 'comments' ? buildTelegramCommentsKeyboard() : undefined });
+            return true;
         }
+        return true;
+
+    }
+
+    if (state.step === 'comments') {
+        const enabled = /^(开|开启|是|包含|评论|评论区|yes|y|on|true|1)$/i.test(input);
+        const disabled = /^(关|关闭|否|不包含|仅频道|no|n|off|false|0)$/i.test(input);
+        if (!enabled && !disabled) {
+            await message.reply({ message: '❌ 请发送 `开`/`关`，或点击按钮选择是否包含评论区文件。' });
+            return true;
+        }
+        state.includeComments = enabled;
+        state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
+        state.step = state.kind === 'tg_tag' ? 'tag' : 'start_date';
         await message.reply({ message: buildTelegramWizardPrompt(state) });
         return true;
     }
@@ -401,7 +466,10 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
         try {
             const queuedMsg = await message.reply({ message: `⏳ 已开始后台扫描 ${state.source} 中带有 ${input.startsWith('#') ? input : `#${input}`} 的媒体消息...
 完成后会自动更新结果，可用 /tasks 查看后台任务。` });
-            await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramTagDownload(client!, message, senderId, state.source!, input, state.customFolder), 'tag');
+            await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramTagDownload(client!, message, senderId, state.source!, input, state.customFolder, {
+                includeComments: Boolean(state.includeComments),
+                commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+            }), 'tag');
         } catch (error) {
             await message.reply({ message: `❌ 标签下载失败: ${error instanceof Error ? error.message : String(error)}` });
         }
@@ -428,7 +496,10 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
     try {
         const queuedMsg = await message.reply({ message: `⏳ 已开始后台扫描 ${state.source}：${state.startDate} → ${input}...
 完成后会自动更新结果，可用 /tasks 查看后台任务。` });
-        await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramDateDownload(client!, message, senderId, state.source!, state.startDate!, input, state.customFolder), 'date');
+        await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramDateDownload(client!, message, senderId, state.source!, state.startDate!, input, state.customFolder, {
+            includeComments: Boolean(state.includeComments),
+            commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+        }), 'date');
     } catch (error) {
         await message.reply({ message: `❌ 日期下载失败: ${error instanceof Error ? error.message : String(error)}` });
     }
@@ -754,12 +825,34 @@ async function handleTelegramDownloadModeCallback(update: Api.UpdateBotCallbackQ
         return;
     }
     const state = telegramWizardStates.get(userId) || { kind: 'tg_download' as TelegramWizardKind, step: 'mode' as TelegramWizardStep };
-    if (data === 'tgd_mode_date') state.kind = 'tg_date';
-    if (data === 'tgd_mode_tag') state.kind = 'tg_tag';
-    state.step = 'source';
-    telegramWizardStates.set(userId, state);
-    await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state) });
-    await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: data === 'tgd_mode_date' ? '按日期下载' : '按标签下载' }));
+    if (data === 'tgd_mode_date') {
+        state.kind = 'tg_date';
+        state.step = 'source';
+        telegramWizardStates.set(userId, state);
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state) });
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '按日期下载' }));
+        return;
+    }
+    if (data === 'tgd_mode_tag') {
+        state.kind = 'tg_tag';
+        state.step = 'source';
+        telegramWizardStates.set(userId, state);
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state) });
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '按标签下载' }));
+        return;
+    }
+    if (data === 'tgd_comments_on' || data === 'tgd_comments_off') {
+        state.includeComments = data === 'tgd_comments_on';
+        state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
+        state.step = state.kind === 'tg_tag' ? 'tag' : 'start_date';
+        telegramWizardStates.set(userId, state);
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state) });
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({
+            queryId: update.queryId,
+            message: state.includeComments ? '将包含评论区文件' : '仅下载频道正文文件',
+        }));
+        return;
+    }
 }
 
 async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
