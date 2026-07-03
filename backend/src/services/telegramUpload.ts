@@ -2028,6 +2028,7 @@ export async function downloadTelegramChannelRange(
                     updateBatch(chatIdStr, batchId, { folderPath: resolved || undefined });
                 }
                 uploadItem.folderOverride = taskResolvedStorageFolder !== undefined ? taskResolvedStorageFolder : taskFolderOverride;
+                await refreshSegmentStatus(true, fileName);
                 await processFileUpload(userClient, uploadItem);
                 if (uploadItem.status === 'success') {
                     successful += 1;

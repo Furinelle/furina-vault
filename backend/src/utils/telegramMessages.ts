@@ -823,6 +823,9 @@ export async function buildConsolidatedStatus(
             if (!isDone) {
                 const progress = generateProgressBar(batch.completed, batch.totalFiles);
                 lines.push(`    ${progress} (${batch.completed}/${batch.totalFiles})`);
+                if (batch.currentFileName) {
+                    lines.push(`    📄 当前: ${batch.currentFileName}`);
+                }
             } else {
                 lines.push(`    ✅ ${batch.successful}  ❌ ${batch.failed}`);
             }

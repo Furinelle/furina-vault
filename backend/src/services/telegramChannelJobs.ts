@@ -160,14 +160,28 @@ async function persistDownloadItems(jobId: string, source: string, messages: Api
     }
 }
 
+interface TelegramDownloadScanSummary {
+    source: string;
+    mode: 'date' | 'tag';
+    channelMessagesScanned: number;
+    channelMediaFound: number;
+    commentMessagesScanned: number;
+    commentMediaFound: number;
+    totalMediaFound: number;
+    commentsEnabled: boolean;
+    commentsMaxPerPost: number;
+}
+
 interface TelegramCommentScanOptions {
     includeComments?: boolean;
     commentsMaxPerPost?: number;
+    onScanComplete?: (summary: TelegramDownloadScanSummary) => Promise<void> | void;
 }
 
 interface TelegramDownloadScanResult {
     messages: Api.Message[];
     refs: TelegramDownloadMessageRef[];
+    channelMediaFound: number;
     commentMessagesScanned: number;
     commentMediaFound: number;
 }
@@ -266,6 +280,7 @@ async function buildDownloadScanResult(
     return {
         messages,
         refs,
+        channelMediaFound: refs.length,
         commentMessagesScanned: commentScan.scanned,
         commentMediaFound: commentScan.mediaFound,
     };
@@ -387,6 +402,18 @@ export async function enqueueTelegramDateDownload(botClient: TelegramClient, req
     const baseMessages = await getMessagesByDateRange(userClient, source, startDate, endDate);
     const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
     const scan = await buildDownloadScanResult(userClient, source, messages, { ...options, startDate, endDate });
+    const commentLimit = options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST;
+    await options.onScanComplete?.({
+        source,
+        mode: 'date',
+        channelMessagesScanned: messages.length,
+        channelMediaFound: scan.channelMediaFound,
+        commentMessagesScanned: scan.commentMessagesScanned,
+        commentMediaFound: scan.commentMediaFound,
+        totalMediaFound: scan.refs.length,
+        commentsEnabled: Boolean(options.includeComments),
+        commentsMaxPerPost: commentLimit,
+    });
     const messageIds = scan.refs.map(ref => ref.id);
     const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'date_range', source, {
         startDate: startDateText,
@@ -453,6 +480,18 @@ export async function enqueueTelegramTagDownload(botClient: TelegramClient, requ
     const baseMessages = await getMessagesByHashtag(userClient, source, tag);
     const messages = await expandMessagesWithMediaGroups(userClient, source, baseMessages);
     const scan = await buildDownloadScanResult(userClient, source, messages, { ...options, tag });
+    const commentLimit = options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST;
+    await options.onScanComplete?.({
+        source,
+        mode: 'tag',
+        channelMessagesScanned: messages.length,
+        channelMediaFound: scan.channelMediaFound,
+        commentMessagesScanned: scan.commentMessagesScanned,
+        commentMediaFound: scan.commentMediaFound,
+        totalMediaFound: scan.refs.length,
+        commentsEnabled: Boolean(options.includeComments),
+        commentsMaxPerPost: commentLimit,
+    });
     const messageIds = scan.refs.map(ref => ref.id);
     const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, {
         tag,

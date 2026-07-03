@@ -2573,6 +2573,9 @@ async function buildConsolidatedStatus(singleFiles, batches) {
       if (!isDone) {
         const progress = generateProgressBar(batch.completed, batch.totalFiles);
         lines.push(`    ${progress} (${batch.completed}/${batch.totalFiles})`);
+        if (batch.currentFileName) {
+          lines.push(`    \u{1F4C4} \u5F53\u524D: ${batch.currentFileName}`);
+        }
       } else {
         lines.push(`    \u2705 ${batch.successful}  \u274C ${batch.failed}`);
       }
@@ -4790,6 +4793,7 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
           updateBatch(chatIdStr, batchId, { folderPath: resolved || void 0 });
         }
         uploadItem.folderOverride = taskResolvedStorageFolder !== void 0 ? taskResolvedStorageFolder : taskFolderOverride;
+        await refreshSegmentStatus(true, fileName);
         await processFileUpload(userClient2, uploadItem);
         if (uploadItem.status === "success") {
           successful += 1;
@@ -5384,6 +5388,7 @@ async function buildDownloadScanResult(userClient2, source, messages, options = 
   return {
     messages,
     refs,
+    channelMediaFound: refs.length,
     commentMessagesScanned: commentScan.scanned,
     commentMediaFound: commentScan.mediaFound
   };
@@ -5491,6 +5496,18 @@ async function enqueueTelegramDateDownload(botClient, requestMessage, userId, so
   const baseMessages = await getMessagesByDateRange(userClient2, source, startDate, endDate);
   const messages = await expandMessagesWithMediaGroups(userClient2, source, baseMessages);
   const scan = await buildDownloadScanResult(userClient2, source, messages, { ...options, startDate, endDate });
+  const commentLimit = options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST;
+  await options.onScanComplete?.({
+    source,
+    mode: "date",
+    channelMessagesScanned: messages.length,
+    channelMediaFound: scan.channelMediaFound,
+    commentMessagesScanned: scan.commentMessagesScanned,
+    commentMediaFound: scan.commentMediaFound,
+    totalMediaFound: scan.refs.length,
+    commentsEnabled: Boolean(options.includeComments),
+    commentsMaxPerPost: commentLimit
+  });
   const messageIds = scan.refs.map((ref) => ref.id);
   const jobId = await createJob(userId, requestMessage.chatId?.toString(), "date_range", source, {
     startDate: startDateText,
@@ -5550,6 +5567,18 @@ async function enqueueTelegramTagDownload(botClient, requestMessage, userId, sou
   const baseMessages = await getMessagesByHashtag(userClient2, source, tag);
   const messages = await expandMessagesWithMediaGroups(userClient2, source, baseMessages);
   const scan = await buildDownloadScanResult(userClient2, source, messages, { ...options, tag });
+  const commentLimit = options.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST;
+  await options.onScanComplete?.({
+    source,
+    mode: "tag",
+    channelMessagesScanned: messages.length,
+    channelMediaFound: scan.channelMediaFound,
+    commentMessagesScanned: scan.commentMessagesScanned,
+    commentMediaFound: scan.commentMediaFound,
+    totalMediaFound: scan.refs.length,
+    commentsEnabled: Boolean(options.includeComments),
+    commentsMaxPerPost: commentLimit
+  });
   const messageIds = scan.refs.map((ref) => ref.id);
   const jobId = await createJob(userId, requestMessage.chatId?.toString(), "tag_download", source, {
     tag,
@@ -7151,6 +7180,19 @@ function buildTelegramWizardPrompt(state) {
 function isDateOnly(text) {
   return /^\d{4}-\d{2}-\d{2}$/.test(text.trim());
 }
+async function updateScanStatusMessage(statusMessage, summary) {
+  const lines = [
+    `\u{1F50E} **\u626B\u63CF\u5B8C\u6210\uFF0C\u5F00\u59CB\u4E0B\u8F7D**`,
+    `\u{1F4CD} \u9891\u9053\uFF1A${summary.source}`,
+    ``,
+    `\u{1F4C4} \u9891\u9053\u6B63\u6587\uFF1A\u626B\u63CF ${summary.channelMessagesScanned} \u6761\uFF0C\u53D1\u73B0 ${summary.channelMediaFound} \u4E2A\u6587\u4EF6`,
+    summary.commentsEnabled ? `\u{1F4AC} \u8BC4\u8BBA\u533A\uFF1A\u626B\u63CF ${summary.commentMessagesScanned} \u6761\uFF0C\u53D1\u73B0 ${summary.commentMediaFound} \u4E2A\u6587\u4EF6\uFF08\u6BCF\u5E16\u6700\u591A ${summary.commentsMaxPerPost} \u6761\uFF09` : `\u{1F4AC} \u8BC4\u8BBA\u533A\uFF1A\u672A\u542F\u7528`,
+    `\u{1F4E6} \u5F85\u4E0B\u8F7D\uFF1A${summary.totalMediaFound} \u4E2A\u6587\u4EF6`,
+    ``,
+    `\u23F3 \u6B63\u5728\u52A0\u5165\u4E0B\u8F7D\u961F\u5217\uFF0C\u53EF\u7528 /tasks \u67E5\u770B\u540E\u53F0\u4EFB\u52A1\u3002`
+  ];
+  await statusMessage.edit({ text: lines.join("\n") }).catch(() => void 0);
+}
 async function replyWithJobResult(statusMessage, fallbackMessage, promise, kind) {
   promise.then((result) => {
     const commentLine = result.commentMediaFound || result.commentMessagesScanned ? `
@@ -7329,7 +7371,8 @@ ${buildPathPreviewLine(state.customFolder)}` : "\u{1F4C1} \u672C\u8BA2\u9605\u4F
 \u5B8C\u6210\u540E\u4F1A\u81EA\u52A8\u66F4\u65B0\u7ED3\u679C\uFF0C\u53EF\u7528 /tasks \u67E5\u770B\u540E\u53F0\u4EFB\u52A1\u3002` });
       await replyWithJobResult(queuedMsg, message, enqueueTelegramTagDownload(client, message, senderId, state.source, input, state.customFolder, {
         includeComments: Boolean(state.includeComments),
-        commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST
+        commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+        onScanComplete: (summary) => updateScanStatusMessage(queuedMsg, summary)
       }), "tag");
     } catch (error) {
       await message.reply({ message: `\u274C \u6807\u7B7E\u4E0B\u8F7D\u5931\u8D25: ${error instanceof Error ? error.message : String(error)}` });
@@ -7356,7 +7399,8 @@ ${buildPathPreviewLine(state.customFolder)}` : "\u{1F4C1} \u672C\u8BA2\u9605\u4F
 \u5B8C\u6210\u540E\u4F1A\u81EA\u52A8\u66F4\u65B0\u7ED3\u679C\uFF0C\u53EF\u7528 /tasks \u67E5\u770B\u540E\u53F0\u4EFB\u52A1\u3002` });
     await replyWithJobResult(queuedMsg, message, enqueueTelegramDateDownload(client, message, senderId, state.source, state.startDate, input, state.customFolder, {
       includeComments: Boolean(state.includeComments),
-      commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST
+      commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+      onScanComplete: (summary) => updateScanStatusMessage(queuedMsg, summary)
     }), "date");
   } catch (error) {
     await message.reply({ message: `\u274C \u65E5\u671F\u4E0B\u8F7D\u5931\u8D25: ${error instanceof Error ? error.message : String(error)}` });

@@ -285,6 +285,34 @@ function isDateOnly(text: string): boolean {
 }
 
 
+interface TelegramDownloadScanSummary {
+    source: string;
+    mode: 'date' | 'tag';
+    channelMessagesScanned: number;
+    channelMediaFound: number;
+    commentMessagesScanned: number;
+    commentMediaFound: number;
+    totalMediaFound: number;
+    commentsEnabled: boolean;
+    commentsMaxPerPost: number;
+}
+
+async function updateScanStatusMessage(statusMessage: Api.Message, summary: TelegramDownloadScanSummary): Promise<void> {
+    const lines = [
+        `🔎 **扫描完成，开始下载**`,
+        `📍 频道：${summary.source}`,
+        ``,
+        `📄 频道正文：扫描 ${summary.channelMessagesScanned} 条，发现 ${summary.channelMediaFound} 个文件`,
+        summary.commentsEnabled
+            ? `💬 评论区：扫描 ${summary.commentMessagesScanned} 条，发现 ${summary.commentMediaFound} 个文件（每帖最多 ${summary.commentsMaxPerPost} 条）`
+            : `💬 评论区：未启用`,
+        `📦 待下载：${summary.totalMediaFound} 个文件`,
+        ``,
+        `⏳ 正在加入下载队列，可用 /tasks 查看后台任务。`,
+    ];
+    await statusMessage.edit({ text: lines.join('\n') }).catch(() => undefined);
+}
+
 async function replyWithJobResult(statusMessage: Api.Message, fallbackMessage: Api.Message, promise: Promise<any>, kind: 'date' | 'tag'): Promise<void> {
     promise
         .then(result => {
@@ -469,6 +497,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
             await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramTagDownload(client!, message, senderId, state.source!, input, state.customFolder, {
                 includeComments: Boolean(state.includeComments),
                 commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+                onScanComplete: summary => updateScanStatusMessage(queuedMsg as Api.Message, summary),
             }), 'tag');
         } catch (error) {
             await message.reply({ message: `❌ 标签下载失败: ${error instanceof Error ? error.message : String(error)}` });
@@ -499,6 +528,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
         await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramDateDownload(client!, message, senderId, state.source!, state.startDate!, input, state.customFolder, {
             includeComments: Boolean(state.includeComments),
             commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
+            onScanComplete: summary => updateScanStatusMessage(queuedMsg as Api.Message, summary),
         }), 'date');
     } catch (error) {
         await message.reply({ message: `❌ 日期下载失败: ${error instanceof Error ? error.message : String(error)}` });
