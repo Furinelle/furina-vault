@@ -2,8 +2,9 @@ import { Router, Request, Response } from 'express';
 import path from 'path';
 import { query } from '../db/index.js';
 import { safeUnlink } from '../utils/localPath.js';
+import { requireAuth } from './auth.js';
 
-const router = Router();
+const router = Router({ strict: true });
 
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './data/uploads');
 const THUMBNAIL_DIR = path.resolve(process.env.THUMBNAIL_DIR || './data/thumbnails');
@@ -40,7 +41,7 @@ async function removePhysicalFile(file: any) {
     }
 }
 
-router.post('/batch-delete', async (req: Request, res: Response) => {
+router.post('/batch-delete', requireAuth, async (req: Request, res: Response) => {
     try {
         const { fileIds = [], folderNames = [] } = req.body;
 
@@ -95,7 +96,7 @@ router.post('/batch-delete', async (req: Request, res: Response) => {
     }
 });
 
-router.patch('/rename-folder', async (req: Request, res: Response) => {
+router.patch('/rename-folder', requireAuth, async (req: Request, res: Response) => {
     try {
         const { oldName, newName } = req.body;
 
@@ -143,7 +144,7 @@ router.patch('/rename-folder', async (req: Request, res: Response) => {
     }
 });
 
-router.patch('/move-folder', async (req: Request, res: Response) => {
+router.patch('/move-folder', requireAuth, async (req: Request, res: Response) => {
     try {
         const { oldName, newName } = req.body;
 

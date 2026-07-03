@@ -169,11 +169,55 @@ async function updateDownloadItemsStatus(jobId: string, messageIds: number[] | u
     );
 }
 
-function parseDateOnly(value: string, endOfDay = false): Date {
+function getTelegramDateTimezone(): string {
+    return process.env.TELEGRAM_DATE_TIMEZONE || process.env.TZ || 'Asia/Shanghai';
+}
+
+function getZonedParts(date: Date, timeZone: string): Record<string, number> {
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hourCycle: 'h23',
+    }).formatToParts(date);
+
+    return Object.fromEntries(
+        parts
+            .filter(part => part.type !== 'literal')
+            .map(part => [part.type, Number(part.value)])
+    ) as Record<string, number>;
+}
+
+function zonedDateTimeToUtc(year: number, month: number, day: number, hour: number, minute: number, second: number, millisecond: number, timeZone: string): Date {
+    const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millisecond));
+    const zoned = getZonedParts(utcGuess, timeZone);
+    const zonedAsUtc = Date.UTC(zoned.year, zoned.month - 1, zoned.day, zoned.hour, zoned.minute, zoned.second, millisecond);
+    const offset = zonedAsUtc - utcGuess.getTime();
+    return new Date(utcGuess.getTime() - offset);
+}
+
+export function parseDateOnly(value: string, endOfDay = false): Date {
     const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (!match) throw new Error('日期格式必须是 YYYY-MM-DD');
-    const [, year, month, day] = match;
-    return new Date(`${year}-${month}-${day}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}Z`);
+    const [, yearText, monthText, dayText] = match;
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const day = Number(dayText);
+    const timezone = getTelegramDateTimezone();
+    return zonedDateTimeToUtc(
+        year,
+        month,
+        day,
+        endOfDay ? 23 : 0,
+        endOfDay ? 59 : 0,
+        endOfDay ? 59 : 0,
+        endOfDay ? 999 : 0,
+        timezone,
+    );
 }
 
 async function createJob(userId: number, chatId: string | undefined, kind: string, source: string, params: Record<string, unknown>) {

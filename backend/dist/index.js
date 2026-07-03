@@ -5256,11 +5256,49 @@ async function updateDownloadItemsStatus(jobId, messageIds, status, error) {
     [jobId, status, error || null, ids]
   );
 }
+function getTelegramDateTimezone() {
+  return process.env.TELEGRAM_DATE_TIMEZONE || process.env.TZ || "Asia/Shanghai";
+}
+function getZonedParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  return Object.fromEntries(
+    parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)])
+  );
+}
+function zonedDateTimeToUtc(year, month, day, hour, minute, second, millisecond, timeZone) {
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millisecond));
+  const zoned = getZonedParts(utcGuess, timeZone);
+  const zonedAsUtc = Date.UTC(zoned.year, zoned.month - 1, zoned.day, zoned.hour, zoned.minute, zoned.second, millisecond);
+  const offset = zonedAsUtc - utcGuess.getTime();
+  return new Date(utcGuess.getTime() - offset);
+}
 function parseDateOnly(value, endOfDay = false) {
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) throw new Error("\u65E5\u671F\u683C\u5F0F\u5FC5\u987B\u662F YYYY-MM-DD");
-  const [, year, month, day] = match;
-  return /* @__PURE__ */ new Date(`${year}-${month}-${day}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`);
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const timezone = getTelegramDateTimezone();
+  return zonedDateTimeToUtc(
+    year,
+    month,
+    day,
+    endOfDay ? 23 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 999 : 0,
+    timezone
+  );
 }
 async function createJob(userId, chatId, kind, source, params) {
   const result = await query(
@@ -9000,7 +9038,7 @@ init_db();
 init_localPath();
 import { Router as Router3 } from "express";
 import path17 from "path";
-var router3 = Router3();
+var router3 = Router3({ strict: true });
 var UPLOAD_DIR6 = path17.resolve(process.env.UPLOAD_DIR || "./data/uploads");
 var THUMBNAIL_DIR6 = path17.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
 var CLOUD_SOURCES2 = /* @__PURE__ */ new Set(["onedrive", "aliyun_oss", "s3", "webdav", "google_drive"]);
@@ -9029,7 +9067,7 @@ async function removePhysicalFile2(file) {
     await safeUnlink(thumbPath, THUMBNAIL_DIR6);
   }
 }
-router3.post("/batch-delete", async (req, res) => {
+router3.post("/batch-delete", requireAuth, async (req, res) => {
   try {
     const { fileIds = [], folderNames = [] } = req.body;
     if (!Array.isArray(fileIds) || !Array.isArray(folderNames)) {
@@ -9073,7 +9111,7 @@ router3.post("/batch-delete", async (req, res) => {
     res.status(500).json({ error: "\u6279\u91CF\u5220\u9664\u5931\u8D25" });
   }
 });
-router3.patch("/rename-folder", async (req, res) => {
+router3.patch("/rename-folder", requireAuth, async (req, res) => {
   try {
     const { oldName, newName } = req.body;
     if (!oldName || !newName || typeof oldName !== "string" || typeof newName !== "string") {
@@ -9113,7 +9151,7 @@ router3.patch("/rename-folder", async (req, res) => {
     res.status(500).json({ error: "\u91CD\u547D\u540D\u6587\u4EF6\u5939\u5931\u8D25" });
   }
 });
-router3.patch("/move-folder", async (req, res) => {
+router3.patch("/move-folder", requireAuth, async (req, res) => {
   try {
     const { oldName, newName } = req.body;
     if (!oldName || typeof oldName !== "string") {
@@ -10233,7 +10271,7 @@ app.use("/thumbnails", requireAuth, express.static(THUMBNAIL_DIR8, {
   maxAge: "7d",
   etag: true
 }));
-app.use("/api/files", requireAuth, folderOperations_default);
+app.use("/api/files", folderOperations_default);
 app.use("/api/files", requireAuthOrSignedUrl, files_default);
 app.use("/api/upload", requireAuth, upload_default);
 app.use("/api/v1/upload", requireAuth, upload_default);

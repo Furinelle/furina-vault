@@ -109,7 +109,9 @@ app.use('/thumbnails', requireAuth, express.static(THUMBNAIL_DIR, {
 }));
 
 // API 路由（需要认证）
-app.use('/api/files', requireAuth, scopedFolderOperationsRouter);
+// 文件夹操作路由仅提供更具体的 batch-delete/rename-folder/move-folder 端点，需先挂载。
+// 不能在挂载点套 requireAuth，否则会抢先拦截 /api/files/:id/thumbnail 这类签名 URL。
+app.use('/api/files', scopedFolderOperationsRouter);
 app.use('/api/files', requireAuthOrSignedUrl, filesRouter);
 app.use('/api/upload', requireAuth, uploadRouter);
 app.use('/api/v1/upload', requireAuth, uploadRouter); // 外部 API 接口保持原有认证（API Key）
