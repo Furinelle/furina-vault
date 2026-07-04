@@ -137,7 +137,7 @@ export const BulkActionToolbar = ({
                         transition={{ duration: 0.3, ease: "easeInOut" }}
                         className="z-40 w-full"
                     >
-                        <div className="bg-white dark:bg-zinc-900 border border-primary/20 shadow-lg rounded-2xl p-3 flex items-center justify-between gap-4">
+                        <div className="bg-white dark:bg-zinc-900 border border-primary/20 shadow-lg rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                             <div className="flex items-center gap-3 pl-1">
                                 <div className="bg-primary/10 p-1.5 rounded-lg">
                                     <CheckSquare className="h-4 w-4 text-primary" />
@@ -152,11 +152,11 @@ export const BulkActionToolbar = ({
                                 </div>
                             </div>
 
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
                                 <Button
                                     variant="ghost"
                                     size="sm"
-                                    className="h-8 px-3 text-xs flex items-center gap-1.5 hover:bg-muted"
+                                    className="h-11 px-4 text-sm flex items-center gap-1.5 hover:bg-muted touch-manipulation"
                                     onClick={() => {
                                         setShowShareSettings(false);
                                         onCancel();
@@ -169,7 +169,7 @@ export const BulkActionToolbar = ({
                                 <Button
                                     variant={showShareSettings ? "secondary" : "ghost"}
                                     size="sm"
-                                    className="h-8 px-3 text-xs flex items-center gap-1.5 hover:bg-primary/10 text-blue-600 hover:text-blue-700"
+                                    className="h-11 px-4 text-sm flex items-center gap-1.5 hover:bg-primary/10 text-blue-600 hover:text-blue-700 touch-manipulation"
                                     onClick={handleShareClick}
                                     disabled={!canShare}
                                     title={!canShare ? "请选择单个文件或文件夹进行分享" : "分享"}
@@ -181,7 +181,7 @@ export const BulkActionToolbar = ({
                                 <Button
                                     variant="destructive"
                                     size="sm"
-                                    className="h-8 px-3 text-xs flex items-center gap-1.5 shadow-md shadow-red-500/10"
+                                    className="h-11 px-4 text-sm flex items-center gap-1.5 shadow-md shadow-red-500/10 touch-manipulation"
                                     onClick={onDelete}
                                     disabled={selectedFilesCount + selectedFoldersCount === 0}
                                 >

@@ -127,7 +127,7 @@ export const LoginPage = ({ onLogin, setupRequired = false, onSetup }: LoginPage
                         className="inline-block mb-4"
                     >
                         <img
-                            src="/logo.png"
+                            src="/logo.png?v=tg-vault"
                             alt="TG Vault Logo"
                             className="w-20 h-20 rounded-2xl shadow-lg shadow-black/10"
                         />

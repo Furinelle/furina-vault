@@ -36,7 +36,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/src/db/schema.sql ./dist/schema.sql
 
 # 创建数据目录
-RUN mkdir -p /data/uploads /data/thumbnails
+RUN mkdir -p /data/uploads /data/thumbnails /data/previews
 
 # 设置权限
 RUN chown -R node:node /app /data

@@ -30,6 +30,23 @@ async function ensureFavoritesColumn() {
     }
 }
 
+async function ensureFilesPerformanceIndexes() {
+    try {
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_account_created ON files(storage_account_id, created_at DESC, id DESC)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_source_created ON files(source, created_at DESC, id DESC)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_account_fav_created ON files(storage_account_id, is_favorite, created_at DESC, id DESC)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_source_fav_created ON files(source, is_favorite, created_at DESC, id DESC)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_account_folder_created ON files(storage_account_id, folder, created_at DESC, id DESC)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_source_folder_created ON files(source, folder, created_at DESC, id DESC)`);
+    } catch (err: any) {
+        if (err?.code === '42P01') {
+            return;
+        }
+        console.error('❌ 数据库迁移失败 (文件列表性能索引):', err);
+        throw err;
+    }
+}
+
 // 自动初始化数据库表结构
 async function initializeDatabase() {
     try {
@@ -83,6 +100,8 @@ async function initializeDatabase() {
         }
 
         await ensureFavoritesColumn();
+        await ensureFilesPerformanceIndexes();
+        await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS preview_path VARCHAR(500)`);
         await pool.query(`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(64)`);
         await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash) WHERE key_hash IS NOT NULL`);
 

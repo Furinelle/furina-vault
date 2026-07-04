@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS files (
     size BIGINT NOT NULL,
     path VARCHAR(500) NOT NULL,
     thumbnail_path VARCHAR(500),
+    preview_path VARCHAR(500),
     width INT,
     height INT,
     source VARCHAR(50) DEFAULT 'web',
@@ -53,6 +54,13 @@ CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
 CREATE INDEX IF NOT EXISTS idx_files_is_favorite ON files(is_favorite);
 CREATE INDEX IF NOT EXISTS idx_files_storage_account_id ON files(storage_account_id);
+CREATE INDEX IF NOT EXISTS idx_files_account_created ON files(storage_account_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_files_source_created ON files(source, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_files_account_fav_created ON files(storage_account_id, is_favorite, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_files_source_fav_created ON files(source, is_favorite, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_files_account_folder_created ON files(storage_account_id, folder, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_files_source_folder_created ON files(source, folder, created_at DESC, id DESC);
+ALTER TABLE files ADD COLUMN IF NOT EXISTS preview_path VARCHAR(500);
 
 CREATE OR REPLACE TRIGGER files_updated_at
     BEFORE UPDATE ON files

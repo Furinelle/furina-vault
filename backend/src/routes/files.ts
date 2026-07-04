@@ -5,11 +5,13 @@ import path from 'path';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getScopedFileById, removePhysicalFile, updateScopedFileById } from '../utils/fileScope.js';
 import { isPathInside } from '../utils/localPath.js';
+import { generateMediaPreview } from '../utils/thumbnail.js';
 
 const router = Router();
 
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './data/uploads');
 const THUMBNAIL_DIR = path.resolve(process.env.THUMBNAIL_DIR || './data/thumbnails');
+const PREVIEW_DIR = path.resolve(process.env.PREVIEW_DIR || './data/previews');
 
 async function getSafeLocalFilePath(file: any): Promise<string> {
     const candidate = file.path || path.join(UPLOAD_DIR, file.stored_name);
@@ -25,6 +27,43 @@ async function getSafeLocalFilePath(file: any): Promise<string> {
         throw new Error('Unsafe local file path');
     }
     return real;
+}
+
+
+async function serveLocalPathWithRange(req: Request, res: Response, filePath: string, mimeType: string, cacheControl: string, etag?: string): Promise<void> {
+    const stat = fs.statSync(filePath);
+    res.set({
+        'Content-Type': mimeType || 'application/octet-stream',
+        'Cache-Control': cacheControl,
+        'Accept-Ranges': 'bytes',
+        ...(etag ? { 'ETag': etag } : {}),
+    });
+
+    const range = req.headers.range;
+    if (range) {
+        const parsedRange = parseRangeHeader(range, stat.size);
+        if (!parsedRange) {
+            res.status(416);
+            res.set({
+                'Content-Range': `bytes */${stat.size}`,
+                'Accept-Ranges': 'bytes',
+            });
+            res.end();
+            return;
+        }
+        const { start, end } = parsedRange;
+        const chunkSize = end - start + 1;
+        res.status(206);
+        res.set({
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+            'Content-Length': String(chunkSize),
+        });
+        fs.createReadStream(filePath, { start, end }).pipe(res);
+        return;
+    }
+
+    res.set('Content-Length', String(stat.size));
+    fs.createReadStream(filePath).pipe(res);
 }
 
 function parseRangeHeader(range: string | undefined, size: number): { start: number; end: number } | null {
@@ -49,41 +88,99 @@ function parseRangeHeader(range: string | undefined, size: number): { start: num
     return { start, end: Math.min(end, size - 1) };
 }
 
+const FILES_LIST_COLUMNS = `
+    id, name, stored_name, type, mime_type, size, thumbnail_path, preview_path,
+    width, height, source, folder, storage_account_id, is_favorite, created_at, updated_at
+`;
+
+type FileCursor = { createdAt: string; id: string };
+
+function encodeFileCursor(file: any): string {
+    return Buffer.from(`${new Date(file.created_at).toISOString()}|${file.id}`, 'utf8').toString('base64url');
+}
+
+function decodeFileCursor(cursor: unknown): FileCursor | null {
+    if (!cursor || typeof cursor !== 'string') return null;
+    try {
+        const decoded = Buffer.from(cursor, 'base64url').toString('utf8');
+        const [createdAt, id] = decoded.split('|');
+        if (!createdAt || !id || Number.isNaN(new Date(createdAt).getTime())) return null;
+        return { createdAt, id };
+    } catch {
+        return null;
+    }
+}
+
+function mapFileForList(file: any) {
+    return {
+        ...file,
+        size: formatFileSize(file.size),
+        date: formatRelativeTime(file.created_at),
+        thumbnailUrl: file.thumbnail_path
+            ? getSignedUrl(file.id, 'thumbnail')
+            : undefined,
+        previewUrl: getSignedUrl(file.id, 'preview'),
+    };
+}
+
+async function queryFilesPage(options: { favoriteOnly?: boolean; cursor?: unknown; limit?: unknown }) {
+    const { storageManager } = await import('../services/storage.js');
+    const activeAccountId = storageManager.getActiveAccountId();
+    const provider = storageManager.getProvider();
+    const limit = Math.min(500, Math.max(1, parseInt(String(options.limit || '200'), 10) || 200));
+    const cursor = decodeFileCursor(options.cursor);
+
+    const whereParts: string[] = [];
+    const params: any[] = [];
+
+    if (provider.name === 'local') {
+        whereParts.push(`source = $${params.length + 1}`);
+        params.push('local');
+    } else {
+        whereParts.push(`storage_account_id = $${params.length + 1}`);
+        params.push(activeAccountId);
+    }
+
+    if (options.favoriteOnly) {
+        whereParts.push(`is_favorite = $${params.length + 1}`);
+        params.push(true);
+    }
+
+    if (cursor) {
+        whereParts.push(`(created_at, id) < ($${params.length + 1}::timestamptz, $${params.length + 2}::uuid)`);
+        params.push(cursor.createdAt, cursor.id);
+    }
+
+    params.push(limit + 1);
+    const result = await query(
+        `SELECT ${FILES_LIST_COLUMNS}
+         FROM files
+         WHERE ${whereParts.join(' AND ')}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${params.length}`,
+        params
+    );
+
+    const rows = result.rows.slice(0, limit);
+    return {
+        files: rows.map(mapFileForList),
+        nextCursor: result.rows.length > limit ? encodeFileCursor(rows[rows.length - 1]) : null,
+        hasMore: result.rows.length > limit,
+    };
+}
+
+function shouldReturnPagedEnvelope(req: Request): boolean {
+    return req.query.page === 'cursor' || req.query.cursor !== undefined || req.query.limit !== undefined;
+}
+
 // 获取文件列表
 router.get('/', async (req: Request, res: Response) => {
     try {
-        const { storageManager } = await import('../services/storage.js');
-        const activeAccountId = storageManager.getActiveAccountId();
-        const provider = storageManager.getProvider();
-
-        const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || '200'), 10) || 200));
-        const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10) || 0);
-        let queryStr = '';
-        let params: any[] = [];
-
-        if (provider.name === 'local') {
-            // 本地存储模式：只显示 source = 'local' 的文件
-            queryStr = 'SELECT * FROM files WHERE source = \'local\' ORDER BY created_at DESC LIMIT $1 OFFSET $2';
-            params = [limit, offset];
-        } else {
-            // 云盘模式：只显示当前激活账户的文件
-            queryStr = 'SELECT * FROM files WHERE storage_account_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3';
-            params = [activeAccountId, limit, offset];
+        const page = await queryFilesPage({ cursor: req.query.cursor, limit: req.query.limit });
+        if (shouldReturnPagedEnvelope(req)) {
+            return res.json(page);
         }
-
-        const result = await query(queryStr, params);
-
-        const files = result.rows.map(file => ({
-            ...file,
-            size: formatFileSize(file.size),
-            date: formatRelativeTime(file.created_at),
-            thumbnailUrl: file.thumbnail_path
-                ? getSignedUrl(file.id, 'thumbnail')
-                : undefined,
-            previewUrl: getSignedUrl(file.id, 'preview'),
-        }));
-
-        res.json(files);
+        res.json(page.files);
     } catch (error) {
         console.error('获取文件列表失败:', error);
         res.status(500).json({ error: '获取文件列表失败' });
@@ -269,47 +366,85 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
             return res.status(404).json({ error: '文件不存在于服务器' });
         }
 
-        // 设置缓存头
-        res.set({
-            'Content-Type': file.mime_type || 'application/octet-stream',
-            'Cache-Control': 'public, max-age=86400',
-            'ETag': `"${file.id}-${file.updated_at}"`,
-        });
+        let previewPath = file.preview_path;
+        let preferredPreviewPath = previewPath && (file.type === 'image' || file.type === 'video')
+            ? path.join(PREVIEW_DIR, path.basename(previewPath))
+            : null;
 
-        // 支持 Range 请求（视频播放等）
-        const stat = fs.statSync(filePath);
-        const range = req.headers.range;
-
-        if (range) {
-            const parsedRange = parseRangeHeader(range, stat.size);
-            if (!parsedRange) {
-                res.status(416);
-                res.set({
-                    'Content-Range': `bytes */${stat.size}`,
-                    'Accept-Ranges': 'bytes',
-                });
-                return res.end();
+        // Backfill previews lazily. Images are cheap enough to generate inline;
+        // videos can be huge, so generate them in the background and stream the
+        // original with Range immediately for this request.
+        if (file.type === 'image' && (!preferredPreviewPath || !fs.existsSync(preferredPreviewPath))) {
+            try {
+                const generatedPreview = await generateMediaPreview(filePath, file.stored_name || file.name, file.mime_type || 'application/octet-stream');
+                if (generatedPreview) {
+                    previewPath = path.basename(generatedPreview);
+                    preferredPreviewPath = path.join(PREVIEW_DIR, previewPath);
+                    await query('UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2', [previewPath, file.id]);
+                }
+            } catch (previewError) {
+                console.error('懒生成图片预览失败:', previewError);
             }
-            const { start, end } = parsedRange;
-            const chunksize = end - start + 1;
-
-            res.status(206);
-            res.set({
-                'Content-Range': `bytes ${start}-${end}/${stat.size}`,
-                'Accept-Ranges': 'bytes',
-                'Content-Length': String(chunksize),
-            });
-
-            const stream = fs.createReadStream(filePath, { start, end });
-            stream.pipe(res);
-        } else {
-            res.set('Content-Length', String(stat.size));
-            const stream = fs.createReadStream(filePath);
-            stream.pipe(res);
+        } else if (file.type === 'video' && (!preferredPreviewPath || !fs.existsSync(preferredPreviewPath))) {
+            void generateMediaPreview(filePath, file.stored_name || file.name, file.mime_type || 'application/octet-stream')
+                .then(async (generatedPreview) => {
+                    if (!generatedPreview) return;
+                    const generatedPreviewName = path.basename(generatedPreview);
+                    await query('UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2', [generatedPreviewName, file.id]);
+                    console.log(`[Preview] 🎞️ Lazy video preview cached for ${file.id}: ${generatedPreviewName}`);
+                })
+                .catch((previewError) => console.error('懒生成视频预览失败:', previewError));
         }
+
+        const servedPath = preferredPreviewPath && fs.existsSync(preferredPreviewPath) ? preferredPreviewPath : filePath;
+        const servedMime = preferredPreviewPath && servedPath === preferredPreviewPath
+            ? (file.type === 'video' ? 'video/mp4' : 'image/webp')
+            : (file.mime_type || 'application/octet-stream');
+
+        await serveLocalPathWithRange(
+            req,
+            res,
+            servedPath,
+            servedMime,
+            'public, max-age=86400',
+            `"${file.id}-${file.updated_at}-${previewPath || 'original'}"`
+        );
     } catch (error) {
         console.error('预览文件失败:', error);
         res.status(500).json({ error: '预览文件失败' });
+    }
+});
+
+// 原始媒体流（不使用预览缓存，用于“查看原图/原视频”）
+router.get('/:id([0-9a-fA-F-]{36})/original', async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const file = await getScopedFileById(id);
+        if (!file) return res.status(404).json({ error: '文件不存在' });
+
+        if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
+            const { storageManager } = await import('../services/storage.js');
+            const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
+            const url = await provider.getPreviewUrl(file.path);
+            if (url) {
+                res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+                return res.redirect(url);
+            }
+            const stream = await provider.getFileStream(file.path);
+            res.set({
+                'Content-Type': file.mime_type || 'application/octet-stream',
+                'Cache-Control': 'public, max-age=86400',
+            });
+            (stream as any).pipe(res);
+            return;
+        }
+
+        const filePath = await getSafeLocalFilePath(file);
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: '文件不存在于服务器' });
+        await serveLocalPathWithRange(req, res, filePath, file.mime_type || 'application/octet-stream', 'public, max-age=86400', `"${file.id}-${file.updated_at}-original"`);
+    } catch (error) {
+        console.error('获取原始文件失败:', error);
+        res.status(500).json({ error: '获取原始文件失败' });
     }
 });
 
@@ -612,38 +747,11 @@ router.post('/:id([0-9a-fA-F-]{36})/share', async (req: Request, res: Response) 
 // 获取收藏的文件
 router.get('/favorites', async (req: Request, res: Response) => {
     try {
-        const { storageManager } = await import('../services/storage.js');
-        const activeAccountId = storageManager.getActiveAccountId();
-        const provider = storageManager.getProvider();
-
-        const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || '200'), 10) || 200));
-        const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10) || 0);
-        let queryStr = '';
-        let params: any[] = [];
-
-        if (provider.name === 'local') {
-            // 本地存储模式：只显示 source = 'local' 的收藏文件
-            queryStr = 'SELECT * FROM files WHERE source = \'local\' AND is_favorite = true ORDER BY created_at DESC LIMIT $1 OFFSET $2';
-            params = [limit, offset];
-        } else {
-            // 云盘模式：只显示当前激活账户的收藏文件
-            queryStr = 'SELECT * FROM files WHERE storage_account_id = $1 AND is_favorite = true ORDER BY created_at DESC LIMIT $2 OFFSET $3';
-            params = [activeAccountId, limit, offset];
+        const page = await queryFilesPage({ favoriteOnly: true, cursor: req.query.cursor, limit: req.query.limit });
+        if (shouldReturnPagedEnvelope(req)) {
+            return res.json(page);
         }
-
-        const result = await query(queryStr, params);
-
-        const files = result.rows.map(file => ({
-            ...file,
-            size: formatFileSize(file.size),
-            date: formatRelativeTime(file.created_at),
-            thumbnailUrl: file.thumbnail_path
-                ? getSignedUrl(file.id, 'thumbnail')
-                : undefined,
-            previewUrl: getSignedUrl(file.id, 'preview'),
-        }));
-
-        res.json(files);
+        res.json(page.files);
     } catch (error) {
         console.error('获取收藏文件失败:', error);
         res.status(500).json({ error: '获取收藏文件失败' });

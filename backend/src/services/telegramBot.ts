@@ -7,7 +7,7 @@ import path from 'path';
 import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleStorage, handleDelete, handleDeleteConfirmCallback, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
+import { handleStart, handleHelp, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleDelete, handleDeleteConfirmCallback, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
 import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask, loadFileDownloadConcurrencySetting } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
 import {
@@ -1051,6 +1051,7 @@ export async function initTelegramBot(): Promise<void> {
                     new Api.BotCommand({ command: 'path_rules', description: '保存路径/自定义目录' }),
                     new Api.BotCommand({ command: 'tg_sub', description: '订阅频道自动同步' }),
                     new Api.BotCommand({ command: 'tg_download', description: '按日期/标签下载频道文件' }),
+                    new Api.BotCommand({ command: 'storage_switch', description: '切换已配置存储源' }),
                     new Api.BotCommand({ command: 'download_workers', description: '设置单文件分片并发' }),
                     new Api.BotCommand({ command: 'file_concurrency', description: '设置同时下载文件数' }),
                     new Api.BotCommand({ command: 'duplicate_mode', description: '设置重复文件处理' }),
@@ -1427,6 +1428,15 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
+                if (text === '/storage_switch' || text === '/switch_storage' || text === '/storage_source') {
+                    if (!(await isAuthenticatedAsync(senderId))) {
+                        await message.reply({ message: MSG.AUTH_REQUIRED });
+                        return;
+                    }
+                    await handleStorageSwitch(message);
+                    return;
+                }
+
                 if (text === '/list' || text.startsWith('/list ')) {
                     await message.reply({ message: '📋 上传记录菜单已隐藏。需要查看文件时请到网页端文件列表，或使用 /storage 查看统计。' });
                     return;
@@ -1662,7 +1672,12 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
-                // 处理存储统计/本地文件清理回调
+                // 处理存储统计/本地文件清理/存储源切换回调
+                if (data.startsWith('storage_switch_')) {
+                    await handleStorageSwitchCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
                 if (data.startsWith('storage_')) {
                     await handleStorageCleanupCallback(activeClient, callbackUpdate, data);
                     return;

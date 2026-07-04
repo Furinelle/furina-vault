@@ -6,6 +6,7 @@ export const CLOUD_SOURCES = new Set(['onedrive', 'aliyun_oss', 's3', 'webdav', 
 
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './data/uploads');
 const THUMBNAIL_DIR = path.resolve(process.env.THUMBNAIL_DIR || './data/thumbnails');
+const PREVIEW_DIR = path.resolve(process.env.PREVIEW_DIR || './data/previews');
 
 export interface StorageScope {
     clause: string;
@@ -49,6 +50,11 @@ export async function removePhysicalFile(file: any): Promise<void> {
     if (file.thumbnail_path) {
         const thumbPath = path.join(THUMBNAIL_DIR, path.basename(file.thumbnail_path));
         await safeUnlink(thumbPath, THUMBNAIL_DIR);
+    }
+
+    if (file.preview_path) {
+        const previewPath = path.join(PREVIEW_DIR, path.basename(file.preview_path));
+        await safeUnlink(previewPath, PREVIEW_DIR);
     }
 }
 

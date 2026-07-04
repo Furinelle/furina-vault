@@ -54,6 +54,12 @@ export interface StorageAccount {
     is_active: boolean;
 }
 
+export interface FilesPage {
+    files: FileData[];
+    nextCursor: string | null;
+    hasMore: boolean;
+}
+
 // 获取带认证的请求头
 function getHeaders(additionalHeaders: Record<string, string> = {}): HeadersInit {
     return {
@@ -63,15 +69,23 @@ function getHeaders(additionalHeaders: Record<string, string> = {}): HeadersInit
 }
 
 class FileAPI {
-    // 获取文件列表
-    async getFiles(): Promise<FileData[]> {
-        const response = await fetch(`${API_BASE}/api/files`, {
+    async getFilesPage(options: { cursor?: string | null; limit?: number; favorites?: boolean } = {}): Promise<FilesPage> {
+        const params = new URLSearchParams({ page: 'cursor', limit: String(options.limit ?? 200) });
+        if (options.cursor) params.set('cursor', options.cursor);
+        const endpoint = options.favorites ? '/api/files/favorites' : '/api/files';
+        const response = await fetch(`${API_BASE}${endpoint}?${params.toString()}`, {
             credentials: 'include',
             headers: getHeaders(),
         });
         if (response.status === 401) throw new Error('UNAUTHORIZED');
-        if (!response.ok) throw new Error('获取文件列表失败');
+        if (!response.ok) throw new Error(options.favorites ? '获取收藏文件失败' : '获取文件列表失败');
         return response.json();
+    }
+
+    // 获取文件列表
+    async getFiles(): Promise<FileData[]> {
+        const page = await this.getFilesPage();
+        return page.files;
     }
 
     // 获取单个文件
@@ -369,6 +383,21 @@ class FileAPI {
         return response.json();
     }
 
+    async cleanupDownloadItems(retentionDays: number = 7): Promise<{ success: boolean; deletedCount: number; retentionDays: number }> {
+        const response = await fetch(`${API_BASE}/api/storage/maintenance/download-items/cleanup`, {
+            credentials: 'include',
+            method: 'POST',
+            headers: getHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ retentionDays }),
+        });
+        if (response.status === 401) throw new Error('UNAUTHORIZED');
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.error || '清理下载任务明细失败');
+        }
+        return response.json();
+    }
+
     // 更新 OneDrive 配置
     async updateOneDriveConfig(clientId: string, clientSecret: string, refreshToken: string, tenantId: string = 'common', name?: string): Promise<{ success: boolean; message: string }> {
         const response = await fetch(`${API_BASE}/api/storage/config/onedrive`, {
@@ -556,13 +585,8 @@ class FileAPI {
     }
     // 获取收藏的文件
     async getFavoriteFiles(): Promise<FileData[]> {
-        const response = await fetch(`${API_BASE}/api/files/favorites`, {
-            credentials: 'include',
-            headers: getHeaders(),
-        });
-        if (response.status === 401) throw new Error('UNAUTHORIZED');
-        if (!response.ok) throw new Error('获取收藏文件失败');
-        return response.json();
+        const page = await this.getFilesPage({ favorites: true });
+        return page.files;
     }
 
     // 切换文件收藏状态
@@ -613,12 +637,12 @@ class FileAPI {
         return response.json();
     }
 
-    async getGoogleDriveAuthUrl(clientId: string, clientSecret: string, redirectUri: string, name?: string): Promise<{ authUrl: string }> {
+    async getGoogleDriveAuthUrl(clientId: string, clientSecret: string, redirectUri: string, name?: string, sharedDriveId?: string): Promise<{ authUrl: string }> {
         const response = await fetch(`${API_BASE}/api/storage/config/google-drive/auth-url`, {
             credentials: 'include',
             method: 'POST',
             headers: getHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ clientId, clientSecret, redirectUri, name }),
+            body: JSON.stringify({ clientId, clientSecret, redirectUri, name, sharedDriveId }),
         });
 
         if (!response.ok) {

@@ -32,6 +32,7 @@ services:
       - COOKIE_SECURE=${COOKIE_SECURE:-true}
       - UPLOAD_DIR=/data/uploads
       - THUMBNAIL_DIR=/data/thumbnails
+      - PREVIEW_DIR=/data/previews
       - CHUNK_DIR=/data/chunks
       - DUPLICATE_FILE_MODE=${DUPLICATE_FILE_MODE:-copy}
       - AUTO_CLEANUP_ORPHANS=${AUTO_CLEANUP_ORPHANS:-true}

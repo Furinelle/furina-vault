@@ -25,6 +25,7 @@ const PORT = process.env.PORT || 51947;
 // 确保上传目录存在
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const THUMBNAIL_DIR = process.env.THUMBNAIL_DIR || './data/thumbnails';
+const PREVIEW_DIR = process.env.PREVIEW_DIR || './data/previews';
 const CHUNK_DIR = process.env.CHUNK_DIR || './data/chunks';
 
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -35,6 +36,11 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 if (!fs.existsSync(THUMBNAIL_DIR)) {
     fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
     console.log(`📁 创建缩略图目录: ${THUMBNAIL_DIR}`);
+}
+
+if (!fs.existsSync(PREVIEW_DIR)) {
+    fs.mkdirSync(PREVIEW_DIR, { recursive: true });
+    console.log(`🎞️ 创建预览目录: ${PREVIEW_DIR}`);
 }
 
 if (!fs.existsSync(CHUNK_DIR)) {
@@ -153,6 +159,7 @@ app.listen(PORT, async () => {
 📍 端口: ${PORT}
 📁 上传目录: ${path.resolve(UPLOAD_DIR)}
 🖼️  缩略图目录: ${path.resolve(THUMBNAIL_DIR)}
+🎞️  预览目录: ${path.resolve(PREVIEW_DIR)}
 🔐 密码保护: ${initialSetupRequired ? '待首次初始化' : '已启用'}
 🤖 Telegram Bot: ${telegramEnabled ? '已启用 (最大 2GB，账号级下载器不受此限制)' : '未启用'}
 👤 Telegram User Download: ${isTelegramUserClientReady() ? '已启用' : '未启用'}

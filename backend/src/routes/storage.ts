@@ -19,6 +19,56 @@ const router = Router();
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 
+function sendOAuthSuccessPage(res: Response, providerName: string, messageType: string): void {
+    const nonce = crypto.randomBytes(16).toString('base64');
+
+    // The OAuth callback is loaded in a popup from a third-party auth flow. Helmet's
+    // global defaults block inline scripts/event handlers and COOP can sever
+    // window.opener, which makes both postMessage() and the "关闭此窗口" button look
+    // dead. Use a route-specific nonce and keep opener access only for this small
+    // success page.
+    res.setHeader('Content-Security-Policy', [
+        "default-src 'self'",
+        "style-src 'unsafe-inline'",
+        `script-src 'nonce-${nonce}'`,
+        "script-src-attr 'none'",
+        "base-uri 'none'",
+        "object-src 'none'",
+    ].join('; '));
+    res.setHeader('Cross-Origin-Opener-Policy', 'unsafe-none');
+    res.type('html').send(`
+            <!doctype html>
+            <html lang="zh-CN">
+                <head>
+                    <meta charset="utf-8" />
+                    <title>${providerName} 授权成功</title>
+                </head>
+                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+                    <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
+                        <h2 style="color: #16a34a; margin-bottom: 10px;">🎉 授权成功！</h2>
+                        <p style="color: #15803d; margin-bottom: 8px;">${providerName} 已成功连接并启用。</p>
+                        <p style="color: #166534; font-size: 14px; margin-bottom: 20px;">窗口将自动关闭。如果未关闭，请点击下方按钮关闭，主页面会自动刷新账户列表。</p>
+                        <button id="close-window" type="button" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">关闭此窗口</button>
+                        <script nonce="${nonce}">
+                            const notifyParent = () => {
+                                if (window.opener && !window.opener.closed) {
+                                    window.opener.postMessage('${messageType}', '*');
+                                }
+                            };
+                            const closeWindow = () => {
+                                notifyParent();
+                                window.close();
+                            };
+                            document.getElementById('close-window')?.addEventListener('click', closeWindow);
+                            notifyParent();
+                            setTimeout(closeWindow, 1200);
+                        </script>
+                    </div>
+                </body>
+            </html>
+        `);
+}
+
 /**
  * 获取 OneDrive 重定向 URI
  * 优先使用 DOMAIN 环境变量，其次使用请求头中的 Host
@@ -173,6 +223,26 @@ router.post('/config/telegram-user-download', requireAuth, async (req: Request, 
     }
 });
 
+router.post('/maintenance/download-items/cleanup', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const retentionDays = Math.min(365, Math.max(1, parseInt(String(req.body?.retentionDays ?? '7'), 10) || 7));
+        const result = await query(
+            `DELETE FROM telegram_download_items
+             WHERE status = 'completed'
+               AND COALESCE(completed_at, updated_at, created_at) < NOW() - ($1::int * INTERVAL '1 day')`,
+            [retentionDays]
+        );
+        res.json({
+            success: true,
+            deletedCount: result.rowCount || 0,
+            retentionDays,
+        });
+    } catch (error) {
+        console.error('清理下载任务明细失败:', error);
+        res.status(500).json({ error: '清理下载任务明细失败' });
+    }
+});
+
 // 获取 OneDrive 授权 URL
 router.post('/config/onedrive/auth-url', requireAuth, async (req: Request, res: Response) => {
     try {
@@ -293,32 +363,7 @@ router.get('/onedrive/callback', async (req: Request, res: Response) => {
             await query('UPDATE storage_accounts SET name = $1 WHERE id = $2', [finalName, activeId]);
         }
 
-        res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
-        res.setHeader('Cross-Origin-Opener-Policy', 'unsafe-none');
-        res.send(`
-            <html>
-                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
-                    <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
-                        <h2 style="color: #16a34a; margin-bottom: 10px;">🎉 授权成功！</h2>
-                        <p style="color: #15803d; margin-bottom: 20px;">OneDrive 已成功连接并启用。</p>
-                        <p style="color: #16a34a; font-size: 13px; margin-bottom: 20px;">窗口将自动关闭。如果未关闭，请手动关闭，主页面会自动刷新账户列表。</p>
-                        <button onclick="notifyParent(); window.close();" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">关闭此窗口</button>
-                        <script>
-                            const notifyParent = () => {
-                                if (window.opener && !window.opener.closed) {
-                                    window.opener.postMessage('onedrive_auth_success', '*');
-                                }
-                            };
-                            notifyParent();
-                            setTimeout(() => {
-                                notifyParent();
-                                window.close();
-                            }, 1200);
-                        </script>
-                    </div>
-                </body>
-            </html>
-        `);
+        sendOAuthSuccessPage(res, 'OneDrive', 'onedrive_auth_success');
     } catch (error: any) {
         console.error('OneDrive 回调处理失败:', error);
         res.status(500).send('授权处理出错，请检查后端日志。');
@@ -328,7 +373,7 @@ router.get('/onedrive/callback', async (req: Request, res: Response) => {
 // 获取 Google Drive 授权 URL
 router.post('/config/google-drive/auth-url', requireAuth, async (req: Request, res: Response) => {
     try {
-        const { clientId, clientSecret, redirectUri, name } = req.body;
+        const { clientId, clientSecret, redirectUri, name, sharedDriveId } = req.body;
         if (!clientId || !clientSecret || !redirectUri) {
             return res.status(400).json({ error: '缺少必要参数 (Client ID, Client Secret 或 Redirect URI)' });
         }
@@ -342,6 +387,7 @@ router.post('/config/google-drive/auth-url', requireAuth, async (req: Request, r
         await StorageManager.updateSetting('google_drive_client_secret', clientSecret);
         await StorageManager.updateSetting('google_drive_redirect_uri', redirectUri);
         await StorageManager.updateSetting('google_drive_oauth_state', oauthState);
+        await StorageManager.updateSetting('google_drive_shared_drive_id', sharedDriveId?.trim() || '');
         if (name) {
             await StorageManager.updateSetting('google_drive_pending_name', name);
         }
@@ -374,6 +420,7 @@ router.get('/google-drive/callback', async (req: Request, res: Response) => {
         const clientId = await storageManager.getSetting('google_drive_client_id');
         const clientSecret = await storageManager.getSetting('google_drive_client_secret') || '';
         const redirectUri = await storageManager.getSetting('google_drive_redirect_uri') || getGoogleDriveRedirectUri(req);
+        const sharedDriveId = await storageManager.getSetting('google_drive_shared_drive_id') || '';
 
         if (!clientId || !clientSecret) {
             return res.send('配置信息丢失，请返回设置页面重试。');
@@ -389,9 +436,10 @@ router.get('/google-drive/callback', async (req: Request, res: Response) => {
         const pendingName = await storageManager.getSetting('google_drive_pending_name');
         await StorageManager.updateSetting('google_drive_pending_name', '');
         await StorageManager.updateSetting('google_drive_oauth_state', '');
+        await StorageManager.updateSetting('google_drive_shared_drive_id', '');
 
         // 保存账户
-        await storageManager.addGoogleDriveAccount(pendingName || 'Google Drive Account', clientId, clientSecret, tokens.refresh_token, redirectUri);
+        await storageManager.addGoogleDriveAccount(pendingName || 'Google Drive Account', clientId, clientSecret, tokens.refresh_token, redirectUri, sharedDriveId);
 
         // 自动切到新账户
         const accounts = await storageManager.getAccounts();
@@ -400,30 +448,7 @@ router.get('/google-drive/callback', async (req: Request, res: Response) => {
             await storageManager.switchAccount(newAccount.id);
         }
 
-        res.send(`
-            <html>
-                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
-                    <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
-                        <h2 style="color: #16a34a; margin-bottom: 10px;">🎉 授权成功！</h2>
-                        <p style="color: #15803d; margin-bottom: 8px;">Google Drive 已成功连接并启用。</p>
-                        <p style="color: #166534; font-size: 14px; margin-bottom: 20px;">窗口将自动关闭。如果未关闭，请手动关闭，主页面会自动刷新账户列表。</p>
-                        <button onclick="window.close()" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">关闭此窗口</button>
-                        <script>
-                            const notifyParent = () => {
-                                if (window.opener) {
-                                    window.opener.postMessage('google_drive_auth_success', '*');
-                                }
-                            };
-                            notifyParent();
-                            setTimeout(() => {
-                                notifyParent();
-                                window.close();
-                            }, 1200);
-                        </script>
-                    </div>
-                </body>
-            </html>
-        `);
+        sendOAuthSuccessPage(res, 'Google Drive', 'google_drive_auth_success');
     } catch (error: any) {
         console.error('Google Drive 回调处理失败:', error);
         res.status(500).send('授权处理出错，请检查后端日志。');

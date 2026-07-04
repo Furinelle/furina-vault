@@ -13,6 +13,7 @@ import {
     buildFileList,
     buildTasksReport,
     buildDeleteSuccess,
+    getProviderDisplayName,
 } from '../utils/telegramMessages.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync } from './telegramState.js';
 import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, retryFailedDownloadTasks, getFileDownloadConcurrency, setFileDownloadConcurrency } from './telegramUpload.js';
@@ -39,6 +40,7 @@ import {
 const checkDiskSpace = (checkDiskSpaceModule as any).default || checkDiskSpaceModule;
 const DOWNLOAD_WORKER_OPTIONS = [4, 8, 12, 16];
 const FILE_CONCURRENCY_OPTIONS = [1, 2, 3, 4];
+const STORAGE_TYPE_ORDER = ['local', 'onedrive', 'google_drive', 'aliyun_oss', 's3', 'webdav'];
 const ON_VALUES = new Set(['1', 'true', 'yes', 'on']);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const THUMBNAIL_DIR = process.env.THUMBNAIL_DIR || './data/thumbnails';
@@ -50,6 +52,14 @@ interface PendingDeleteInfo {
     selector: string;
     createdAt: number;
 }
+
+interface StorageAccountSummary {
+    id: string;
+    name?: string | null;
+    type: string;
+    is_active: boolean;
+}
+
 const pendingDeleteConfirmations = new Map<string, PendingDeleteInfo>();
 const DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 
@@ -123,6 +133,109 @@ function buildStorageMaintenanceKeyboard(localFileCount: number, confirm = false
             }),
         ],
     });
+}
+
+function shortenStorageAccountName(name: string, maxLength = 22): string {
+    return name.length > maxLength ? `${name.slice(0, maxLength - 1)}…` : name;
+}
+
+function sortStorageAccounts(accounts: StorageAccountSummary[]): StorageAccountSummary[] {
+    return [...accounts].sort((a, b) => {
+        const orderDiff = STORAGE_TYPE_ORDER.indexOf(a.type) - STORAGE_TYPE_ORDER.indexOf(b.type);
+        if (orderDiff !== 0) return orderDiff;
+        return (a.name || '').localeCompare(b.name || '', 'zh-CN');
+    });
+}
+
+function buildStorageAccountKeyboard(accounts: StorageAccountSummary[], activeAccountId: string | null): Api.ReplyInlineMarkup {
+    const accountButtons = sortStorageAccounts(accounts).map(account => {
+        const isActive = account.is_active || account.id === activeAccountId;
+        const providerLabel = getProviderDisplayName(account.type).replace(/^[^\p{L}\p{N}]+/u, '').trim();
+        const accountName = shortenStorageAccountName(account.name || '未命名账户');
+        return new Api.KeyboardButtonRow({
+            buttons: [new Api.KeyboardButtonCallback({
+                text: `${isActive ? '✅' : '⬜'} ${providerLabel} · ${accountName}`,
+                data: Buffer.from(`storage_switch_${account.id}`),
+            })],
+        });
+    });
+
+    return new Api.ReplyInlineMarkup({
+        rows: [
+            new Api.KeyboardButtonRow({
+                buttons: [new Api.KeyboardButtonCallback({
+                    text: `${!activeAccountId ? '✅' : '⬜'} 💾 本地存储`,
+                    data: Buffer.from('storage_switch_local'),
+                })],
+            }),
+            ...accountButtons,
+            new Api.KeyboardButtonRow({
+                buttons: [new Api.KeyboardButtonCallback({ text: '🔄 刷新列表', data: Buffer.from('storage_switch_refresh') })],
+            }),
+        ],
+    });
+}
+
+function buildStorageSwitchText(accounts: StorageAccountSummary[], activeAccountId: string | null): string {
+    const activeAccount = accounts.find(account => account.is_active || account.id === activeAccountId);
+    const activeLine = activeAccount
+        ? `${getProviderDisplayName(activeAccount.type)} · ${activeAccount.name || '未命名账户'}`
+        : getProviderDisplayName('local');
+
+    const accountLines = sortStorageAccounts(accounts).map(account => {
+        const marker = account.id === activeAccountId || account.is_active ? '✅' : '⬜';
+        return `${marker} ${getProviderDisplayName(account.type)} · ${account.name || '未命名账户'}\n   ID: \`${String(account.id).slice(0, 8)}\``;
+    });
+
+    return [
+        '🗄️ **存储源切换**',
+        '',
+        `当前使用：${activeLine}`,
+        '',
+        '点击下面按钮即可切换到已在网页端配置好的存储账户；不需要打开前端页面。',
+        '',
+        '**可选存储：**',
+        `✅/⬜ ${getProviderDisplayName('local')}`,
+        ...accountLines,
+        '',
+        '提示：这里只能切换已有账户；新增 OAuth/密钥配置仍需在网页端完成。',
+    ].join('\n');
+}
+
+async function buildStorageSwitchView(): Promise<{ text: string; buttons: Api.ReplyInlineMarkup }> {
+    const accounts = await storageManager.getAccounts() as StorageAccountSummary[];
+    const activeAccountId = storageManager.getActiveAccountId();
+    return {
+        text: buildStorageSwitchText(accounts, activeAccountId),
+        buttons: buildStorageAccountKeyboard(accounts, activeAccountId),
+    };
+}
+
+function isTelegramMessageNotModified(error: unknown): boolean {
+    const err = error as { code?: number; errorMessage?: string; message?: string };
+    return err?.code === 400 && (
+        err?.errorMessage === 'MESSAGE_NOT_MODIFIED' ||
+        String(err?.message || '').includes('MESSAGE_NOT_MODIFIED')
+    );
+}
+
+async function editStorageSwitchMessage(client: TelegramClient, update: Api.UpdateBotCallbackQuery, toast: string): Promise<void> {
+    const view = await buildStorageSwitchView();
+    try {
+        await client.editMessage(update.peer, {
+            message: Number(update.msgId),
+            text: view.text,
+            buttons: view.buttons,
+        });
+    } catch (error) {
+        // Telegram returns 400 MESSAGE_NOT_MODIFIED when the refreshed account list is
+        // identical. That is a successful refresh from the user's perspective, not an
+        // error popup.
+        if (!isTelegramMessageNotModified(error)) {
+            throw error;
+        }
+    }
+    await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast }));
 }
 
 async function scanLocalDownloadFiles(): Promise<{ count: number; totalSize: number; paths: string[] }> {
@@ -362,6 +475,64 @@ export async function handleStorage(message: Api.Message): Promise<void> {
     } catch (error) {
         console.error('🤖 获取存储统计失败:', error);
         await message.reply({ message: MSG.ERR_STORAGE });
+    }
+}
+
+export async function handleStorageSwitch(message: Api.Message): Promise<void> {
+    try {
+        const view = await buildStorageSwitchView();
+        await message.reply({ message: view.text, buttons: view.buttons });
+    } catch (error) {
+        console.error('🤖 获取存储源切换菜单失败:', error);
+        await message.reply({ message: `❌ 获取存储源切换菜单失败: ${(error as Error).message}` });
+    }
+}
+
+export async function handleStorageSwitchCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
+    const userId = update.userId.toJSNumber();
+    if (!(await isAuthenticatedAsync(userId))) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+        return;
+    }
+
+    try {
+        if (data === 'storage_switch_refresh') {
+            await editStorageSwitchMessage(client, update, '已刷新');
+            return;
+        }
+
+        const accountId = data.replace(/^storage_switch_/, '');
+        if (!accountId) {
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '无效的存储源选择', alert: true }));
+            return;
+        }
+
+        if (accountId === 'local') {
+            if (!storageManager.getActiveAccountId()) {
+                await editStorageSwitchMessage(client, update, '当前已经是本地存储');
+                return;
+            }
+            await storageManager.switchAccount('local');
+            await editStorageSwitchMessage(client, update, '已切换到本地存储');
+            return;
+        }
+
+        const accounts = await storageManager.getAccounts() as StorageAccountSummary[];
+        const selected = accounts.find(account => account.id === accountId);
+        if (!selected) {
+            await editStorageSwitchMessage(client, update, '该存储账户已不存在');
+            return;
+        }
+        if (selected.is_active || storageManager.getActiveAccountId() === accountId) {
+            await editStorageSwitchMessage(client, update, '当前已经在使用该账户');
+            return;
+        }
+
+        await storageManager.switchAccount(accountId);
+        await editStorageSwitchMessage(client, update, `已切换到 ${selected.name || getProviderDisplayName(selected.type)}`);
+    } catch (error) {
+        console.error('🤖 切换存储源失败:', error);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `切换失败: ${(error as Error).message}`, alert: true }));
     }
 }
 

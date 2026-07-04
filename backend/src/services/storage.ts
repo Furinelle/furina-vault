@@ -891,6 +891,7 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
     private drive: any;
     private tokenExpiresAt: number = 0;
     private readonly GOOGLE_DRIVE_FOLDER = 'TG Vault';
+    private readonly sharedDriveId?: string;
     private folderIdCache = new Map<string, string>();
     private folderEnsureLocks = new Map<string, Promise<string>>();
 
@@ -899,8 +900,11 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
         private clientId: string,
         private clientSecret: string,
         private refreshToken: string,
-        private redirectUri: string
+        private redirectUri: string,
+        sharedDriveId?: string | null
     ) {
+        const normalizedSharedDriveId = sharedDriveId?.trim();
+        this.sharedDriveId = normalizedSharedDriveId || undefined;
         this.oauth2Client = new google.auth.OAuth2(
             this.clientId,
             this.clientSecret,
@@ -939,15 +943,36 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
         return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     }
 
+    private getRootParentId(): string {
+        return this.sharedDriveId || 'root';
+    }
+
+    private withSharedDriveSupport<T extends Record<string, any>>(params: T, includeListScope = false): T {
+        const next: Record<string, any> = {
+            ...params,
+            supportsAllDrives: true,
+        };
+
+        if (includeListScope) {
+            next.includeItemsFromAllDrives = true;
+            if (this.sharedDriveId) {
+                next.corpora = 'drive';
+                next.driveId = this.sharedDriveId;
+            }
+        }
+
+        return next as T;
+    }
+
     private async findFolderId(segment: string, parentId: string | null): Promise<string | null> {
-        const parentClause: string = parentId ? `'${parentId}' in parents` : `'root' in parents`;
-        const response: any = await this.drive.files.list({
+        const parentClause: string = `'${parentId || this.getRootParentId()}' in parents`;
+        const response: any = await this.drive.files.list(this.withSharedDriveSupport({
             q: `name = '${this.escapeDriveQuery(segment)}' and mimeType = 'application/vnd.google-apps.folder' and ${parentClause} and trashed = false`,
             fields: 'files(id, name, createdTime)',
             orderBy: 'createdTime',
             spaces: 'drive',
             pageSize: 10,
-        });
+        }, true));
         return response.data.files?.[0]?.id || null;
     }
 
@@ -970,12 +995,12 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
                 name: segment,
                 mimeType: 'application/vnd.google-apps.folder'
             };
-            if (parentId) folderMetadata.parents = [parentId];
+            folderMetadata.parents = [parentId || this.getRootParentId()];
 
-            const createdFolder = await this.drive.files.create({
+            const createdFolder = await this.drive.files.create(this.withSharedDriveSupport({
                 resource: folderMetadata,
                 fields: 'id'
-            });
+            }));
             const createdId = createdFolder.data.id;
             this.folderIdCache.set(cacheKey, createdId);
             return createdId;
@@ -1016,11 +1041,11 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
         };
 
         try {
-            const file = await this.drive.files.create({
+            const file = await this.drive.files.create(this.withSharedDriveSupport({
                 resource: fileMetadata,
                 media: media,
                 fields: 'id'
-            });
+            }));
             console.log('[GoogleDrive] Upload successful, file ID:', file.data.id);
             return file.data.id;
         } catch (error: any) {
@@ -1033,7 +1058,7 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
         await this.ensureAuthenticated();
         try {
             const response = await this.drive.files.get(
-                { fileId: storedPath, alt: 'media' },
+                this.withSharedDriveSupport({ fileId: storedPath, alt: 'media' }),
                 { responseType: 'stream' }
             );
             return response.data;
@@ -1051,7 +1076,7 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
     async deleteFile(storedPath: string): Promise<void> {
         await this.ensureAuthenticated();
         try {
-            await this.drive.files.delete({ fileId: storedPath });
+            await this.drive.files.delete(this.withSharedDriveSupport({ fileId: storedPath }));
             console.log('[GoogleDrive] Delete successful:', storedPath);
         } catch (error: any) {
             if (error.code === 404) {
@@ -1066,10 +1091,10 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
     async getFileSize(storedPath: string): Promise<number> {
         await this.ensureAuthenticated();
         try {
-            const response = await this.drive.files.get({
+            const response = await this.drive.files.get(this.withSharedDriveSupport({
                 fileId: storedPath,
                 fields: 'size'
-            });
+            }));
             return parseInt(response.data.size || '0');
         } catch (error: any) {
             console.error('[GoogleDrive] Get file size failed:', error.message);
@@ -1086,19 +1111,19 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
         try {
             // 1. 设置权限为“任何拥有链接的人均可查看”
             // 注意：drive.file 作用域下，只能对应用创建的文件起作用
-            await this.drive.permissions.create({
+            await this.drive.permissions.create(this.withSharedDriveSupport({
                 fileId: storedPath,
                 requestBody: {
                     role: 'reader',
                     type: 'anyone',
                 },
-            });
+            }));
 
             // 2. 获取 webViewLink
-            const response = await this.drive.files.get({
+            const response = await this.drive.files.get(this.withSharedDriveSupport({
                 fileId: storedPath,
                 fields: 'webViewLink',
-            });
+            }));
 
             const link = response.data.webViewLink;
             if (!link) {
@@ -1256,7 +1281,8 @@ export class StorageManager {
                         config.clientId,
                         config.clientSecret,
                         config.refreshToken,
-                        config.redirectUri
+                        config.redirectUri,
+                        config.sharedDriveId
                     );
                     this.providers.set(`google_drive:${row.id}`, provider);
                 }
@@ -1483,8 +1509,9 @@ export class StorageManager {
         return targetId;
     }
 
-    async addGoogleDriveAccount(name: string, clientId: string, clientSecret: string, refreshToken: string, redirectUri: string) {
-        const config = JSON.stringify(encryptStorageConfig({ clientId, clientSecret, refreshToken, redirectUri }));
+    async addGoogleDriveAccount(name: string, clientId: string, clientSecret: string, refreshToken: string, redirectUri: string, sharedDriveId?: string | null) {
+        const normalizedSharedDriveId = sharedDriveId?.trim() || undefined;
+        const config = JSON.stringify(encryptStorageConfig({ clientId, clientSecret, refreshToken, redirectUri, sharedDriveId: normalizedSharedDriveId }));
 
         const res = await query(
             `INSERT INTO storage_accounts (type, name, config, is_active) 
@@ -1494,7 +1521,7 @@ export class StorageManager {
         const targetId = res.rows[0].id;
         console.log(`[StorageManager] Added new Google Drive account: ${targetId}`);
 
-        const gd = new GoogleDriveStorageProvider(targetId, clientId, clientSecret, refreshToken, redirectUri);
+        const gd = new GoogleDriveStorageProvider(targetId, clientId, clientSecret, refreshToken, redirectUri, normalizedSharedDriveId);
         this.providers.set(`google_drive:${targetId}`, gd);
 
         return targetId;

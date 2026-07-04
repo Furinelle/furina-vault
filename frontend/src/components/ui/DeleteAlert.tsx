@@ -10,9 +10,11 @@ interface DeleteAlertProps {
     onClose: () => void;
     onConfirm: () => void | Promise<void>;
     fileName?: string;
+    itemCount?: number;
+    folderCount?: number;
 }
 
-export const DeleteAlert = ({ isOpen, onClose, onConfirm, fileName }: DeleteAlertProps) => {
+export const DeleteAlert = ({ isOpen, onClose, onConfirm, fileName, itemCount, folderCount = 0 }: DeleteAlertProps) => {
     const { t } = useTranslation();
     const [isDeleting, setIsDeleting] = useState(false);
 
@@ -71,7 +73,18 @@ export const DeleteAlert = ({ isOpen, onClose, onConfirm, fileName }: DeleteAler
                         <div className="flex items-start gap-4">
                             <div className="flex-1">
                                 <p className="text-sm text-foreground/80 leading-relaxed">
-                                    {fileName ? (
+                                    {itemCount ? (
+                                        <>
+                                            即将删除 <span className="font-semibold text-foreground">{itemCount}</span> 个项目。
+                                            {folderCount > 0 && (
+                                                <>
+                                                    <br />其中包含 <span className="font-semibold text-foreground">{folderCount}</span> 个文件夹，文件夹内文件也会一并删除。
+                                                </>
+                                            )}
+                                            <br className="mb-2" />
+                                            删除后将无法恢复，请确认是否继续？
+                                        </>
+                                    ) : fileName ? (
                                         <>
                                             即将删除文件 <span className="font-semibold text-foreground break-all">"{fileName}"</span>。
                                             <br className="mb-2" />

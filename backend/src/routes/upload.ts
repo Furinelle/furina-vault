@@ -6,7 +6,7 @@ import path from 'path';
 import fs from 'fs';
 import { query } from '../db/index.js';
 import { validateApiKey } from '../middleware/apiKey.js';
-import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
+import { generateThumbnail, getImageDimensions, generateMediaPreview } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
@@ -102,6 +102,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         // 2. 在保存到永久存储前生成缩略图和获取尺寸
         // 方案A：只在本地存储生成缩略图；OneDrive/S3/OSS/WebDAV/Google Drive 等第三方存储不生成本地缩略图。
         let thumbnailPath = null;
+        let previewPath = null;
         let width = null;
         let height = null;
         const duplicateMode = await getDuplicateMode();
@@ -141,6 +142,18 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             }
         }
 
+        if (provider.name === 'local' && mimeType.startsWith('image/')) {
+            try {
+                const previewResult = await generateMediaPreview(tempPath, storedName, mimeType);
+                if (previewResult) {
+                    previewPath = path.basename(previewResult);
+                    console.log(`[Upload] 🎞️ Image preview generated: ${previewPath}`);
+                }
+            } catch (error) {
+                console.error('生成图片预览失败:', error);
+            }
+        }
+
         // 3. 保存到永久存储
         let storedPath = '';
         try {
@@ -170,14 +183,25 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             mimeType.includes('sql')) type = 'document';
 
         const result = await query(
-            `INSERT INTO files 
-            (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+            `INSERT INTO files
+            (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id, created_at, name, type, size`,
-            [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, width, height, provider.name, storageFolder, activeAccountId]
+            [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, previewPath, width, height, provider.name, storageFolder, activeAccountId]
         );
 
         const newFile = result.rows[0];
+
+        if (provider.name === 'local' && type === 'video') {
+            void generateMediaPreview(storedPath, storedName, mimeType)
+                .then(async (previewResult) => {
+                    if (!previewResult) return;
+                    const generatedPreviewName = path.basename(previewResult);
+                    await query('UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2', [generatedPreviewName, newFile.id]);
+                    console.log(`[Upload] 🎞️ Video preview generated async: ${generatedPreviewName}`);
+                })
+                .catch((error) => console.error('异步生成视频预览失败:', error));
+        }
 
         res.json({
             success: true,

@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Download, Eye, FileText, Image as ImageIcon, Music, Video, Trash2, Cloud, HardDrive, Database, Package, Network, Star, MoreVertical } from "lucide-react";
+import { Download, Eye, FileText, Image as ImageIcon, Music, Video, Cloud, HardDrive, Database, Package, Network, Star, MoreVertical } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./Button";
@@ -115,7 +115,7 @@ export const FileCard = ({
             <motion.div
                 layout
                 whileHover={{ y: isSelectionMode ? 0 : -4, transition: { duration: 0.2 } }}
-                className={`group relative flex flex-col rounded-2xl border ${isSelected ? 'border-primary ring-2 ring-primary/20 bg-primary/5' : 'border-border/50 bg-card'} overflow-hidden shadow-sm transition-all ${!isSelectionMode ? 'hover:shadow-lg hover:border-border cursor-pointer' : 'cursor-default'}`}
+                className={`group relative flex flex-col rounded-2xl border ${isSelected ? 'border-primary ring-2 ring-primary/20 bg-primary/5' : 'border-border/50 bg-card'} overflow-hidden shadow-sm transition-all touch-manipulation select-none ${!isSelectionMode ? 'hover:shadow-lg hover:border-border cursor-pointer active:scale-[0.99]' : 'cursor-pointer active:scale-[0.99]'}`}
                 {...(!isSelectionMode ? longPressHandlers : { onClick: handleCardClick })}
                 onContextMenu={handleContextMenu}
             >
@@ -125,7 +125,7 @@ export const FileCard = ({
                         <img
                             src={thumbnailSrc}
                             alt={file.name}
-                            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
+                            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
                             loading="lazy"
                         />
                     ) : (
@@ -140,11 +140,14 @@ export const FileCard = ({
                     {/* Selection Checkbox */}
                     {isSelectionMode && (
                         <div
-                            className="absolute bottom-2 right-2 z-20"
+                            className="absolute bottom-2 right-2 z-20 flex h-11 w-11 items-center justify-center"
                             onClick={(e) => e.stopPropagation()}
                         >
                             <div
-                                className={`h-6 w-6 rounded-full border-2 flex items-center justify-center transition-all cursor-pointer ${isSelected ? 'bg-primary border-primary' : 'bg-black/20 border-white/50 backdrop-blur-sm'}`}
+                                role="checkbox"
+                                aria-checked={isSelected}
+                                aria-label={`选择 ${file.name}`}
+                                className={`h-7 w-7 rounded-full border-2 flex items-center justify-center transition-all cursor-pointer shadow-sm ${isSelected ? 'bg-primary border-primary' : 'bg-black/35 border-white/70 backdrop-blur-sm'}`}
                                 onClick={() => onSelect?.(file.id)}
                             >
                                 {isSelected && (
@@ -176,11 +179,11 @@ export const FileCard = ({
 
                     {/* Hover Overlay Actions */}
                     {!isSelectionMode && (
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/30 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100 flex items-end justify-center pb-4 gap-3">
+                        <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/30 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100 hidden md:flex items-end justify-center pb-4 gap-3">
                             <Button
                                 size="icon"
                                 variant="secondary"
-                                className="h-9 w-9 rounded-full bg-white/95 hover:bg-white text-gray-700 shadow-lg transition-all hover:scale-110"
+                                className="h-11 w-11 rounded-full bg-white/95 hover:bg-white text-gray-700 shadow-lg transition-all hover:scale-105"
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onPreview?.();
@@ -196,7 +199,7 @@ export const FileCard = ({
                             <Button
                                 size="icon"
                                 variant="secondary"
-                                className="h-9 w-9 rounded-full bg-white/95 hover:bg-white text-gray-700 shadow-lg transition-all hover:scale-110"
+                                className="h-11 w-11 rounded-full bg-white/95 hover:bg-white text-gray-700 shadow-lg transition-all hover:scale-105"
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     handleDownload();
@@ -209,44 +212,6 @@ export const FileCard = ({
                             >
                                 <Download className="h-4 w-4" />
                             </Button>
-                            {onToggleFavorite && (
-                                <Button
-                                    size="icon"
-                                    variant="secondary"
-                                    className={`h-9 w-9 rounded-full bg-white/95 hover:bg-white shadow-lg transition-all hover:scale-110 ${
-                                        file.is_favorite ? 'text-yellow-500 hover:bg-yellow-50' : 'text-gray-500'
-                                    }`}
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onToggleFavorite();
-                                    }}
-                                    onMouseDown={(e) => e.stopPropagation()}
-                                    onMouseUp={(e) => e.stopPropagation()}
-                                    onTouchStart={(e) => e.stopPropagation()}
-                                    onTouchEnd={(e) => e.stopPropagation()}
-                                    title={file.is_favorite ? '取消收藏' : '收藏'}
-                                >
-                                    <Star className={`h-4 w-4 ${file.is_favorite ? 'fill-current' : ''}`} />
-                                </Button>
-                            )}
-                            {onDelete && (
-                                <Button
-                                    size="icon"
-                                    variant="secondary"
-                                    className="h-9 w-9 rounded-full bg-white/95 hover:bg-red-50 text-red-500 hover:text-red-600 shadow-lg transition-all hover:scale-110"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onDelete();
-                                    }}
-                                    onMouseDown={(e) => e.stopPropagation()}
-                                    onMouseUp={(e) => e.stopPropagation()}
-                                    onTouchStart={(e) => e.stopPropagation()}
-                                    onTouchEnd={(e) => e.stopPropagation()}
-                                    title="删除"
-                                >
-                                    <Trash2 className="h-4 w-4" />
-                                </Button>
-                            )}
                         </div>
                     )}
                 </div>
@@ -263,7 +228,7 @@ export const FileCard = ({
                         <Button
                             variant="ghost"
                             size="icon"
-                            className="h-8 w-8 rounded-full md:opacity-0 group-hover:opacity-100 transition-opacity -mr-1.5"
+                            className="h-11 w-11 rounded-full md:opacity-0 group-hover:opacity-100 transition-opacity -mr-1.5 touch-manipulation"
                             onClick={(e) => {
                                 e.stopPropagation();
                                 const rect = e.currentTarget.getBoundingClientRect();
@@ -273,8 +238,9 @@ export const FileCard = ({
                             onMouseUp={(e) => e.stopPropagation()}
                             onTouchStart={(e) => e.stopPropagation()}
                             onTouchEnd={(e) => e.stopPropagation()}
+                                                    aria-label={`更多操作：${file.name}`}
                         >
-                            <MoreVertical className="h-4 w-4" />
+                            <MoreVertical className="h-5 w-5" />
                         </Button>
                     )}
                 </div>

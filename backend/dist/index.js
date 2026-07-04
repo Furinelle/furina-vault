@@ -31,6 +31,22 @@ async function ensureFavoritesColumn() {
     throw err;
   }
 }
+async function ensureFilesPerformanceIndexes() {
+  try {
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_account_created ON files(storage_account_id, created_at DESC, id DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_source_created ON files(source, created_at DESC, id DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_account_fav_created ON files(storage_account_id, is_favorite, created_at DESC, id DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_source_fav_created ON files(source, is_favorite, created_at DESC, id DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_account_folder_created ON files(storage_account_id, folder, created_at DESC, id DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_source_folder_created ON files(source, folder, created_at DESC, id DESC)`);
+  } catch (err) {
+    if (err?.code === "42P01") {
+      return;
+    }
+    console.error("\u274C \u6570\u636E\u5E93\u8FC1\u79FB\u5931\u8D25 (\u6587\u4EF6\u5217\u8868\u6027\u80FD\u7D22\u5F15):", err);
+    throw err;
+  }
+}
 async function initializeDatabase() {
   try {
     const schemaPath = path.join(__dirname, "schema.sql");
@@ -74,6 +90,8 @@ async function initializeDatabase() {
       }
     }
     await ensureFavoritesColumn();
+    await ensureFilesPerformanceIndexes();
+    await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS preview_path VARCHAR(500)`);
     await pool.query(`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(64)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash) WHERE key_hash IS NOT NULL`);
     console.log("\u2705 \u6570\u636E\u5E93\u8868\u7ED3\u6784\u521D\u59CB\u5316\u5B8C\u6210");
@@ -1056,12 +1074,14 @@ var init_storage = __esm({
       }
     };
     GoogleDriveStorageProvider = class {
-      constructor(id, clientId, clientSecret, refreshToken, redirectUri) {
+      constructor(id, clientId, clientSecret, refreshToken, redirectUri, sharedDriveId) {
         this.id = id;
         this.clientId = clientId;
         this.clientSecret = clientSecret;
         this.refreshToken = refreshToken;
         this.redirectUri = redirectUri;
+        const normalizedSharedDriveId = sharedDriveId?.trim();
+        this.sharedDriveId = normalizedSharedDriveId || void 0;
         this.oauth2Client = new google.auth.OAuth2(
           this.clientId,
           this.clientSecret,
@@ -1082,6 +1102,7 @@ var init_storage = __esm({
       drive;
       tokenExpiresAt = 0;
       GOOGLE_DRIVE_FOLDER = "TG Vault";
+      sharedDriveId;
       folderIdCache = /* @__PURE__ */ new Map();
       folderEnsureLocks = /* @__PURE__ */ new Map();
       static generateAuthUrl(clientId, clientSecret, redirectUri, state) {
@@ -1107,15 +1128,32 @@ var init_storage = __esm({
       escapeDriveQuery(value) {
         return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       }
+      getRootParentId() {
+        return this.sharedDriveId || "root";
+      }
+      withSharedDriveSupport(params, includeListScope = false) {
+        const next = {
+          ...params,
+          supportsAllDrives: true
+        };
+        if (includeListScope) {
+          next.includeItemsFromAllDrives = true;
+          if (this.sharedDriveId) {
+            next.corpora = "drive";
+            next.driveId = this.sharedDriveId;
+          }
+        }
+        return next;
+      }
       async findFolderId(segment, parentId) {
-        const parentClause = parentId ? `'${parentId}' in parents` : `'root' in parents`;
-        const response = await this.drive.files.list({
+        const parentClause = `'${parentId || this.getRootParentId()}' in parents`;
+        const response = await this.drive.files.list(this.withSharedDriveSupport({
           q: `name = '${this.escapeDriveQuery(segment)}' and mimeType = 'application/vnd.google-apps.folder' and ${parentClause} and trashed = false`,
           fields: "files(id, name, createdTime)",
           orderBy: "createdTime",
           spaces: "drive",
           pageSize: 10
-        });
+        }, true));
         return response.data.files?.[0]?.id || null;
       }
       async ensureChildFolder(segment, parentId) {
@@ -1134,11 +1172,11 @@ var init_storage = __esm({
             name: segment,
             mimeType: "application/vnd.google-apps.folder"
           };
-          if (parentId) folderMetadata.parents = [parentId];
-          const createdFolder = await this.drive.files.create({
+          folderMetadata.parents = [parentId || this.getRootParentId()];
+          const createdFolder = await this.drive.files.create(this.withSharedDriveSupport({
             resource: folderMetadata,
             fields: "id"
-          });
+          }));
           const createdId = createdFolder.data.id;
           this.folderIdCache.set(cacheKey, createdId);
           return createdId;
@@ -1171,11 +1209,11 @@ var init_storage = __esm({
           body: fs4.createReadStream(tempPath)
         };
         try {
-          const file = await this.drive.files.create({
+          const file = await this.drive.files.create(this.withSharedDriveSupport({
             resource: fileMetadata,
             media,
             fields: "id"
-          });
+          }));
           console.log("[GoogleDrive] Upload successful, file ID:", file.data.id);
           return file.data.id;
         } catch (error) {
@@ -1187,7 +1225,7 @@ var init_storage = __esm({
         await this.ensureAuthenticated();
         try {
           const response = await this.drive.files.get(
-            { fileId: storedPath, alt: "media" },
+            this.withSharedDriveSupport({ fileId: storedPath, alt: "media" }),
             { responseType: "stream" }
           );
           return response.data;
@@ -1202,7 +1240,7 @@ var init_storage = __esm({
       async deleteFile(storedPath) {
         await this.ensureAuthenticated();
         try {
-          await this.drive.files.delete({ fileId: storedPath });
+          await this.drive.files.delete(this.withSharedDriveSupport({ fileId: storedPath }));
           console.log("[GoogleDrive] Delete successful:", storedPath);
         } catch (error) {
           if (error.code === 404) {
@@ -1216,10 +1254,10 @@ var init_storage = __esm({
       async getFileSize(storedPath) {
         await this.ensureAuthenticated();
         try {
-          const response = await this.drive.files.get({
+          const response = await this.drive.files.get(this.withSharedDriveSupport({
             fileId: storedPath,
             fields: "size"
-          });
+          }));
           return parseInt(response.data.size || "0");
         } catch (error) {
           console.error("[GoogleDrive] Get file size failed:", error.message);
@@ -1232,17 +1270,17 @@ var init_storage = __esm({
       async createShareLink(storedPath, password, expiration) {
         await this.ensureAuthenticated();
         try {
-          await this.drive.permissions.create({
+          await this.drive.permissions.create(this.withSharedDriveSupport({
             fileId: storedPath,
             requestBody: {
               role: "reader",
               type: "anyone"
             }
-          });
-          const response = await this.drive.files.get({
+          }));
+          const response = await this.drive.files.get(this.withSharedDriveSupport({
             fileId: storedPath,
             fields: "webViewLink"
-          });
+          }));
           const link = response.data.webViewLink;
           if (!link) {
             return { link: "", error: "Google Drive \u672A\u8FD4\u56DE\u6709\u6548\u7684\u5206\u4EAB\u94FE\u63A5" };
@@ -1374,7 +1412,8 @@ var init_storage = __esm({
                 config.clientId,
                 config.clientSecret,
                 config.refreshToken,
-                config.redirectUri
+                config.redirectUri,
+                config.sharedDriveId
               );
               this.providers.set(`google_drive:${row.id}`, provider);
             }
@@ -1558,8 +1597,9 @@ var init_storage = __esm({
         this.providers.set(`webdav:${targetId}`, webdav);
         return targetId;
       }
-      async addGoogleDriveAccount(name, clientId, clientSecret, refreshToken, redirectUri) {
-        const config = JSON.stringify(encryptStorageConfig({ clientId, clientSecret, refreshToken, redirectUri }));
+      async addGoogleDriveAccount(name, clientId, clientSecret, refreshToken, redirectUri, sharedDriveId) {
+        const normalizedSharedDriveId = sharedDriveId?.trim() || void 0;
+        const config = JSON.stringify(encryptStorageConfig({ clientId, clientSecret, refreshToken, redirectUri, sharedDriveId: normalizedSharedDriveId }));
         const res = await query(
           `INSERT INTO storage_accounts (type, name, config, is_active) 
              VALUES ($1, $2, $3, $4) RETURNING id`,
@@ -1567,7 +1607,7 @@ var init_storage = __esm({
         );
         const targetId = res.rows[0].id;
         console.log(`[StorageManager] Added new Google Drive account: ${targetId}`);
-        const gd = new GoogleDriveStorageProvider(targetId, clientId, clientSecret, refreshToken, redirectUri);
+        const gd = new GoogleDriveStorageProvider(targetId, clientId, clientSecret, refreshToken, redirectUri, normalizedSharedDriveId);
         this.providers.set(`google_drive:${targetId}`, gd);
         return targetId;
       }
@@ -2651,6 +2691,74 @@ import crypto5 from "crypto";
 var THUMBNAIL_DIR = path6.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
 if (!fs5.existsSync(THUMBNAIL_DIR)) {
   fs5.mkdirSync(THUMBNAIL_DIR, { recursive: true });
+}
+var PREVIEW_DIR = path6.resolve(process.env.PREVIEW_DIR || "./data/previews");
+if (!fs5.existsSync(PREVIEW_DIR)) {
+  fs5.mkdirSync(PREVIEW_DIR, { recursive: true });
+}
+function isMp4Like(mimeType, filePath) {
+  const lower = filePath.toLowerCase();
+  return mimeType === "video/mp4" || lower.endsWith(".mp4") || lower.endsWith(".m4v") || lower.endsWith(".mov");
+}
+function ffmpegRun(command, label) {
+  return new Promise((resolve, reject) => {
+    command.on("start", (cmd) => console.log(`[Preview] ${label} CMD: ${cmd}`)).on("end", () => resolve()).on("error", (err) => reject(err)).run();
+  });
+}
+async function generateMediaPreview(filePath, storedName, mimeType) {
+  const absFilePath = path6.resolve(filePath);
+  if (!fs5.existsSync(absFilePath)) return null;
+  try {
+    if (mimeType.startsWith("image/") && mimeType !== "image/gif") {
+      const previewName = `preview_${crypto5.randomUUID()}.webp`;
+      const previewPath = path6.join(PREVIEW_DIR, previewName);
+      await sharp(absFilePath).rotate().resize(2048, 2048, { fit: "inside", withoutEnlargement: true }).webp({ quality: 86, effort: 4 }).toFile(previewPath);
+      console.log(`[Preview] \u2705 Image preview created: ${previewName}`);
+      return previewPath;
+    }
+    if (mimeType.startsWith("video/")) {
+      const previewName = `preview_${crypto5.randomUUID()}.mp4`;
+      const previewPath = path6.join(PREVIEW_DIR, previewName);
+      const mp4Like = isMp4Like(mimeType, storedName || absFilePath);
+      if (mp4Like) {
+        try {
+          await ffmpegRun(
+            ffmpeg(absFilePath).outputOptions(["-c copy", "-movflags +faststart"]).output(previewPath),
+            "Video faststart"
+          );
+          if (fs5.existsSync(previewPath) && fs5.statSync(previewPath).size > 0) {
+            console.log(`[Preview] \u2705 Video faststart preview created: ${previewName}`);
+            return previewPath;
+          }
+        } catch (copyError) {
+          console.warn(`[Preview] \u26A0\uFE0F Faststart copy failed, fallback to transcode: ${copyError.message}`);
+          try {
+            if (fs5.existsSync(previewPath)) fs5.unlinkSync(previewPath);
+          } catch {
+          }
+        }
+      }
+      await ffmpegRun(
+        ffmpeg(absFilePath).videoCodec("libx264").audioCodec("aac").size("?x720").outputOptions([
+          "-preset veryfast",
+          "-crf 23",
+          "-movflags +faststart",
+          "-pix_fmt yuv420p",
+          "-profile:v baseline",
+          "-level 3.1",
+          "-b:a 128k"
+        ]).output(previewPath),
+        "Video transcode"
+      );
+      if (fs5.existsSync(previewPath) && fs5.statSync(previewPath).size > 0) {
+        console.log(`[Preview] \u2705 Video transcoded preview created: ${previewName}`);
+        return previewPath;
+      }
+    }
+  } catch (error) {
+    console.error(`[Preview] \u274C Generate preview failed for ${storedName}:`, error.message);
+  }
+  return null;
 }
 async function generateThumbnail(filePath, storedName, mimeType) {
   const absFilePath = path6.resolve(filePath);
@@ -5193,6 +5301,9 @@ async function handleFileUpload(client2, event) {
   }
 }
 
+// src/services/telegramCommands.ts
+init_storage();
+
 // src/services/telegramChannelJobs.ts
 init_db();
 var SUBSCRIPTION_INTERVAL_MS = Math.max(6e4, parseInt(process.env.TELEGRAM_SUBSCRIPTION_INTERVAL_MS || "300000", 10) || 3e5);
@@ -6162,6 +6273,7 @@ import path12 from "path";
 var CLOUD_SOURCES = /* @__PURE__ */ new Set(["onedrive", "aliyun_oss", "s3", "webdav", "google_drive"]);
 var UPLOAD_DIR3 = path12.resolve(process.env.UPLOAD_DIR || "./data/uploads");
 var THUMBNAIL_DIR3 = path12.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var PREVIEW_DIR2 = path12.resolve(process.env.PREVIEW_DIR || "./data/previews");
 async function getCurrentStorageScope() {
   const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
   const provider = storageManager2.getProvider();
@@ -6194,6 +6306,10 @@ async function removePhysicalFile(file) {
     const thumbPath = path12.join(THUMBNAIL_DIR3, path12.basename(file.thumbnail_path));
     await safeUnlink(thumbPath, THUMBNAIL_DIR3);
   }
+  if (file.preview_path) {
+    const previewPath = path12.join(PREVIEW_DIR2, path12.basename(file.preview_path));
+    await safeUnlink(previewPath, PREVIEW_DIR2);
+  }
 }
 async function updateScopedFileById(id, setSql, values) {
   const scope = await getCurrentStorageScope();
@@ -6209,6 +6325,7 @@ async function updateScopedFileById(id, setSql, values) {
 var checkDiskSpace = checkDiskSpaceModule.default || checkDiskSpaceModule;
 var DOWNLOAD_WORKER_OPTIONS = [4, 8, 12, 16];
 var FILE_CONCURRENCY_OPTIONS = [1, 2, 3, 4];
+var STORAGE_TYPE_ORDER = ["local", "onedrive", "google_drive", "aliyun_oss", "s3", "webdav"];
 var ON_VALUES = /* @__PURE__ */ new Set(["1", "true", "yes", "on"]);
 var UPLOAD_DIR4 = process.env.UPLOAD_DIR || "./data/uploads";
 var THUMBNAIL_DIR4 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
@@ -6276,6 +6393,92 @@ function buildStorageMaintenanceKeyboard(localFileCount, confirm = false) {
       })
     ]
   });
+}
+function shortenStorageAccountName(name, maxLength = 22) {
+  return name.length > maxLength ? `${name.slice(0, maxLength - 1)}\u2026` : name;
+}
+function sortStorageAccounts(accounts) {
+  return [...accounts].sort((a, b) => {
+    const orderDiff = STORAGE_TYPE_ORDER.indexOf(a.type) - STORAGE_TYPE_ORDER.indexOf(b.type);
+    if (orderDiff !== 0) return orderDiff;
+    return (a.name || "").localeCompare(b.name || "", "zh-CN");
+  });
+}
+function buildStorageAccountKeyboard(accounts, activeAccountId) {
+  const accountButtons = sortStorageAccounts(accounts).map((account) => {
+    const isActive = account.is_active || account.id === activeAccountId;
+    const providerLabel = getProviderDisplayName(account.type).replace(/^[^\p{L}\p{N}]+/u, "").trim();
+    const accountName = shortenStorageAccountName(account.name || "\u672A\u547D\u540D\u8D26\u6237");
+    return new Api5.KeyboardButtonRow({
+      buttons: [new Api5.KeyboardButtonCallback({
+        text: `${isActive ? "\u2705" : "\u2B1C"} ${providerLabel} \xB7 ${accountName}`,
+        data: Buffer.from(`storage_switch_${account.id}`)
+      })]
+    });
+  });
+  return new Api5.ReplyInlineMarkup({
+    rows: [
+      new Api5.KeyboardButtonRow({
+        buttons: [new Api5.KeyboardButtonCallback({
+          text: `${!activeAccountId ? "\u2705" : "\u2B1C"} \u{1F4BE} \u672C\u5730\u5B58\u50A8`,
+          data: Buffer.from("storage_switch_local")
+        })]
+      }),
+      ...accountButtons,
+      new Api5.KeyboardButtonRow({
+        buttons: [new Api5.KeyboardButtonCallback({ text: "\u{1F504} \u5237\u65B0\u5217\u8868", data: Buffer.from("storage_switch_refresh") })]
+      })
+    ]
+  });
+}
+function buildStorageSwitchText(accounts, activeAccountId) {
+  const activeAccount = accounts.find((account) => account.is_active || account.id === activeAccountId);
+  const activeLine = activeAccount ? `${getProviderDisplayName(activeAccount.type)} \xB7 ${activeAccount.name || "\u672A\u547D\u540D\u8D26\u6237"}` : getProviderDisplayName("local");
+  const accountLines = sortStorageAccounts(accounts).map((account) => {
+    const marker = account.id === activeAccountId || account.is_active ? "\u2705" : "\u2B1C";
+    return `${marker} ${getProviderDisplayName(account.type)} \xB7 ${account.name || "\u672A\u547D\u540D\u8D26\u6237"}
+   ID: \`${String(account.id).slice(0, 8)}\``;
+  });
+  return [
+    "\u{1F5C4}\uFE0F **\u5B58\u50A8\u6E90\u5207\u6362**",
+    "",
+    `\u5F53\u524D\u4F7F\u7528\uFF1A${activeLine}`,
+    "",
+    "\u70B9\u51FB\u4E0B\u9762\u6309\u94AE\u5373\u53EF\u5207\u6362\u5230\u5DF2\u5728\u7F51\u9875\u7AEF\u914D\u7F6E\u597D\u7684\u5B58\u50A8\u8D26\u6237\uFF1B\u4E0D\u9700\u8981\u6253\u5F00\u524D\u7AEF\u9875\u9762\u3002",
+    "",
+    "**\u53EF\u9009\u5B58\u50A8\uFF1A**",
+    `\u2705/\u2B1C ${getProviderDisplayName("local")}`,
+    ...accountLines,
+    "",
+    "\u63D0\u793A\uFF1A\u8FD9\u91CC\u53EA\u80FD\u5207\u6362\u5DF2\u6709\u8D26\u6237\uFF1B\u65B0\u589E OAuth/\u5BC6\u94A5\u914D\u7F6E\u4ECD\u9700\u5728\u7F51\u9875\u7AEF\u5B8C\u6210\u3002"
+  ].join("\n");
+}
+async function buildStorageSwitchView() {
+  const accounts = await storageManager.getAccounts();
+  const activeAccountId = storageManager.getActiveAccountId();
+  return {
+    text: buildStorageSwitchText(accounts, activeAccountId),
+    buttons: buildStorageAccountKeyboard(accounts, activeAccountId)
+  };
+}
+function isTelegramMessageNotModified(error) {
+  const err = error;
+  return err?.code === 400 && (err?.errorMessage === "MESSAGE_NOT_MODIFIED" || String(err?.message || "").includes("MESSAGE_NOT_MODIFIED"));
+}
+async function editStorageSwitchMessage(client2, update, toast) {
+  const view = await buildStorageSwitchView();
+  try {
+    await client2.editMessage(update.peer, {
+      message: Number(update.msgId),
+      text: view.text,
+      buttons: view.buttons
+    });
+  } catch (error) {
+    if (!isTelegramMessageNotModified(error)) {
+      throw error;
+    }
+  }
+  await client2.invoke(new Api5.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast }));
 }
 async function scanLocalDownloadFiles() {
   const baseDir = path13.resolve(UPLOAD_DIR4);
@@ -6489,6 +6692,57 @@ async function handleStorage(message) {
   } catch (error) {
     console.error("\u{1F916} \u83B7\u53D6\u5B58\u50A8\u7EDF\u8BA1\u5931\u8D25:", error);
     await message.reply({ message: MSG.ERR_STORAGE });
+  }
+}
+async function handleStorageSwitch(message) {
+  try {
+    const view = await buildStorageSwitchView();
+    await message.reply({ message: view.text, buttons: view.buttons });
+  } catch (error) {
+    console.error("\u{1F916} \u83B7\u53D6\u5B58\u50A8\u6E90\u5207\u6362\u83DC\u5355\u5931\u8D25:", error);
+    await message.reply({ message: `\u274C \u83B7\u53D6\u5B58\u50A8\u6E90\u5207\u6362\u83DC\u5355\u5931\u8D25: ${error.message}` });
+  }
+}
+async function handleStorageSwitchCallback(client2, update, data) {
+  const userId = update.userId.toJSNumber();
+  if (!await isAuthenticatedAsync(userId)) {
+    await client2.invoke(new Api5.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+    return;
+  }
+  try {
+    if (data === "storage_switch_refresh") {
+      await editStorageSwitchMessage(client2, update, "\u5DF2\u5237\u65B0");
+      return;
+    }
+    const accountId = data.replace(/^storage_switch_/, "");
+    if (!accountId) {
+      await client2.invoke(new Api5.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u65E0\u6548\u7684\u5B58\u50A8\u6E90\u9009\u62E9", alert: true }));
+      return;
+    }
+    if (accountId === "local") {
+      if (!storageManager.getActiveAccountId()) {
+        await editStorageSwitchMessage(client2, update, "\u5F53\u524D\u5DF2\u7ECF\u662F\u672C\u5730\u5B58\u50A8");
+        return;
+      }
+      await storageManager.switchAccount("local");
+      await editStorageSwitchMessage(client2, update, "\u5DF2\u5207\u6362\u5230\u672C\u5730\u5B58\u50A8");
+      return;
+    }
+    const accounts = await storageManager.getAccounts();
+    const selected = accounts.find((account) => account.id === accountId);
+    if (!selected) {
+      await editStorageSwitchMessage(client2, update, "\u8BE5\u5B58\u50A8\u8D26\u6237\u5DF2\u4E0D\u5B58\u5728");
+      return;
+    }
+    if (selected.is_active || storageManager.getActiveAccountId() === accountId) {
+      await editStorageSwitchMessage(client2, update, "\u5F53\u524D\u5DF2\u7ECF\u5728\u4F7F\u7528\u8BE5\u8D26\u6237");
+      return;
+    }
+    await storageManager.switchAccount(accountId);
+    await editStorageSwitchMessage(client2, update, `\u5DF2\u5207\u6362\u5230 ${selected.name || getProviderDisplayName(selected.type)}`);
+  } catch (error) {
+    console.error("\u{1F916} \u5207\u6362\u5B58\u50A8\u6E90\u5931\u8D25:", error);
+    await client2.invoke(new Api5.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u5207\u6362\u5931\u8D25: ${error.message}`, alert: true }));
   }
 }
 async function handleStorageCleanupCallback(client2, update, data) {
@@ -8232,6 +8486,7 @@ async function initTelegramBot() {
           new Api6.BotCommand({ command: "path_rules", description: "\u4FDD\u5B58\u8DEF\u5F84/\u81EA\u5B9A\u4E49\u76EE\u5F55" }),
           new Api6.BotCommand({ command: "tg_sub", description: "\u8BA2\u9605\u9891\u9053\u81EA\u52A8\u540C\u6B65" }),
           new Api6.BotCommand({ command: "tg_download", description: "\u6309\u65E5\u671F/\u6807\u7B7E\u4E0B\u8F7D\u9891\u9053\u6587\u4EF6" }),
+          new Api6.BotCommand({ command: "storage_switch", description: "\u5207\u6362\u5DF2\u914D\u7F6E\u5B58\u50A8\u6E90" }),
           new Api6.BotCommand({ command: "download_workers", description: "\u8BBE\u7F6E\u5355\u6587\u4EF6\u5206\u7247\u5E76\u53D1" }),
           new Api6.BotCommand({ command: "file_concurrency", description: "\u8BBE\u7F6E\u540C\u65F6\u4E0B\u8F7D\u6587\u4EF6\u6570" }),
           new Api6.BotCommand({ command: "duplicate_mode", description: "\u8BBE\u7F6E\u91CD\u590D\u6587\u4EF6\u5904\u7406" }),
@@ -8567,6 +8822,14 @@ ${buildPathPreviewLine(appliedPath.folder)}
           await handleStorage(message);
           return;
         }
+        if (text === "/storage_switch" || text === "/switch_storage" || text === "/storage_source") {
+          if (!await isAuthenticatedAsync(senderId)) {
+            await message.reply({ message: MSG.AUTH_REQUIRED });
+            return;
+          }
+          await handleStorageSwitch(message);
+          return;
+        }
         if (text === "/list" || text.startsWith("/list ")) {
           await message.reply({ message: "\u{1F4CB} \u4E0A\u4F20\u8BB0\u5F55\u83DC\u5355\u5DF2\u9690\u85CF\u3002\u9700\u8981\u67E5\u770B\u6587\u4EF6\u65F6\u8BF7\u5230\u7F51\u9875\u7AEF\u6587\u4EF6\u5217\u8868\uFF0C\u6216\u4F7F\u7528 /storage \u67E5\u770B\u7EDF\u8BA1\u3002" });
           return;
@@ -8760,6 +9023,10 @@ ${buildPathPreviewLine(appliedPath.folder)}
         }
         if (data.startsWith("fc_")) {
           await handleFileConcurrencyCallback(activeClient, callbackUpdate, data);
+          return;
+        }
+        if (data.startsWith("storage_switch_")) {
+          await handleStorageSwitchCallback(activeClient, callbackUpdate, data);
           return;
         }
         if (data.startsWith("storage_")) {
@@ -9157,6 +9424,7 @@ init_localPath();
 var router2 = Router2();
 var UPLOAD_DIR5 = path16.resolve(process.env.UPLOAD_DIR || "./data/uploads");
 var THUMBNAIL_DIR5 = path16.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var PREVIEW_DIR3 = path16.resolve(process.env.PREVIEW_DIR || "./data/previews");
 async function getSafeLocalFilePath(file) {
   const candidate = file.path || path16.join(UPLOAD_DIR5, file.stored_name);
   const resolved = path16.resolve(candidate);
@@ -9171,6 +9439,39 @@ async function getSafeLocalFilePath(file) {
     throw new Error("Unsafe local file path");
   }
   return real;
+}
+async function serveLocalPathWithRange(req, res, filePath, mimeType, cacheControl, etag) {
+  const stat = fs12.statSync(filePath);
+  res.set({
+    "Content-Type": mimeType || "application/octet-stream",
+    "Cache-Control": cacheControl,
+    "Accept-Ranges": "bytes",
+    ...etag ? { "ETag": etag } : {}
+  });
+  const range = req.headers.range;
+  if (range) {
+    const parsedRange = parseRangeHeader(range, stat.size);
+    if (!parsedRange) {
+      res.status(416);
+      res.set({
+        "Content-Range": `bytes */${stat.size}`,
+        "Accept-Ranges": "bytes"
+      });
+      res.end();
+      return;
+    }
+    const { start, end } = parsedRange;
+    const chunkSize = end - start + 1;
+    res.status(206);
+    res.set({
+      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+      "Content-Length": String(chunkSize)
+    });
+    fs12.createReadStream(filePath, { start, end }).pipe(res);
+    return;
+  }
+  res.set("Content-Length", String(stat.size));
+  fs12.createReadStream(filePath).pipe(res);
 }
 function parseRangeHeader(range, size) {
   if (!range) return null;
@@ -9193,31 +9494,82 @@ function parseRangeHeader(range, size) {
   }
   return { start, end: Math.min(end, size - 1) };
 }
+var FILES_LIST_COLUMNS = `
+    id, name, stored_name, type, mime_type, size, thumbnail_path, preview_path,
+    width, height, source, folder, storage_account_id, is_favorite, created_at, updated_at
+`;
+function encodeFileCursor(file) {
+  return Buffer.from(`${new Date(file.created_at).toISOString()}|${file.id}`, "utf8").toString("base64url");
+}
+function decodeFileCursor(cursor) {
+  if (!cursor || typeof cursor !== "string") return null;
+  try {
+    const decoded = Buffer.from(cursor, "base64url").toString("utf8");
+    const [createdAt, id] = decoded.split("|");
+    if (!createdAt || !id || Number.isNaN(new Date(createdAt).getTime())) return null;
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}
+function mapFileForList(file) {
+  return {
+    ...file,
+    size: formatFileSize(file.size),
+    date: formatRelativeTime(file.created_at),
+    thumbnailUrl: file.thumbnail_path ? getSignedUrl(file.id, "thumbnail") : void 0,
+    previewUrl: getSignedUrl(file.id, "preview")
+  };
+}
+async function queryFilesPage(options) {
+  const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+  const activeAccountId = storageManager2.getActiveAccountId();
+  const provider = storageManager2.getProvider();
+  const limit = Math.min(500, Math.max(1, parseInt(String(options.limit || "200"), 10) || 200));
+  const cursor = decodeFileCursor(options.cursor);
+  const whereParts = [];
+  const params = [];
+  if (provider.name === "local") {
+    whereParts.push(`source = $${params.length + 1}`);
+    params.push("local");
+  } else {
+    whereParts.push(`storage_account_id = $${params.length + 1}`);
+    params.push(activeAccountId);
+  }
+  if (options.favoriteOnly) {
+    whereParts.push(`is_favorite = $${params.length + 1}`);
+    params.push(true);
+  }
+  if (cursor) {
+    whereParts.push(`(created_at, id) < ($${params.length + 1}::timestamptz, $${params.length + 2}::uuid)`);
+    params.push(cursor.createdAt, cursor.id);
+  }
+  params.push(limit + 1);
+  const result = await query(
+    `SELECT ${FILES_LIST_COLUMNS}
+         FROM files
+         WHERE ${whereParts.join(" AND ")}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${params.length}`,
+    params
+  );
+  const rows = result.rows.slice(0, limit);
+  return {
+    files: rows.map(mapFileForList),
+    nextCursor: result.rows.length > limit ? encodeFileCursor(rows[rows.length - 1]) : null,
+    hasMore: result.rows.length > limit
+  };
+}
+function shouldReturnPagedEnvelope(req) {
+  return req.query.page === "cursor" || req.query.cursor !== void 0 || req.query.limit !== void 0;
+}
 router2.get("/", async (req, res) => {
   try {
-    const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
-    const activeAccountId = storageManager2.getActiveAccountId();
-    const provider = storageManager2.getProvider();
-    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "200"), 10) || 200));
-    const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10) || 0);
-    let queryStr = "";
-    let params = [];
-    if (provider.name === "local") {
-      queryStr = "SELECT * FROM files WHERE source = 'local' ORDER BY created_at DESC LIMIT $1 OFFSET $2";
-      params = [limit, offset];
-    } else {
-      queryStr = "SELECT * FROM files WHERE storage_account_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3";
-      params = [activeAccountId, limit, offset];
+    const page = await queryFilesPage({ cursor: req.query.cursor, limit: req.query.limit });
+    if (shouldReturnPagedEnvelope(req)) {
+      return res.json(page);
     }
-    const result = await query(queryStr, params);
-    const files = result.rows.map((file) => ({
-      ...file,
-      size: formatFileSize(file.size),
-      date: formatRelativeTime(file.created_at),
-      thumbnailUrl: file.thumbnail_path ? getSignedUrl(file.id, "thumbnail") : void 0,
-      previewUrl: getSignedUrl(file.id, "preview")
-    }));
-    res.json(files);
+    res.json(page.files);
   } catch (error) {
     console.error("\u83B7\u53D6\u6587\u4EF6\u5217\u8868\u5931\u8D25:", error);
     res.status(500).json({ error: "\u83B7\u53D6\u6587\u4EF6\u5217\u8868\u5931\u8D25" });
@@ -9375,41 +9727,69 @@ router2.get("/:id([0-9a-fA-F-]{36})/preview", async (req, res) => {
     if (!fs12.existsSync(filePath)) {
       return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728\u4E8E\u670D\u52A1\u5668" });
     }
-    res.set({
-      "Content-Type": file.mime_type || "application/octet-stream",
-      "Cache-Control": "public, max-age=86400",
-      "ETag": `"${file.id}-${file.updated_at}"`
-    });
-    const stat = fs12.statSync(filePath);
-    const range = req.headers.range;
-    if (range) {
-      const parsedRange = parseRangeHeader(range, stat.size);
-      if (!parsedRange) {
-        res.status(416);
-        res.set({
-          "Content-Range": `bytes */${stat.size}`,
-          "Accept-Ranges": "bytes"
-        });
-        return res.end();
+    let previewPath = file.preview_path;
+    let preferredPreviewPath = previewPath && (file.type === "image" || file.type === "video") ? path16.join(PREVIEW_DIR3, path16.basename(previewPath)) : null;
+    if (file.type === "image" && (!preferredPreviewPath || !fs12.existsSync(preferredPreviewPath))) {
+      try {
+        const generatedPreview = await generateMediaPreview(filePath, file.stored_name || file.name, file.mime_type || "application/octet-stream");
+        if (generatedPreview) {
+          previewPath = path16.basename(generatedPreview);
+          preferredPreviewPath = path16.join(PREVIEW_DIR3, previewPath);
+          await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [previewPath, file.id]);
+        }
+      } catch (previewError) {
+        console.error("\u61D2\u751F\u6210\u56FE\u7247\u9884\u89C8\u5931\u8D25:", previewError);
       }
-      const { start, end } = parsedRange;
-      const chunksize = end - start + 1;
-      res.status(206);
-      res.set({
-        "Content-Range": `bytes ${start}-${end}/${stat.size}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": String(chunksize)
-      });
-      const stream = fs12.createReadStream(filePath, { start, end });
-      stream.pipe(res);
-    } else {
-      res.set("Content-Length", String(stat.size));
-      const stream = fs12.createReadStream(filePath);
-      stream.pipe(res);
+    } else if (file.type === "video" && (!preferredPreviewPath || !fs12.existsSync(preferredPreviewPath))) {
+      void generateMediaPreview(filePath, file.stored_name || file.name, file.mime_type || "application/octet-stream").then(async (generatedPreview) => {
+        if (!generatedPreview) return;
+        const generatedPreviewName = path16.basename(generatedPreview);
+        await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [generatedPreviewName, file.id]);
+        console.log(`[Preview] \u{1F39E}\uFE0F Lazy video preview cached for ${file.id}: ${generatedPreviewName}`);
+      }).catch((previewError) => console.error("\u61D2\u751F\u6210\u89C6\u9891\u9884\u89C8\u5931\u8D25:", previewError));
     }
+    const servedPath = preferredPreviewPath && fs12.existsSync(preferredPreviewPath) ? preferredPreviewPath : filePath;
+    const servedMime = preferredPreviewPath && servedPath === preferredPreviewPath ? file.type === "video" ? "video/mp4" : "image/webp" : file.mime_type || "application/octet-stream";
+    await serveLocalPathWithRange(
+      req,
+      res,
+      servedPath,
+      servedMime,
+      "public, max-age=86400",
+      `"${file.id}-${file.updated_at}-${previewPath || "original"}"`
+    );
   } catch (error) {
     console.error("\u9884\u89C8\u6587\u4EF6\u5931\u8D25:", error);
     res.status(500).json({ error: "\u9884\u89C8\u6587\u4EF6\u5931\u8D25" });
+  }
+});
+router2.get("/:id([0-9a-fA-F-]{36})/original", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const file = await getScopedFileById(id);
+    if (!file) return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728" });
+    if (file.source === "onedrive" || file.source === "aliyun_oss" || file.source === "s3" || file.source === "webdav" || file.source === "google_drive") {
+      const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+      const provider = storageManager2.getProvider(`${file.source}:${file.storage_account_id}`);
+      const url = await provider.getPreviewUrl(file.path);
+      if (url) {
+        res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
+        return res.redirect(url);
+      }
+      const stream = await provider.getFileStream(file.path);
+      res.set({
+        "Content-Type": file.mime_type || "application/octet-stream",
+        "Cache-Control": "public, max-age=86400"
+      });
+      stream.pipe(res);
+      return;
+    }
+    const filePath = await getSafeLocalFilePath(file);
+    if (!fs12.existsSync(filePath)) return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728\u4E8E\u670D\u52A1\u5668" });
+    await serveLocalPathWithRange(req, res, filePath, file.mime_type || "application/octet-stream", "public, max-age=86400", `"${file.id}-${file.updated_at}-original"`);
+  } catch (error) {
+    console.error("\u83B7\u53D6\u539F\u59CB\u6587\u4EF6\u5931\u8D25:", error);
+    res.status(500).json({ error: "\u83B7\u53D6\u539F\u59CB\u6587\u4EF6\u5931\u8D25" });
   }
 });
 router2.get("/:id([0-9a-fA-F-]{36})/download-url", async (req, res) => {
@@ -9631,29 +10011,11 @@ router2.post("/:id([0-9a-fA-F-]{36})/share", async (req, res) => {
 });
 router2.get("/favorites", async (req, res) => {
   try {
-    const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
-    const activeAccountId = storageManager2.getActiveAccountId();
-    const provider = storageManager2.getProvider();
-    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "200"), 10) || 200));
-    const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10) || 0);
-    let queryStr = "";
-    let params = [];
-    if (provider.name === "local") {
-      queryStr = "SELECT * FROM files WHERE source = 'local' AND is_favorite = true ORDER BY created_at DESC LIMIT $1 OFFSET $2";
-      params = [limit, offset];
-    } else {
-      queryStr = "SELECT * FROM files WHERE storage_account_id = $1 AND is_favorite = true ORDER BY created_at DESC LIMIT $2 OFFSET $3";
-      params = [activeAccountId, limit, offset];
+    const page = await queryFilesPage({ favoriteOnly: true, cursor: req.query.cursor, limit: req.query.limit });
+    if (shouldReturnPagedEnvelope(req)) {
+      return res.json(page);
     }
-    const result = await query(queryStr, params);
-    const files = result.rows.map((file) => ({
-      ...file,
-      size: formatFileSize(file.size),
-      date: formatRelativeTime(file.created_at),
-      thumbnailUrl: file.thumbnail_path ? getSignedUrl(file.id, "thumbnail") : void 0,
-      previewUrl: getSignedUrl(file.id, "preview")
-    }));
-    res.json(files);
+    res.json(page.files);
   } catch (error) {
     console.error("\u83B7\u53D6\u6536\u85CF\u6587\u4EF6\u5931\u8D25:", error);
     res.status(500).json({ error: "\u83B7\u53D6\u6536\u85CF\u6587\u4EF6\u5931\u8D25" });
@@ -9961,6 +10323,7 @@ var handleUpload = async (req, res, source = "web") => {
     const provider = storageManager.getProvider();
     console.log(`[Upload] \u{1F6E0}\uFE0F  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || "none (local)"}`);
     let thumbnailPath = null;
+    let previewPath = null;
     let width = null;
     let height = null;
     const duplicateMode = await getDuplicateMode();
@@ -9998,6 +10361,17 @@ var handleUpload = async (req, res, source = "web") => {
         console.error("\u751F\u6210\u7F29\u7565\u56FE\u5931\u8D25:", error);
       }
     }
+    if (provider.name === "local" && mimeType.startsWith("image/")) {
+      try {
+        const previewResult = await generateMediaPreview(tempPath, storedName, mimeType);
+        if (previewResult) {
+          previewPath = path18.basename(previewResult);
+          console.log(`[Upload] \u{1F39E}\uFE0F Image preview generated: ${previewPath}`);
+        }
+      } catch (error) {
+        console.error("\u751F\u6210\u56FE\u7247\u9884\u89C8\u5931\u8D25:", error);
+      }
+    }
     let storedPath = "";
     try {
       storedPath = await provider.saveFile(tempPath, storedName, mimeType, storageFolder);
@@ -10018,13 +10392,21 @@ var handleUpload = async (req, res, source = "web") => {
     else if (mimeType.startsWith("audio/")) type = "audio";
     else if (mimeType.includes("pdf") || mimeType.includes("document") || mimeType.includes("text") || mimeType.includes("word") || mimeType.includes("excel") || mimeType.includes("spreadsheet") || mimeType.includes("powerpoint") || mimeType.includes("presentation") || mimeType.includes("markdown") || mimeType.includes("json") || mimeType.includes("xml") || mimeType.includes("sql")) type = "document";
     const result = await query(
-      `INSERT INTO files 
-            (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+      `INSERT INTO files
+            (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id, created_at, name, type, size`,
-      [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, width, height, provider.name, storageFolder, activeAccountId]
+      [originalName, storedName, type, mimeType, size, storedPath, thumbnailPath, previewPath, width, height, provider.name, storageFolder, activeAccountId]
     );
     const newFile = result.rows[0];
+    if (provider.name === "local" && type === "video") {
+      void generateMediaPreview(storedPath, storedName, mimeType).then(async (previewResult) => {
+        if (!previewResult) return;
+        const generatedPreviewName = path18.basename(previewResult);
+        await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [generatedPreviewName, newFile.id]);
+        console.log(`[Upload] \u{1F39E}\uFE0F Video preview generated async: ${generatedPreviewName}`);
+      }).catch((error) => console.error("\u5F02\u6B65\u751F\u6210\u89C6\u9891\u9884\u89C8\u5931\u8D25:", error));
+    }
     res.json({
       success: true,
       file: {
@@ -10064,6 +10446,49 @@ import crypto9 from "crypto";
 var checkDiskSpace2 = checkDiskSpaceModule2.default || checkDiskSpaceModule2;
 var router5 = Router5();
 var UPLOAD_DIR7 = process.env.UPLOAD_DIR || "./data/uploads";
+function sendOAuthSuccessPage(res, providerName, messageType) {
+  const nonce = crypto9.randomBytes(16).toString("base64");
+  res.setHeader("Content-Security-Policy", [
+    "default-src 'self'",
+    "style-src 'unsafe-inline'",
+    `script-src 'nonce-${nonce}'`,
+    "script-src-attr 'none'",
+    "base-uri 'none'",
+    "object-src 'none'"
+  ].join("; "));
+  res.setHeader("Cross-Origin-Opener-Policy", "unsafe-none");
+  res.type("html").send(`
+            <!doctype html>
+            <html lang="zh-CN">
+                <head>
+                    <meta charset="utf-8" />
+                    <title>${providerName} \u6388\u6743\u6210\u529F</title>
+                </head>
+                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+                    <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
+                        <h2 style="color: #16a34a; margin-bottom: 10px;">\u{1F389} \u6388\u6743\u6210\u529F\uFF01</h2>
+                        <p style="color: #15803d; margin-bottom: 8px;">${providerName} \u5DF2\u6210\u529F\u8FDE\u63A5\u5E76\u542F\u7528\u3002</p>
+                        <p style="color: #166534; font-size: 14px; margin-bottom: 20px;">\u7A97\u53E3\u5C06\u81EA\u52A8\u5173\u95ED\u3002\u5982\u679C\u672A\u5173\u95ED\uFF0C\u8BF7\u70B9\u51FB\u4E0B\u65B9\u6309\u94AE\u5173\u95ED\uFF0C\u4E3B\u9875\u9762\u4F1A\u81EA\u52A8\u5237\u65B0\u8D26\u6237\u5217\u8868\u3002</p>
+                        <button id="close-window" type="button" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">\u5173\u95ED\u6B64\u7A97\u53E3</button>
+                        <script nonce="${nonce}">
+                            const notifyParent = () => {
+                                if (window.opener && !window.opener.closed) {
+                                    window.opener.postMessage('${messageType}', '*');
+                                }
+                            };
+                            const closeWindow = () => {
+                                notifyParent();
+                                window.close();
+                            };
+                            document.getElementById('close-window')?.addEventListener('click', closeWindow);
+                            notifyParent();
+                            setTimeout(closeWindow, 1200);
+                        </script>
+                    </div>
+                </body>
+            </html>
+        `);
+}
 function getOneDriveRedirectUri(req) {
   const apiBase = process.env.VITE_API_URL;
   if (apiBase) {
@@ -10186,6 +10611,25 @@ router5.post("/config/telegram-user-download", requireAuth, async (req, res) => 
     res.status(500).json({ error: "\u66F4\u65B0 Telegram \u7528\u6237\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25" });
   }
 });
+router5.post("/maintenance/download-items/cleanup", requireAuth, async (req, res) => {
+  try {
+    const retentionDays = Math.min(365, Math.max(1, parseInt(String(req.body?.retentionDays ?? "7"), 10) || 7));
+    const result = await query(
+      `DELETE FROM telegram_download_items
+             WHERE status = 'completed'
+               AND COALESCE(completed_at, updated_at, created_at) < NOW() - ($1::int * INTERVAL '1 day')`,
+      [retentionDays]
+    );
+    res.json({
+      success: true,
+      deletedCount: result.rowCount || 0,
+      retentionDays
+    });
+  } catch (error) {
+    console.error("\u6E05\u7406\u4E0B\u8F7D\u4EFB\u52A1\u660E\u7EC6\u5931\u8D25:", error);
+    res.status(500).json({ error: "\u6E05\u7406\u4E0B\u8F7D\u4EFB\u52A1\u660E\u7EC6\u5931\u8D25" });
+  }
+});
 router5.post("/config/onedrive/auth-url", requireAuth, async (req, res) => {
   try {
     const { clientId, tenantId, redirectUri, clientSecret, name } = req.body;
@@ -10273,32 +10717,7 @@ router5.get("/onedrive/callback", async (req, res) => {
     if (activeId) {
       await query("UPDATE storage_accounts SET name = $1 WHERE id = $2", [finalName, activeId]);
     }
-    res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
-    res.setHeader("Cross-Origin-Opener-Policy", "unsafe-none");
-    res.send(`
-            <html>
-                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
-                    <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
-                        <h2 style="color: #16a34a; margin-bottom: 10px;">\u{1F389} \u6388\u6743\u6210\u529F\uFF01</h2>
-                        <p style="color: #15803d; margin-bottom: 20px;">OneDrive \u5DF2\u6210\u529F\u8FDE\u63A5\u5E76\u542F\u7528\u3002</p>
-                        <p style="color: #16a34a; font-size: 13px; margin-bottom: 20px;">\u7A97\u53E3\u5C06\u81EA\u52A8\u5173\u95ED\u3002\u5982\u679C\u672A\u5173\u95ED\uFF0C\u8BF7\u624B\u52A8\u5173\u95ED\uFF0C\u4E3B\u9875\u9762\u4F1A\u81EA\u52A8\u5237\u65B0\u8D26\u6237\u5217\u8868\u3002</p>
-                        <button onclick="notifyParent(); window.close();" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">\u5173\u95ED\u6B64\u7A97\u53E3</button>
-                        <script>
-                            const notifyParent = () => {
-                                if (window.opener && !window.opener.closed) {
-                                    window.opener.postMessage('onedrive_auth_success', '*');
-                                }
-                            };
-                            notifyParent();
-                            setTimeout(() => {
-                                notifyParent();
-                                window.close();
-                            }, 1200);
-                        </script>
-                    </div>
-                </body>
-            </html>
-        `);
+    sendOAuthSuccessPage(res, "OneDrive", "onedrive_auth_success");
   } catch (error) {
     console.error("OneDrive \u56DE\u8C03\u5904\u7406\u5931\u8D25:", error);
     res.status(500).send("\u6388\u6743\u5904\u7406\u51FA\u9519\uFF0C\u8BF7\u68C0\u67E5\u540E\u7AEF\u65E5\u5FD7\u3002");
@@ -10306,7 +10725,7 @@ router5.get("/onedrive/callback", async (req, res) => {
 });
 router5.post("/config/google-drive/auth-url", requireAuth, async (req, res) => {
   try {
-    const { clientId, clientSecret, redirectUri, name } = req.body;
+    const { clientId, clientSecret, redirectUri, name, sharedDriveId } = req.body;
     if (!clientId || !clientSecret || !redirectUri) {
       return res.status(400).json({ error: "\u7F3A\u5C11\u5FC5\u8981\u53C2\u6570 (Client ID, Client Secret \u6216 Redirect URI)" });
     }
@@ -10317,6 +10736,7 @@ router5.post("/config/google-drive/auth-url", requireAuth, async (req, res) => {
     await StorageManager2.updateSetting("google_drive_client_secret", clientSecret);
     await StorageManager2.updateSetting("google_drive_redirect_uri", redirectUri);
     await StorageManager2.updateSetting("google_drive_oauth_state", oauthState);
+    await StorageManager2.updateSetting("google_drive_shared_drive_id", sharedDriveId?.trim() || "");
     if (name) {
       await StorageManager2.updateSetting("google_drive_pending_name", name);
     }
@@ -10343,6 +10763,7 @@ router5.get("/google-drive/callback", async (req, res) => {
     const clientId = await storageManager2.getSetting("google_drive_client_id");
     const clientSecret = await storageManager2.getSetting("google_drive_client_secret") || "";
     const redirectUri = await storageManager2.getSetting("google_drive_redirect_uri") || getGoogleDriveRedirectUri(req);
+    const sharedDriveId = await storageManager2.getSetting("google_drive_shared_drive_id") || "";
     if (!clientId || !clientSecret) {
       return res.send("\u914D\u7F6E\u4FE1\u606F\u4E22\u5931\uFF0C\u8BF7\u8FD4\u56DE\u8BBE\u7F6E\u9875\u9762\u91CD\u8BD5\u3002");
     }
@@ -10353,36 +10774,14 @@ router5.get("/google-drive/callback", async (req, res) => {
     const pendingName = await storageManager2.getSetting("google_drive_pending_name");
     await StorageManager2.updateSetting("google_drive_pending_name", "");
     await StorageManager2.updateSetting("google_drive_oauth_state", "");
-    await storageManager2.addGoogleDriveAccount(pendingName || "Google Drive Account", clientId, clientSecret, tokens.refresh_token, redirectUri);
+    await StorageManager2.updateSetting("google_drive_shared_drive_id", "");
+    await storageManager2.addGoogleDriveAccount(pendingName || "Google Drive Account", clientId, clientSecret, tokens.refresh_token, redirectUri, sharedDriveId);
     const accounts = await storageManager2.getAccounts();
     const newAccount = accounts.filter((a) => a.type === "google_drive").sort((a, b) => b.created_at - a.created_at)[0];
     if (newAccount) {
       await storageManager2.switchAccount(newAccount.id);
     }
-    res.send(`
-            <html>
-                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
-                    <div style="text-align: center; padding: 40px; border-radius: 20px; background: #f0fdf4; border: 1px solid #bbf7d0;">
-                        <h2 style="color: #16a34a; margin-bottom: 10px;">\u{1F389} \u6388\u6743\u6210\u529F\uFF01</h2>
-                        <p style="color: #15803d; margin-bottom: 8px;">Google Drive \u5DF2\u6210\u529F\u8FDE\u63A5\u5E76\u542F\u7528\u3002</p>
-                        <p style="color: #166534; font-size: 14px; margin-bottom: 20px;">\u7A97\u53E3\u5C06\u81EA\u52A8\u5173\u95ED\u3002\u5982\u679C\u672A\u5173\u95ED\uFF0C\u8BF7\u624B\u52A8\u5173\u95ED\uFF0C\u4E3B\u9875\u9762\u4F1A\u81EA\u52A8\u5237\u65B0\u8D26\u6237\u5217\u8868\u3002</p>
-                        <button onclick="window.close()" style="padding: 10px 20px; background: #16a34a; color: white; border: none; border-radius: 8px; cursor: pointer;">\u5173\u95ED\u6B64\u7A97\u53E3</button>
-                        <script>
-                            const notifyParent = () => {
-                                if (window.opener) {
-                                    window.opener.postMessage('google_drive_auth_success', '*');
-                                }
-                            };
-                            notifyParent();
-                            setTimeout(() => {
-                                notifyParent();
-                                window.close();
-                            }, 1200);
-                        </script>
-                    </div>
-                </body>
-            </html>
-        `);
+    sendOAuthSuccessPage(res, "Google Drive", "google_drive_auth_success");
   } catch (error) {
     console.error("Google Drive \u56DE\u8C03\u5904\u7406\u5931\u8D25:", error);
     res.status(500).send("\u6388\u6743\u5904\u7406\u51FA\u9519\uFF0C\u8BF7\u68C0\u67E5\u540E\u7AEF\u65E5\u5FD7\u3002");
@@ -10747,6 +11146,7 @@ router6.post("/complete", async (req, res) => {
       }
     }
     let thumbnailPath = null;
+    let previewPath = null;
     let width = null;
     let height = null;
     const provider = storageManager.getProvider();
@@ -10767,6 +11167,17 @@ router6.post("/complete", async (req, res) => {
         console.error("\u751F\u6210\u7F29\u7565\u56FE\u5931\u8D25:", error);
       }
     }
+    if (provider.name === "local" && session.mimeType.startsWith("image/")) {
+      try {
+        const previewResult = await generateMediaPreview(tempMergedPath, storedName, session.mimeType);
+        if (previewResult) {
+          previewPath = path20.basename(previewResult);
+          console.log(`[ChunkedComplete] \u{1F39E}\uFE0F Image preview generated: ${previewPath}`);
+        }
+      } catch (error) {
+        console.error("\u751F\u6210\u56FE\u7247\u9884\u89C8\u5931\u8D25:", error);
+      }
+    }
     let storedPath = "";
     console.log(`[ChunkedComplete] \u{1F6E0}\uFE0F  Provider: ${provider.name}, accountId: ${activeAccountId || "none (local)"}`);
     try {
@@ -10783,13 +11194,21 @@ router6.post("/complete", async (req, res) => {
     }
     const type = session.mimeType.startsWith("image/") ? "image" : session.mimeType.startsWith("video/") ? "video" : session.mimeType.startsWith("audio/") ? "audio" : "other";
     const result = await query(
-      `INSERT INTO files 
-            (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+      `INSERT INTO files
+            (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id, created_at, name, type, size`,
-      [session.filename, storedName, type, session.mimeType, session.totalSize, storedPath, thumbnailPath, width, height, provider.name, storageFolder, activeAccountId]
+      [session.filename, storedName, type, session.mimeType, session.totalSize, storedPath, thumbnailPath, previewPath, width, height, provider.name, storageFolder, activeAccountId]
     );
     const newFile = result.rows[0];
+    if (provider.name === "local" && type === "video") {
+      void generateMediaPreview(storedPath, storedName, session.mimeType).then(async (previewResult) => {
+        if (!previewResult) return;
+        const generatedPreviewName = path20.basename(previewResult);
+        await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [generatedPreviewName, newFile.id]);
+        console.log(`[ChunkedComplete] \u{1F39E}\uFE0F Video preview generated async: ${generatedPreviewName}`);
+      }).catch((error) => console.error("\u5F02\u6B65\u751F\u6210\u89C6\u9891\u9884\u89C8\u5931\u8D25:", error));
+    }
     res.json({
       success: true,
       file: {
@@ -10854,6 +11273,7 @@ app.set("trust proxy", process.env.TRUST_PROXY || "loopback");
 var PORT = process.env.PORT || 51947;
 var UPLOAD_DIR9 = process.env.UPLOAD_DIR || "./data/uploads";
 var THUMBNAIL_DIR8 = process.env.THUMBNAIL_DIR || "./data/thumbnails";
+var PREVIEW_DIR4 = process.env.PREVIEW_DIR || "./data/previews";
 var CHUNK_DIR2 = process.env.CHUNK_DIR || "./data/chunks";
 if (!fs16.existsSync(UPLOAD_DIR9)) {
   fs16.mkdirSync(UPLOAD_DIR9, { recursive: true });
@@ -10862,6 +11282,10 @@ if (!fs16.existsSync(UPLOAD_DIR9)) {
 if (!fs16.existsSync(THUMBNAIL_DIR8)) {
   fs16.mkdirSync(THUMBNAIL_DIR8, { recursive: true });
   console.log(`\u{1F4C1} \u521B\u5EFA\u7F29\u7565\u56FE\u76EE\u5F55: ${THUMBNAIL_DIR8}`);
+}
+if (!fs16.existsSync(PREVIEW_DIR4)) {
+  fs16.mkdirSync(PREVIEW_DIR4, { recursive: true });
+  console.log(`\u{1F39E}\uFE0F \u521B\u5EFA\u9884\u89C8\u76EE\u5F55: ${PREVIEW_DIR4}`);
 }
 if (!fs16.existsSync(CHUNK_DIR2)) {
   fs16.mkdirSync(CHUNK_DIR2, { recursive: true });
@@ -10946,6 +11370,7 @@ app.listen(PORT, async () => {
 \u{1F4CD} \u7AEF\u53E3: ${PORT}
 \u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path21.resolve(UPLOAD_DIR9)}
 \u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path21.resolve(THUMBNAIL_DIR8)}
+\u{1F39E}\uFE0F  \u9884\u89C8\u76EE\u5F55: ${path21.resolve(PREVIEW_DIR4)}
 \u{1F510} \u5BC6\u7801\u4FDD\u62A4: ${initialSetupRequired ? "\u5F85\u9996\u6B21\u521D\u59CB\u5316" : "\u5DF2\u542F\u7528"}
 \u{1F916} Telegram Bot: ${telegramEnabled ? "\u5DF2\u542F\u7528 (\u6700\u5927 2GB\uFF0C\u8D26\u53F7\u7EA7\u4E0B\u8F7D\u5668\u4E0D\u53D7\u6B64\u9650\u5236)" : "\u672A\u542F\u7528"}
 \u{1F464} Telegram User Download: ${isTelegramUserClientReady() ? "\u5DF2\u542F\u7528" : "\u672A\u542F\u7528"}

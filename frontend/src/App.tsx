@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useCallback, lazy, Suspense } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef, lazy, Suspense } from "react";
 import { AppLayout } from "./components/layout/AppLayout";
 import { Button } from "./components/ui/Button";
 import { FileCard } from "./components/ui/FileCard";
@@ -41,6 +41,9 @@ function App() {
 
   const [files, setFiles] = useState<FileData[]>([]);
   const [loading, setLoading] = useState(true);
+  const [fileCursor, setFileCursor] = useState<string | null>(null);
+  const [hasMoreFiles, setHasMoreFiles] = useState(false);
+  const [loadingMoreFiles, setLoadingMoreFiles] = useState(false);
 
   // 改用队列管理上传状态
   const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
@@ -65,8 +68,11 @@ function App() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
   const [selectedFile, setSelectedFile] = useState<FileData | null>(null);
   const [deletingFile, setDeletingFile] = useState<FileData | null>(null);
+  const [pendingBatchDelete, setPendingBatchDelete] = useState<{ fileIds: string[]; folderNames: string[] } | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [currentFolder, setCurrentFolder] = useState<string | null>(null); // 当前选中的文件夹
+  const [isNavigationTapShieldActive, setIsNavigationTapShieldActive] = useState(false);
+  const navigationTapShieldTimerRef = useRef<number | null>(null);
 
   // 重命名状态
   const [renamingFile, setRenamingFile] = useState<FileData | null>(null);
@@ -144,15 +150,10 @@ function App() {
     if (!isAuthenticated) return;
     try {
       setLoading(true);
-      let data: FileData[];
-      
-      if (category === 'favorites') {
-        data = await fileApi.getFavoriteFiles();
-      } else {
-        data = await fileApi.getFiles();
-      }
-      
-      setFiles(data);
+      const page = await fileApi.getFilesPage({ favorites: category === 'favorites' });
+      setFiles(page.files);
+      setFileCursor(page.nextCursor);
+      setHasMoreFiles(page.hasMore);
     } catch (error: any) {
       if (error.message === 'UNAUTHORIZED') {
         authService.clearToken();
@@ -164,6 +165,30 @@ function App() {
       setLoading(false);
     }
   }, [isAuthenticated, currentCategory]);
+
+  const loadMoreFiles = useCallback(async () => {
+    if (!isAuthenticated || !hasMoreFiles || !fileCursor || loadingMoreFiles) return;
+    try {
+      setLoadingMoreFiles(true);
+      const page = await fileApi.getFilesPage({ cursor: fileCursor, favorites: currentCategory === 'favorites' });
+      setFiles(prev => {
+        const seen = new Set(prev.map(file => file.id));
+        return [...prev, ...page.files.filter(file => !seen.has(file.id))];
+      });
+      setFileCursor(page.nextCursor);
+      setHasMoreFiles(page.hasMore);
+    } catch (error: any) {
+      if (error.message === 'UNAUTHORIZED') {
+        authService.clearToken();
+        setIsAuthenticated(false);
+      } else {
+        console.error('加载更多文件失败:', error);
+        setNotification({ show: true, message: error.message || '加载更多文件失败', type: 'error' });
+      }
+    } finally {
+      setLoadingMoreFiles(false);
+    }
+  }, [isAuthenticated, hasMoreFiles, fileCursor, loadingMoreFiles, currentCategory]);
 
   // 加载存储统计
   const loadStorageStats = useCallback(async () => {
@@ -213,6 +238,28 @@ function App() {
       setCurrentFolder(null);
     }
   }, [currentCategory]);
+
+  useEffect(() => {
+    return () => {
+      if (navigationTapShieldTimerRef.current) {
+        window.clearTimeout(navigationTapShieldTimerRef.current);
+      }
+    };
+  }, []);
+
+  const enterFolder = useCallback((folderName: string) => {
+    setCurrentFolder(folderName);
+    setIsNavigationTapShieldActive(true);
+
+    if (navigationTapShieldTimerRef.current) {
+      window.clearTimeout(navigationTapShieldTimerRef.current);
+    }
+
+    navigationTapShieldTimerRef.current = window.setTimeout(() => {
+      setIsNavigationTapShieldActive(false);
+      navigationTapShieldTimerRef.current = null;
+    }, 450);
+  }, []);
 
   // 登录处理
   const handleLogin = async (password: string) => {
@@ -395,22 +442,15 @@ function App() {
     }
   };
 
-  const handleBatchDelete = async (fileIds = selectedFileIds, folderNames = selectedFolderNames) => {
-    if (fileIds.length === 0 && folderNames.length === 0) return;
-
-    const itemCount = fileIds.length + folderNames.length;
-    const folderHint = folderNames.length > 0 ? `
-包含 ${folderNames.length} 个文件夹，文件夹内文件也会删除。` : '';
-    if (!confirm(`确定要删除选中的 ${itemCount} 个项目吗？此操作无法撤销。${folderHint}`)) {
-      return;
-    }
-
+  const performBatchDelete = async (fileIds: string[], folderNames: string[]) => {
     try {
+      setLoading(true);
       const result = await fileApi.batchDelete(fileIds, folderNames);
       await Promise.all([loadFiles(), loadStorageStats()]);
       setSelectedFileIds([]);
       setSelectedFolderNames([]);
       setIsSelectionMode(false);
+      setPendingBatchDelete(null);
       setNotification({ show: true, message: result.message || '删除完成', type: 'success' });
     } catch (error: any) {
       if (error.message === 'UNAUTHORIZED') {
@@ -419,10 +459,16 @@ function App() {
       } else {
         console.error('批量删除失败:', error);
         setNotification({ show: true, message: error.message || '批量删除失败', type: 'error' });
+        throw error;
       }
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleBatchDelete = (fileIds = selectedFileIds, folderNames = selectedFolderNames) => {
+    if (fileIds.length === 0 && folderNames.length === 0) return;
+    setPendingBatchDelete({ fileIds, folderNames });
   };
 
   // 切换收藏状态
@@ -658,6 +704,16 @@ function App() {
     return looseFiles;
   }, [currentFolder, filteredFiles, looseFiles]);
 
+  const mediaPreviewFiles = useMemo(() => {
+    const base = currentFolder ? displayFiles : [...folders.flatMap(folder => folder.files.filter(file => file.name !== '.folder')), ...looseFiles];
+    const seen = new Set<string>();
+    return base.filter(file => {
+      if (seen.has(file.id)) return false;
+      seen.add(file.id);
+      return file.type === 'image' || file.type === 'video';
+    });
+  }, [currentFolder, displayFiles, folders, looseFiles]);
+
   const allFolderNames = useMemo(() => Array.from(new Set(files.filter(f => f.folder).map(f => f.folder!))), [files]);
 
   const handleMoveFile = async (destinationFolder: string | null) => {
@@ -766,7 +822,7 @@ function App() {
                   <Button
                     variant={isSelectionMode ? "secondary" : "ghost"}
                     size="sm"
-                    className="h-8 px-3 text-xs flex items-center gap-2"
+                    className="h-11 px-4 text-sm flex items-center gap-2 touch-manipulation"
                     onClick={() => {
                       setIsSelectionMode(!isSelectionMode);
                       setSelectedFileIds([]);
@@ -774,7 +830,7 @@ function App() {
                     }}
                   >
                     <CheckSquare className="h-4 w-4" />
-                    <span>多选</span>
+                    <span>{isSelectionMode ? "退出选择" : "选择"}</span>
                   </Button>
 
                   {/* 排序按钮 */}
@@ -782,7 +838,7 @@ function App() {
                     <Button
                       variant={sortConfig.key === 'name' ? 'secondary' : 'ghost'}
                       size="sm"
-                      className="h-8 px-2 text-xs"
+                      className="h-10 px-3 text-xs touch-manipulation"
                       onClick={() => setSortConfig(current => ({
                         key: 'name',
                         direction: current.key === 'name' && current.direction === 'asc' ? 'desc' : 'asc'
@@ -793,7 +849,7 @@ function App() {
                     <Button
                       variant={sortConfig.key === 'date' ? 'secondary' : 'ghost'}
                       size="sm"
-                      className="h-8 px-2 text-xs"
+                      className="h-10 px-3 text-xs touch-manipulation"
                       onClick={() => setSortConfig(current => ({
                         key: 'date',
                         direction: current.key === 'date' && current.direction === 'asc' ? 'desc' : 'asc'
@@ -840,7 +896,7 @@ function App() {
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="h-8 w-8 rounded-full"
+                          className="h-11 w-11 rounded-full touch-manipulation"
                           onClick={() => setCurrentFolder(null)}
                         >
                           <ArrowLeft className="h-4 w-4" />
@@ -859,7 +915,7 @@ function App() {
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-7 px-2 text-xs font-medium text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5"
+                          className="h-10 px-3 text-xs font-medium text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5 touch-manipulation"
                           onClick={() => setIsCreateFolderModalOpen(true)}
                         >
                           <FolderPlus className="h-3.5 w-3.5" />
@@ -903,7 +959,7 @@ function App() {
                             />
                           ) : (
                             <div
-                              className={`flex items-center gap-4 p-3 rounded-xl border ${selectedFileIds.includes(file.id) ? 'border-primary bg-primary/5' : 'border-border bg-card'} shadow-sm cursor-pointer group hover:bg-muted/50 transition-colors`}
+                              className={`flex min-h-[64px] items-center gap-4 p-3 rounded-xl border ${selectedFileIds.includes(file.id) ? 'border-primary bg-primary/5' : 'border-border bg-card'} shadow-sm cursor-pointer group hover:bg-muted/50 transition-colors touch-manipulation`}
                               onClick={() => isSelectionMode ? toggleFileSelection(file.id) : setSelectedFile(file)}
                             >
                               {isSelectionMode && (
@@ -927,7 +983,7 @@ function App() {
                               </div>
                               <div className="text-sm font-medium tabular-nums text-muted-foreground px-4">{file.size}</div>
                               <div>
-                                <FileMenu onDelete={() => verifyDelete(file)} />
+                                <FileMenu onDelete={() => verifyDelete(file)} onToggleFavorite={() => handleToggleFavorite(file.id)} isFavorite={!!file.is_favorite} />
                               </div>
                             </div>
                           )}
@@ -975,7 +1031,7 @@ function App() {
                               >
                                 <FolderCard
                                   folder={folder}
-                                  onClick={() => setCurrentFolder(folder.name)}
+                                  onClick={() => enterFolder(folder.name)}
                                   onRename={() => setRenamingFolder(folder.name)}
                                   onToggleFavorite={() => handleToggleFolderFavorite(folder.name)}
                                   onMove={() => setMovingFolder(folder.name)}
@@ -1023,7 +1079,7 @@ function App() {
                                   />
                                 ) : (
                                   <div
-                                    className={`flex items-center gap-4 p-3 rounded-xl border ${selectedFileIds.includes(file.id) ? 'border-primary bg-primary/5' : 'border-border bg-card'} shadow-sm cursor-pointer group hover:bg-muted/50 transition-colors`}
+                                    className={`flex min-h-[64px] items-center gap-4 p-3 rounded-xl border ${selectedFileIds.includes(file.id) ? 'border-primary bg-primary/5' : 'border-border bg-card'} shadow-sm cursor-pointer group hover:bg-muted/50 transition-colors touch-manipulation`}
                                     onClick={() => isSelectionMode ? toggleFileSelection(file.id) : setSelectedFile(file)}
                                   >
                                     {isSelectionMode && (
@@ -1047,7 +1103,7 @@ function App() {
                                     </div>
                                     <div className="text-sm font-medium tabular-nums text-muted-foreground px-4">{file.size}</div>
                                     <div>
-                                      <FileMenu onDelete={() => verifyDelete(file)} />
+                                      <FileMenu onDelete={() => verifyDelete(file)} onToggleFavorite={() => handleToggleFavorite(file.id)} isFavorite={!!file.is_favorite} />
                                     </div>
                                   </div>
                                 )}
@@ -1059,10 +1115,51 @@ function App() {
                     )}
                   </div>
                 )}
+
+                {hasMoreFiles && !loading && (
+                  <div className="flex justify-center pt-8">
+                    <Button
+                      variant="outline"
+                      onClick={loadMoreFiles}
+                      disabled={loadingMoreFiles}
+                      className="gap-2"
+                    >
+                      <RefreshCw className={`h-4 w-4 ${loadingMoreFiles ? 'animate-spin' : ''}`} />
+                      {loadingMoreFiles ? '加载中…' : '加载更多'}
+                    </Button>
+                  </div>
+                )}
               </div>
             </>
           )}
         </div>
+
+        {isNavigationTapShieldActive && (
+          <div
+            className="fixed inset-0 z-[55] cursor-wait bg-transparent"
+            aria-hidden="true"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onMouseUp={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onTouchStart={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onTouchEnd={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+          />
+        )}
 
         <Suspense fallback={null}>
           {selectedFile && (
@@ -1070,6 +1167,8 @@ function App() {
               file={selectedFile}
               onClose={() => setSelectedFile(null)}
               onToggleFavorite={handleToggleFavorite}
+              files={mediaPreviewFiles}
+              onNavigate={setSelectedFile}
             />
           )}
         </Suspense>
@@ -1091,6 +1190,14 @@ function App() {
           onClose={() => setDeletingFile(null)}
           onConfirm={handleConfirmDelete}
           fileName={deletingFile?.name}
+        />
+
+        <DeleteAlert
+          isOpen={!!pendingBatchDelete}
+          onClose={() => setPendingBatchDelete(null)}
+          onConfirm={() => pendingBatchDelete ? performBatchDelete(pendingBatchDelete.fileIds, pendingBatchDelete.folderNames) : undefined}
+          itemCount={(pendingBatchDelete?.fileIds.length || 0) + (pendingBatchDelete?.folderNames.length || 0)}
+          folderCount={pendingBatchDelete?.folderNames.length || 0}
         />
 
         <RenameModal

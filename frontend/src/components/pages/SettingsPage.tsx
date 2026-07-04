@@ -113,6 +113,7 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
     const [gdAccountName, setGdAccountName] = useState("");
     const [gdClientId, setGdClientId] = useState("");
     const [gdClientSecret, setGdClientSecret] = useState("");
+    const [gdSharedDriveId, setGdSharedDriveId] = useState("");
     const [showGDForm, setShowGDForm] = useState(false);
 
     // 2FA State
@@ -126,6 +127,22 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
 
     // Telegram User Download State
     const [showTelegramUserDownload, setShowTelegramUserDownload] = useState(false);
+    const [cleanupRetentionDays, setCleanupRetentionDays] = useState(7);
+    const [isCleaningDownloadItems, setIsCleaningDownloadItems] = useState(false);
+
+    const handleCleanupDownloadItems = async () => {
+        if (isCleaningDownloadItems) return;
+        if (!window.confirm(`确定清理 ${cleanupRetentionDays} 天前已完成的 Telegram 下载明细吗？\n\n只删除任务审计明细，不删除 files 文件索引，也不删除云端文件。`)) return;
+        setIsCleaningDownloadItems(true);
+        try {
+            const result = await fileApi.cleanupDownloadItems(cleanupRetentionDays);
+            alert(`清理完成：删除 ${result.deletedCount} 条已完成下载明细。`);
+        } catch (error: any) {
+            alert(error.message || '清理下载任务明细失败');
+        } finally {
+            setIsCleaningDownloadItems(false);
+        }
+    };
 
     const reloadStorageConfig = async () => {
         const data = await fileApi.getStorageConfig();
@@ -227,7 +244,7 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
         setIsSaving(true);
         try {
             const redirectUri = (config as any)?.googleDriveRedirectUri || config?.redirectUri?.replace('onedrive', 'google-drive') || `${window.location.origin}/api/storage/google-drive/callback`;
-            const { authUrl } = await fileApi.getGoogleDriveAuthUrl(gdClientId, gdClientSecret, redirectUri, gdAccountName);
+            const { authUrl } = await fileApi.getGoogleDriveAuthUrl(gdClientId, gdClientSecret, redirectUri, gdAccountName, gdSharedDriveId.trim());
 
             const width = 600;
             const height = 700;
@@ -621,6 +638,37 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
                 </AnimatePresence>
             </SettingsSection>
 
+            <SettingsSection title="数据维护">
+                <SettingsRow
+                    icon={Trash2}
+                    label="清理已完成下载明细"
+                    description="删除旧的 Telegram 下载审计明细，降低大型下载任务长期占用；不会删除文件索引或云端文件。"
+                    action={
+                        <div className="flex flex-wrap items-center justify-end gap-2">
+                            <select
+                                value={cleanupRetentionDays}
+                                onChange={(e) => setCleanupRetentionDays(Number(e.target.value))}
+                                className="h-9 rounded-lg border border-border bg-background px-2 text-sm outline-none"
+                                disabled={isCleaningDownloadItems}
+                            >
+                                <option value={1}>保留 1 天</option>
+                                <option value={7}>保留 7 天</option>
+                                <option value={30}>保留 30 天</option>
+                                <option value={90}>保留 90 天</option>
+                            </select>
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={handleCleanupDownloadItems}
+                                disabled={isCleaningDownloadItems}
+                            >
+                                {isCleaningDownloadItems ? "清理中..." : "立即清理"}
+                            </Button>
+                        </div>
+                    }
+                />
+            </SettingsSection>
+
             {/* Telegram Download Section */}
             <SettingsSection title="Telegram 下载设置">
                 <div className="p-4 bg-muted/20 border-b border-border/50">
@@ -918,6 +966,19 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
                                             className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm focus:ring-2 focus:ring-primary/20 outline-none transition-all"
                                             placeholder="Google Cloud Client Secret"
                                         />
+                                    </div>
+                                    <div className="space-y-2 md:col-span-2">
+                                        <label className="text-sm font-medium">共享云端硬盘 ID / 团队盘 ID（可选）</label>
+                                        <input
+                                            type="text"
+                                            value={gdSharedDriveId}
+                                            onChange={e => setGdSharedDriveId(e.target.value)}
+                                            className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm focus:ring-2 focus:ring-primary/20 outline-none transition-all"
+                                            placeholder="例如: 0Axxxxxxxxxxxxxxxxx"
+                                        />
+                                        <p className="text-xs text-muted-foreground leading-relaxed">
+                                            留空则使用“我的云端硬盘”。如需上传到共享云端硬盘，请填写 URL 中 <code>folders/</code> 后面的共享盘 ID；授权账号必须已加入该共享盘并具备创建文件权限。
+                                        </p>
                                     </div>
                                 </div>
 

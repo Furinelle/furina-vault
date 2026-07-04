@@ -33,13 +33,13 @@ export const FileMenu = ({ onDelete, onToggleFavorite, isFavorite = false }: Fil
             <Button
                 variant="ghost"
                 size="icon"
-                className="h-8 w-8 text-muted-foreground hover:text-foreground rounded-full hover:bg-muted transition-colors"
+                className="h-11 w-11 text-muted-foreground hover:text-foreground rounded-full hover:bg-muted transition-colors touch-manipulation"
                 onClick={(e) => {
                     e.stopPropagation();
                     setIsOpen(!isOpen);
                 }}
             >
-                <MoreVertical className="h-4 w-4" />
+                <MoreVertical className="h-5 w-5" />
             </Button>
 
             <AnimatePresence>
@@ -49,10 +49,10 @@ export const FileMenu = ({ onDelete, onToggleFavorite, isFavorite = false }: Fil
                         animate={{ opacity: 1, scale: 1, y: 0 }}
                         exit={{ opacity: 0, scale: 0.95, y: 5 }}
                         transition={{ duration: 0.1 }}
-                        className="absolute right-0 top-full mt-1 w-32 bg-white dark:bg-zinc-900 border border-border rounded-lg shadow-lg overflow-hidden z-50 p-1"
+                        className="absolute right-0 top-full mt-1 w-36 bg-white dark:bg-zinc-900 border border-border rounded-xl shadow-lg overflow-hidden z-50 p-1.5"
                     >
                         <button
-                            className="w-full flex items-center gap-2 px-2.5 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-md transition-colors text-left font-medium"
+                            className="w-full min-h-11 flex items-center gap-2 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg transition-colors text-left font-medium touch-manipulation"
                             onClick={(e) => {
                                 e.stopPropagation();
                                 onDelete();
@@ -63,7 +63,7 @@ export const FileMenu = ({ onDelete, onToggleFavorite, isFavorite = false }: Fil
                             {t("file.delete") || "Delete"}
                         </button>
                         <button
-                            className="w-full flex items-center gap-2 px-2.5 py-2 text-sm text-yellow-600 dark:text-yellow-400 hover:bg-yellow-50 dark:hover:bg-yellow-500/10 rounded-md transition-colors text-left font-medium"
+                            className="w-full min-h-11 flex items-center gap-2 px-3 py-2 text-sm text-yellow-600 dark:text-yellow-400 hover:bg-yellow-50 dark:hover:bg-yellow-500/10 rounded-lg transition-colors text-left font-medium touch-manipulation"
                             onClick={(e) => {
                                 e.stopPropagation();
                                 onToggleFavorite?.();

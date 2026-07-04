@@ -98,7 +98,7 @@ export const FolderCard = ({
             <motion.div
                 layout
                 whileHover={{ y: isSelectionMode ? 0 : -4, transition: { duration: 0.2 } }}
-                className={`group relative flex flex-col rounded-2xl border ${isSelected ? 'border-primary ring-2 ring-primary/20 bg-primary/5' : 'border-border/50 bg-card'} overflow-hidden shadow-sm transition-all ${!isSelectionMode ? 'hover:shadow-lg hover:border-primary/30 cursor-pointer' : 'cursor-default'}`}
+                className={`group relative flex flex-col rounded-2xl border ${isSelected ? 'border-primary ring-2 ring-primary/20 bg-primary/5' : 'border-border/50 bg-card'} overflow-hidden shadow-sm transition-all touch-manipulation select-none ${!isSelectionMode ? 'hover:shadow-lg hover:border-primary/30 cursor-pointer active:scale-[0.99]' : 'cursor-pointer active:scale-[0.99]'}`}
                 {...(!isSelectionMode ? longPressHandlers : { onClick: handleCardClick })}
                 onContextMenu={handleContextMenu}
             >
@@ -109,7 +109,7 @@ export const FolderCard = ({
                             <img
                                 src={thumbnailSrc}
                                 alt={folder.name}
-                                className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110 opacity-90"
+                                className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105 opacity-90"
                                 loading="lazy"
                             />
                             {/* 渐变遮罩，使底部文字更清晰 */}
@@ -130,11 +130,14 @@ export const FolderCard = ({
                     {/* Selection Checkbox */}
                     {isSelectionMode && (
                         <div
-                            className="absolute bottom-2.5 right-2.5 z-20"
+                            className="absolute bottom-2 right-2 z-20 flex h-11 w-11 items-center justify-center"
                             onClick={(e) => e.stopPropagation()}
                         >
                             <div
-                                className={`h-6 w-6 rounded-full border-2 flex items-center justify-center transition-all cursor-pointer ${isSelected ? 'bg-primary border-primary' : 'bg-black/20 border-white/50 backdrop-blur-sm'}`}
+                                role="checkbox"
+                                aria-checked={isSelected}
+                                aria-label={`选择文件夹 ${folder.name}`}
+                                className={`h-7 w-7 rounded-full border-2 flex items-center justify-center transition-all cursor-pointer shadow-sm ${isSelected ? 'bg-primary border-primary' : 'bg-black/35 border-white/70 backdrop-blur-sm'}`}
                                 onClick={() => onSelect?.(folder.name)}
                             >
                                 {isSelected && (
@@ -187,7 +190,7 @@ export const FolderCard = ({
                         <Button
                             variant="ghost"
                             size="icon"
-                            className="h-8 w-8 rounded-full md:opacity-0 group-hover:opacity-100 transition-opacity -mr-1.5"
+                            className="h-11 w-11 rounded-full md:opacity-0 group-hover:opacity-100 transition-opacity -mr-1.5 touch-manipulation"
                             onClick={(e) => {
                                 e.stopPropagation();
                                 const rect = e.currentTarget.getBoundingClientRect();
@@ -197,8 +200,9 @@ export const FolderCard = ({
                             onMouseUp={(e) => e.stopPropagation()}
                             onTouchStart={(e) => e.stopPropagation()}
                             onTouchEnd={(e) => e.stopPropagation()}
+                                                    aria-label={`更多操作：${folder.name}`}
                         >
-                            <MoreVertical className="h-4 w-4" />
+                            <MoreVertical className="h-5 w-5" />
                         </Button>
                     )}
                 </div>

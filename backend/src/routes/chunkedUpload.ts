@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { pipeline } from 'stream/promises';
 import { query } from '../db/index.js';
-import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
+import { generateThumbnail, getImageDimensions, generateMediaPreview } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
@@ -317,6 +317,7 @@ router.post('/complete', async (req: Request, res: Response) => {
         // 5. 在保存到永久存储前生成缩略图和获取尺寸
         // 方案A：只在本地存储生成缩略图；第三方存储不生成本地缩略图。
         let thumbnailPath = null;
+        let previewPath = null;
         let width = null;
         let height = null;
         const provider = storageManager.getProvider();
@@ -336,6 +337,18 @@ router.post('/complete', async (req: Request, res: Response) => {
                 }
             } catch (error) {
                 console.error('生成缩略图失败:', error);
+            }
+        }
+
+        if (provider.name === 'local' && session.mimeType.startsWith('image/')) {
+            try {
+                const previewResult = await generateMediaPreview(tempMergedPath, storedName, session.mimeType);
+                if (previewResult) {
+                    previewPath = path.basename(previewResult);
+                    console.log(`[ChunkedComplete] 🎞️ Image preview generated: ${previewPath}`);
+                }
+            } catch (error) {
+                console.error('生成图片预览失败:', error);
             }
         }
 
@@ -364,14 +377,25 @@ router.post('/complete', async (req: Request, res: Response) => {
                 session.mimeType.startsWith('audio/') ? 'audio' : 'other';
 
         const result = await query(
-            `INSERT INTO files 
-            (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+            `INSERT INTO files
+            (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id, created_at, name, type, size`,
-            [session.filename, storedName, type, session.mimeType, session.totalSize, storedPath, thumbnailPath, width, height, provider.name, storageFolder, activeAccountId]
+            [session.filename, storedName, type, session.mimeType, session.totalSize, storedPath, thumbnailPath, previewPath, width, height, provider.name, storageFolder, activeAccountId]
         );
 
         const newFile = result.rows[0];
+
+        if (provider.name === 'local' && type === 'video') {
+            void generateMediaPreview(storedPath, storedName, session.mimeType)
+                .then(async (previewResult) => {
+                    if (!previewResult) return;
+                    const generatedPreviewName = path.basename(previewResult);
+                    await query('UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2', [generatedPreviewName, newFile.id]);
+                    console.log(`[ChunkedComplete] 🎞️ Video preview generated async: ${generatedPreviewName}`);
+                })
+                .catch((error) => console.error('异步生成视频预览失败:', error));
+        }
 
         res.json({
             success: true,

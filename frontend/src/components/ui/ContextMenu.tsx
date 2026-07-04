@@ -72,13 +72,13 @@ export const ContextMenu = ({ x, y, isOpen, onClose, items }: ContextMenuProps) 
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.92 }}
                     transition={{ duration: 0.12 }}
-                    className="fixed z-[9999] min-w-[140px] bg-white dark:bg-zinc-900 border border-border rounded-lg shadow-xl overflow-hidden p-1"
+                    className="fixed z-[9999] min-w-[168px] bg-white dark:bg-zinc-900 border border-border rounded-xl shadow-xl overflow-hidden p-1.5"
                     style={{ left: x, top: y }}
                 >
                     {items.map((item, index) => (
                         <button
                             key={index}
-                            className={`w-full flex items-center gap-3 px-4 py-3 text-base md:text-sm rounded-md transition-colors text-left font-medium ${item.variant === "danger"
+                            className={`w-full min-h-11 flex items-center gap-3 px-4 py-3 text-base md:text-sm rounded-lg transition-colors text-left font-medium touch-manipulation ${item.variant === "danger"
                                 ? "text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
                                 : "text-foreground hover:bg-muted"
                                 }`}
