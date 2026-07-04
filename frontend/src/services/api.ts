@@ -4,6 +4,8 @@ import { API_BASE } from './config';
 
 // 分块大小：50MB（小于 Cloudflare 100MB 限制）
 const CHUNK_SIZE = 50 * 1024 * 1024;
+// 同时在途的分块上传请求数，避免单流上传跑不满带宽
+const CHUNK_CONCURRENCY = 4;
 
 export interface FileData {
     id: string;
@@ -183,8 +185,9 @@ class FileAPI {
         const { uploadId } = await initResponse.json();
 
         try {
-            // 2. 逐个上传分块
-            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            // 2. 并发上传分块（同时最多 CHUNK_CONCURRENCY 个请求在途，避免单流上传跑不满带宽）
+            let nextChunkIndex = 0;
+            const uploadOneChunk = async (chunkIndex: number) => {
                 const start = chunkIndex * CHUNK_SIZE;
                 const end = Math.min(start + CHUNK_SIZE, file.size);
                 const chunk = file.slice(start, end);
@@ -212,7 +215,17 @@ class FileAPI {
                         percent: Math.round((uploadedBytes / file.size) * 100),
                     });
                 }
-            }
+            };
+
+            const worker = async () => {
+                while (nextChunkIndex < totalChunks) {
+                    const chunkIndex = nextChunkIndex++;
+                    await uploadOneChunk(chunkIndex);
+                }
+            };
+
+            const workerCount = Math.min(CHUNK_CONCURRENCY, totalChunks);
+            await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
             // 3. 完成上传
             const completeResponse = await fetch(`${API_BASE}/api/chunked/complete`, {
