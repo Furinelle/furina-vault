@@ -499,6 +499,21 @@ class FileAPI {
         return response.json();
     }
 
+    // 从当前活跃的 S3 存储桶导入未入库文件
+    async importFromBucket(): Promise<{ success: boolean; scanned: number; imported: number; skipped: number; excluded: number }> {
+        const response = await fetch(`${API_BASE}/api/storage/import-from-bucket`, {
+            credentials: 'include',
+            method: 'POST',
+            headers: getHeaders(),
+        });
+        if (response.status === 401) throw new Error('UNAUTHORIZED');
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || '从存储桶导入失败');
+        }
+        return response.json();
+    }
+
     // 删除账户
     async deleteAccount(accountId: string): Promise<{ success: boolean; message: string }> {
         const response = await fetch(`${API_BASE}/api/storage/accounts/${accountId}`, {

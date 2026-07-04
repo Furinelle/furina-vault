@@ -617,4 +617,62 @@ router.delete('/accounts/:id', requireAuth, async (req: Request, res: Response) 
     }
 });
 
+// 从当前活跃的 S3 存储桶导入未入库的文件（绕过 TG Vault 直传到桶里的文件借此补建索引）
+router.post('/import-from-bucket', requireAuth, async (_req: Request, res: Response) => {
+    try {
+        const { storageManager } = await import('../services/storage.js');
+        const { getFileType, getMimeTypeFromFilename } = await import('../utils/telegramUtils.js');
+
+        const provider = storageManager.getProvider();
+        if (provider.name !== 's3' || typeof (provider as any).listObjects !== 'function') {
+            return res.status(400).json({ error: '当前活跃存储源不是 S3 兼容存储，无法从桶导入' });
+        }
+        const activeAccountId = storageManager.getActiveAccountId();
+        if (!activeAccountId) {
+            return res.status(400).json({ error: '未找到活跃的存储账户' });
+        }
+
+        const objects: { key: string; size: number }[] = await (provider as any).listObjects();
+
+        // 已入库的 path 集合（仅限当前账户）
+        const existing = await query('SELECT path FROM files WHERE storage_account_id = $1', [activeAccountId]);
+        const existingPaths = new Set<string>(existing.rows.map((r: any) => r.path));
+
+        let imported = 0;
+        let skipped = 0;
+        let excluded = 0;
+
+        for (const obj of objects) {
+            // 排除数据库备份目录与“目录占位”对象
+            if (obj.key.startsWith('_backups/') || obj.key.endsWith('/')) {
+                excluded++;
+                continue;
+            }
+            if (existingPaths.has(obj.key)) {
+                skipped++;
+                continue;
+            }
+
+            const baseName = obj.key.includes('/') ? obj.key.slice(obj.key.lastIndexOf('/') + 1) : obj.key;
+            const folder = obj.key.includes('/') ? obj.key.slice(0, obj.key.lastIndexOf('/')) : null;
+            const mimeType = getMimeTypeFromFilename(baseName);
+            const type = getFileType(mimeType);
+
+            await query(
+                `INSERT INTO files
+                (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
+                VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, NULL, NULL, $7, $8, $9)`,
+                [baseName, baseName, type, mimeType, obj.size, obj.key, provider.name, folder, activeAccountId]
+            );
+            imported++;
+        }
+
+        console.log(`[Storage] Bucket import done: scanned=${objects.length} imported=${imported} skipped=${skipped} excluded=${excluded}`);
+        res.json({ success: true, scanned: objects.length, imported, skipped, excluded });
+    } catch (error) {
+        console.error('从存储桶导入失败:', error);
+        res.status(500).json({ error: '从存储桶导入失败' });
+    }
+});
+
 export default router;

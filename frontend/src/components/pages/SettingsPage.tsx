@@ -375,6 +375,20 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
         }
     };
 
+    const [isImporting, setIsImporting] = useState(false);
+    const handleImportFromBucket = async () => {
+        if (!window.confirm("扫描当前 S3 存储桶，将桶内还未在 TG Vault 登记的文件导入到文件列表（自动跳过 _backups/ 备份目录）。继续吗？")) return;
+        setIsImporting(true);
+        try {
+            const result = await fileApi.importFromBucket();
+            alert(`导入完成：扫描 ${result.scanned} 个对象，新导入 ${result.imported} 个，已存在跳过 ${result.skipped} 个，排除 ${result.excluded} 个`);
+        } catch (error: any) {
+            alert("从存储桶导入失败: " + error.message);
+        } finally {
+            setIsImporting(false);
+        }
+    };
+
     const handleSaveS3Config = async () => {
         if (!s3AccountName || !s3Endpoint || !s3Region || !s3AccessKeyId || !s3AccessKeySecret || !s3Bucket) {
             alert("请填写所有必填项");
@@ -1419,10 +1433,21 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
                                 </div>
                                 <div className="flex items-center gap-2">
                                     {account.is_active ? (
-                                        <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-green-500/10 text-green-600 dark:text-green-400">
-                                            <CheckCircle className="h-3.5 w-3.5" />
-                                            <span className="text-xs font-semibold">正在使用</span>
-                                        </div>
+                                        <>
+                                            <Button
+                                                size="sm"
+                                                variant="ghost"
+                                                className="h-8 text-xs hover:bg-primary/10 hover:text-primary"
+                                                onClick={handleImportFromBucket}
+                                                disabled={isImporting || isSaving}
+                                            >
+                                                {isImporting ? "正在导入..." : "从存储桶导入"}
+                                            </Button>
+                                            <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-green-500/10 text-green-600 dark:text-green-400">
+                                                <CheckCircle className="h-3.5 w-3.5" />
+                                                <span className="text-xs font-semibold">正在使用</span>
+                                            </div>
+                                        </>
                                     ) : (
                                         <>
                                             <Button

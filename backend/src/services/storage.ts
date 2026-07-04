@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import OSS from 'ali-oss';
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl as getS3SignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createClient, WebDAVClient } from 'webdav';
 import { google } from 'googleapis';
@@ -323,6 +323,28 @@ export class S3StorageProvider implements IStorageProvider {
             console.error('[S3] Get file size failed:', error.message);
             return 0;
         }
+    }
+
+    /**
+     * 列举桶内全部对象（分页遍历），用于"从存储桶导入"
+     */
+    async listObjects(): Promise<{ key: string; size: number }[]> {
+        const objects: { key: string; size: number }[] = [];
+        let continuationToken: string | undefined;
+        do {
+            const command = new ListObjectsV2Command({
+                Bucket: this.bucket,
+                ContinuationToken: continuationToken,
+                MaxKeys: 1000,
+            });
+            const response = await this.client.send(command);
+            for (const item of response.Contents || []) {
+                if (!item.Key) continue;
+                objects.push({ key: item.Key, size: Number(item.Size || 0) });
+            }
+            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+        } while (continuationToken);
+        return objects;
     }
 }
 
