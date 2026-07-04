@@ -244,6 +244,9 @@ export class S3StorageProvider implements IStorageProvider {
                 secretAccessKey: secretAccessKey,
             },
             forcePathStyle: forcePathStyle,
+            // R2 对新版 SDK 默认的 flexible checksum 支持不完整，预签名 URL 会被判定 AccessDenied
+            requestChecksumCalculation: 'WHEN_REQUIRED',
+            responseChecksumValidation: 'WHEN_REQUIRED',
         });
     }
 

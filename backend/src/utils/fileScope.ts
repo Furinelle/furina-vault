@@ -60,10 +60,13 @@ export async function removePhysicalFile(file: any): Promise<void> {
 
 export async function updateScopedFileById(id: string, setSql: string, values: any[]): Promise<number> {
     const scope = await getCurrentStorageScope();
-    const idParam = nextParam(scope, values.length + 1);
+    const base = values.length;
+    // scope.clause 里的占位符(如 $1)重新编号到 values 之后，避免跟调用方硬编码的 $1..$N 撞车
+    const shiftedClause = scope.clause.replace(/\$(\d+)/g, (_match, n) => `$${base + Number(n)}`);
+    const idParam = `$${base + scope.params.length + 1}`;
     const result = await query(
-        `UPDATE files SET ${setSql} WHERE ${scope.clause} AND id = ${idParam}`,
-        [...scope.params, ...values, id]
+        `UPDATE files SET ${setSql} WHERE ${shiftedClause} AND id = ${idParam}`,
+        [...values, ...scope.params, id]
     );
     return result.rowCount || 0;
 }
