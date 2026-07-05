@@ -330,9 +330,6 @@ git fetch origin
 git pull --ff-only origin main
 
 docker compose up -d --build
-
-docker compose ps
-curl -fsS http://127.0.0.1:51947/health
 ```
 
 说明：
