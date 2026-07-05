@@ -356,7 +356,7 @@ async function startTelegramWizard(message: Api.Message, senderId: number, kind:
     const state: TelegramWizardState = { kind, step: kind === 'tg_download' ? 'mode' : 'source' };
     telegramWizardStates.set(senderId, state);
     if (kind === 'tg_sub_manage') {
-        const rows = await listTelegramSubscriptions(senderId);
+        const rows = await listTelegramSubscriptions(senderId, true);
         await message.reply({ message: buildSubscriptionManagePanel(rows), buttons: buildSubscriptionActionKeyboard(rows) });
         return;
     }
@@ -409,7 +409,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
         state.source = sourceParts.join(' ') || input;
         if (state.kind === 'tg_sub_manage') {
             if (/^\d+$/.test(input)) {
-                const rows = await listTelegramSubscriptions(senderId);
+                const rows = await listTelegramSubscriptions(senderId, true);
                 const index = parseInt(input, 10) - 1;
                 const target = rows[index];
                 if (!target) {
@@ -418,7 +418,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
                 }
                 const sub = await unsubscribeTelegramChannel(senderId, target.id);
                 telegramWizardStates.delete(senderId);
-                const rowsAfterCancel = await listTelegramSubscriptions(senderId);
+                const rowsAfterCancel = await listTelegramSubscriptions(senderId, true);
                 await message.reply({
                     message: [
                         sub ? `✅ 已取消订阅 ${sub.title || sub.source}` : '❌ 未找到该订阅',
@@ -461,7 +461,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
             try {
                 if (state.subscriptionId) {
                     const sub = await updateTelegramSubscriptionFolder(senderId, state.subscriptionId, state.customFolder || null);
-                    const rowsAfterUpdate = await listTelegramSubscriptions(senderId);
+                    const rowsAfterUpdate = await listTelegramSubscriptions(senderId, true);
                     await message.reply({
                         message: [
                             sub ? `✅ 已更新订阅目录：${sub.title || sub.source}` : '❌ 未找到该订阅',
@@ -578,21 +578,31 @@ function buildSubscriptionActionKeyboard(rows: any[]): Api.ReplyInlineMarkup | u
     });
 }
 
+function buildSubscriptionDisplayLines(row: any, index: number): string {
+    const status = row.enabled ? '✅' : '⏸️';
+    const sourceLine = row.source_original && row.source_original !== row.source
+        ? `   ${row.source_original} → ${row.source} · last_id=${row.last_message_id || 0}`
+        : `   ${row.source} · last_id=${row.last_message_id || 0}`;
+    return [
+        `${index + 1}. ${status} ${row.title || row.source_original || row.source}`,
+        sourceLine,
+        row.folder_override ? `   📁 专属目录：${row.folder_override}` : '   📁 保存策略：默认自动分类',
+        !row.enabled && row.disabled_reason ? `   ⚠️ ${row.disabled_reason}` : null,
+        !row.enabled && row.disabled_at ? `   暂停时间：${new Date(row.disabled_at).toLocaleString('zh-CN', { hour12: false })}` : null,
+    ].filter(Boolean).join('\n');
+}
+
 function buildSubscriptionManagePanel(rows: any[]): string {
     return [
         '📡 **频道订阅管理**',
         '',
         rows.length > 0
-            ? rows.map((row, index) => [
-                `${index + 1}. ${row.enabled ? '✅' : '⏸️'} ${row.title || row.source}`,
-                `   ${row.source} · last_id=${row.last_message_id || 0}`,
-                row.folder_override ? `   📁 专属目录：${row.folder_override}` : '   📁 保存策略：默认自动分类',
-            ].join('\n')).join('\n')
-            : '当前没有启用中的订阅。',
+            ? rows.map((row, index) => buildSubscriptionDisplayLines(row, index)).join('\n')
+            : '当前没有订阅。',
         '',
-        rows.length > 0 ? '可直接点击订阅下方按钮修改/清除专属目录或取消订阅。' : '回复频道用户名或链接可新增订阅。',
+        rows.length > 0 ? '可直接点击订阅下方按钮修改/清除专属目录或取消订阅；已暂停订阅会保留提醒，重新添加同一来源可恢复。' : '回复频道用户名或链接可新增订阅。',
         '回复频道用户名或链接也可新增订阅。',
-        '例如：`@channel_username` 或 `https://t.me/channel_username`',
+        '例如：`@channel_username`、`https://t.me/channel_username` 或已加入的 `https://t.me/+hash` 私密链接',
         '',
         '新增订阅时会询问是否为本订阅单独指定保存目录；该目录只影响这个订阅，不会改变全局 /path_rules。',
         '',
@@ -606,9 +616,7 @@ function formatSubscriptionList(rows: any[]): string {
         '📡 **频道订阅**',
         '',
         ...rows.map((row, index) => [
-            `${index + 1}. ${row.enabled ? '✅' : '⏸️'} ${row.title || row.source}`,
-            `   ${row.source} · last_id=${row.last_message_id || 0}`,
-            row.folder_override ? `   📁 专属目录：${row.folder_override}` : '   📁 保存策略：默认自动分类',
+            buildSubscriptionDisplayLines(row, index),
             `   ID: ${String(row.id).slice(0, 8)}`,
         ].join('\n')),
     ].join('\n');
@@ -919,7 +927,7 @@ async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQ
     const match = data.match(/^tsub_(view|folder|clear|cancel)_(.+)$/);
     if (!match) return;
     const [, action, id] = match;
-    const rows = await listTelegramSubscriptions(userId);
+    const rows = await listTelegramSubscriptions(userId, true);
     const target = rows.find(row => String(row.id) === id);
     if (!target) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '订阅不存在或已取消', alert: true }));
@@ -952,7 +960,7 @@ async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQ
 
     if (action === 'clear') {
         await updateTelegramSubscriptionFolder(userId, id, null);
-        const rowsAfterClear = await listTelegramSubscriptions(userId);
+        const rowsAfterClear = await listTelegramSubscriptions(userId, true);
         await client.editMessage(update.peer, {
             message: update.msgId,
             text: buildSubscriptionManagePanel(rowsAfterClear),
@@ -964,7 +972,7 @@ async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQ
 
     if (action === 'cancel') {
         await unsubscribeTelegramChannel(userId, id);
-        const rowsAfterCancel = await listTelegramSubscriptions(userId);
+        const rowsAfterCancel = await listTelegramSubscriptions(userId, true);
         await client.editMessage(update.peer, {
             message: update.msgId,
             text: buildSubscriptionManagePanel(rowsAfterCancel),
@@ -1301,7 +1309,7 @@ export async function initTelegramBot(): Promise<void> {
                         await message.reply({ message: MSG.AUTH_REQUIRED });
                         return;
                     }
-                    const rows = await listTelegramSubscriptions(senderId);
+                    const rows = await listTelegramSubscriptions(senderId, true);
                     await message.reply({ message: formatSubscriptionList(rows) });
                     return;
                 }

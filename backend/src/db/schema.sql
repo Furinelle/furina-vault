@@ -98,10 +98,14 @@ CREATE TABLE IF NOT EXISTS telegram_channel_subscriptions (
     user_id BIGINT NOT NULL,
     chat_id BIGINT,
     source TEXT NOT NULL,
+    source_original TEXT,
+    source_type TEXT DEFAULT 'public',
     title TEXT,
     last_message_id INT DEFAULT 0,
     folder_override TEXT,
     enabled BOOLEAN DEFAULT true,
+    disabled_reason TEXT,
+    disabled_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(user_id, source)
@@ -109,7 +113,11 @@ CREATE TABLE IF NOT EXISTS telegram_channel_subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_tg_channel_subscriptions_enabled ON telegram_channel_subscriptions(enabled);
 CREATE INDEX IF NOT EXISTS idx_tg_channel_subscriptions_user_id ON telegram_channel_subscriptions(user_id);
+ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS source_original TEXT;
+ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'public';
 ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS folder_override TEXT;
+ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
+ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
 
 CREATE OR REPLACE TRIGGER telegram_channel_subscriptions_updated_at
     BEFORE UPDATE ON telegram_channel_subscriptions
