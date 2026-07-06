@@ -1,4 +1,5 @@
 import { Api, TelegramClient } from 'telegram';
+import { getPeerId } from 'telegram/Utils.js';
 import { query } from '../db/index.js';
 import { storageManager } from './storage.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
@@ -32,17 +33,19 @@ async function getTelegramSourceAllowlist(): Promise<string[]> {
     return parseTelegramSourceAllowlist(stored || '');
 }
 
-async function assertTelegramSourceAllowed(source: string): Promise<void> {
+async function assertTelegramSourceAllowed(source: string, extraSources: string[] = []): Promise<void> {
     const normalized = normalizeSource(source).toLowerCase();
+    const normalizedExtras = extraSources.map(item => normalizeSource(item).toLowerCase());
     const allowlist = await getTelegramSourceAllowlist();
     if (allowlist.length === 0) {
-        // Empty allowlist keeps compatibility for public @usernames/links, but refuses numeric/private peers.
-        if (/^-?\d+$/.test(normalized)) {
+        // Empty allowlist keeps compatibility for public @usernames/links. Private invite links are resolved
+        // through CheckChatInvite first, so a numeric peer produced by that trusted flow is allowed.
+        if (/^-?\d+$/.test(normalized) && extraSources.length === 0) {
             throw new Error('未配置 Telegram 来源白名单，禁止使用数字 ID/私聊/私密群组来源。请配置 TELEGRAM_ALLOWED_SOURCES。');
         }
         return;
     }
-    if (!allowlist.includes(normalized)) {
+    if (!allowlist.includes(normalized) && !normalizedExtras.some(item => allowlist.includes(item))) {
         throw new Error(`来源 ${source} 不在 Telegram 下载白名单中`);
     }
 }
@@ -65,6 +68,68 @@ function normalizeSource(source: string): string {
     if (!trimmed) throw new Error('频道不能为空');
     if (trimmed.startsWith('@') || /^-?\d+$/.test(trimmed) || /^https?:\/\//i.test(trimmed)) return trimmed;
     return `@${trimmed}`;
+}
+
+export function parseTelegramPrivateInviteHash(source: string): string | null {
+    const trimmed = source.trim();
+    // Supports t.me/+hash, https://t.me/+hash and legacy t.me/joinchat/hash private invite links ("t.me/+hash").
+    const match = trimmed.match(/^(?:https?:\/\/)?(?:www\.)?t\.me\/(?:\+|joinchat\/)([A-Za-z0-9_-]+)\/?(?:[?#].*)?$/i);
+    return match?.[1] || null;
+}
+
+interface ResolvedTelegramSource {
+    source: string;
+    originalSource: string;
+    sourceType: 'public' | 'private_invite';
+    entity?: any;
+    title?: string;
+}
+
+function telegramInviteErrorMessage(error: unknown): string {
+    const anyErr = error as any;
+    const text = `${anyErr?.errorMessage || ''} ${anyErr?.message || ''}`;
+    if (/INVITE_HASH_EXPIRED/i.test(text)) {
+        return '私密频道/群邀请链接已过期，无法解析。请获取新的邀请链接，或先用生成用户 Session 的同一个 Telegram 账号加入后再重试。';
+    }
+    if (/INVITE_HASH_INVALID/i.test(text)) {
+        return '私密频道/群邀请链接无效，无法解析。请检查链接是否完整，或重新生成邀请链接。';
+    }
+    if (/USER_ALREADY_PARTICIPANT/i.test(text)) {
+        return '当前账号已加入，但 Telegram 返回了异常状态，请重新尝试解析。';
+    }
+    return `私密频道/群邀请链接解析失败：${anyErr?.message || anyErr?.errorMessage || String(error)}`;
+}
+
+function assertJoinedPrivateInvite(invite: any): void {
+    if (invite instanceof Api.ChatInviteAlready) return;
+    if (invite instanceof Api.ChatInvite) {
+        throw new Error('当前 Telegram 用户账号尚未加入这个私密频道/群，无法读取消息。请先使用生成用户 Session 的同一个 Telegram 账号打开邀请链接并加入，然后重新执行订阅或下载命令。');
+    }
+}
+
+async function resolveTelegramSource(userClient: TelegramClient, sourceInput: string): Promise<ResolvedTelegramSource> {
+    const originalSource = sourceInput.trim();
+    const inviteHash = parseTelegramPrivateInviteHash(originalSource);
+    if (!inviteHash) {
+        const source = normalizeSource(originalSource);
+        const entity: any = await userClient.getEntity(source as any);
+        return { source, originalSource, sourceType: 'public', entity, title: getEntityTitle(entity, source) };
+    }
+
+    let invite: any;
+    try {
+        invite = await userClient.invoke(new Api.messages.CheckChatInvite({ hash: inviteHash }));
+    } catch (error) {
+        throw new Error(telegramInviteErrorMessage(error));
+    }
+
+    assertJoinedPrivateInvite(invite);
+    const entity = invite.chat;
+    if (!entity) {
+        throw new Error('私密频道/群邀请链接解析失败：Telegram 未返回可读取的频道实体。请检查账号是否仍在该频道/群内。');
+    }
+    const source = getPeerId(entity, true);
+    return { source, originalSource, sourceType: 'private_invite', entity, title: getEntityTitle(entity, source) };
 }
 
 function getEntityTitle(entity: any, fallback: string): string {
@@ -486,26 +551,25 @@ async function hydratePendingDownloadRefs(userClient: TelegramClient, jobId: str
 
 export async function subscribeTelegramChannel(userId: number, chatId: string | undefined, sourceInput: string, folderOverride?: string | null) {
     const userClient = requireUserClient();
-    const source = normalizeSource(sourceInput);
-    await assertTelegramSourceAllowed(source);
-    const entity: any = await userClient.getEntity(source as any);
-    const latestMessageId = await getLatestMessageId(userClient, source);
-    const title = getEntityTitle(entity, source);
+    const resolved = await resolveTelegramSource(userClient, sourceInput);
+    await assertTelegramSourceAllowed(resolved.source, [resolved.originalSource]);
+    const latestMessageId = await getLatestMessageId(userClient, resolved.source);
+    const title = resolved.title || getEntityTitle(resolved.entity, resolved.source);
 
     const result = await query(
-        `INSERT INTO telegram_channel_subscriptions (user_id, chat_id, source, title, last_message_id, folder_override, enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, true)
+        `INSERT INTO telegram_channel_subscriptions (user_id, chat_id, source, source_original, source_type, title, last_message_id, folder_override, enabled, disabled_reason, disabled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, NULL, NULL)
          ON CONFLICT (user_id, source)
-         DO UPDATE SET chat_id = EXCLUDED.chat_id, title = EXCLUDED.title, folder_override = EXCLUDED.folder_override, enabled = true, updated_at = NOW()
-         RETURNING id, source, title, last_message_id, folder_override, enabled`,
-        [userId, chatId || null, source, title, latestMessageId, folderOverride || null]
+         DO UPDATE SET chat_id = EXCLUDED.chat_id, source_original = EXCLUDED.source_original, source_type = EXCLUDED.source_type, title = EXCLUDED.title, folder_override = EXCLUDED.folder_override, enabled = true, disabled_reason = NULL, disabled_at = NULL, updated_at = NOW()
+         RETURNING id, source, source_original, source_type, title, last_message_id, folder_override, enabled, disabled_reason, disabled_at`,
+        [userId, chatId || null, resolved.source, resolved.originalSource, resolved.sourceType, title, latestMessageId, folderOverride || null]
     );
     return result.rows[0];
 }
 
 export async function listTelegramSubscriptions(userId: number, includeDisabled = false) {
     const result = await query(
-        `SELECT id, source, title, last_message_id, folder_override, enabled, updated_at
+        `SELECT id, source, source_original, source_type, title, last_message_id, folder_override, enabled, disabled_reason, disabled_at, updated_at
          FROM telegram_channel_subscriptions
          WHERE user_id = $1
            AND ($2::boolean OR enabled = true)
@@ -520,8 +584,8 @@ export async function updateTelegramSubscriptionFolder(userId: number, selector:
     const result = await query(
         `UPDATE telegram_channel_subscriptions
          SET folder_override = $2, updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $3 AND enabled = true
-         RETURNING id, source, title, last_message_id, folder_override, enabled`,
+         WHERE user_id = $1 AND id::text LIKE $3
+         RETURNING id, source, source_original, source_type, title, last_message_id, folder_override, enabled, disabled_reason, disabled_at`,
         [userId, folderOverride || null, `${trimmed}%`]
     );
     return result.rows[0] || null;
@@ -534,12 +598,37 @@ export async function unsubscribeTelegramChannel(userId: number, selector: strin
         : trimmed;
     const result = await query(
         `UPDATE telegram_channel_subscriptions
-         SET enabled = false, updated_at = NOW()
-         WHERE user_id = $1 AND (source = $2 OR id::text LIKE $3)
-         RETURNING source, title`,
+         SET enabled = false, disabled_reason = COALESCE(disabled_reason, '用户手动取消订阅'), disabled_at = COALESCE(disabled_at, NOW()), updated_at = NOW()
+         WHERE user_id = $1 AND (source = $2 OR source_original = $2 OR id::text LIKE $3)
+         RETURNING source, source_original, title`,
         [userId, normalizedSelector, `${trimmed}%`]
     );
     return result.rows[0] || null;
+}
+
+async function pauseTelegramSubscriptionForError(subscriptionId: string, reason: string) {
+    await query(
+        `UPDATE telegram_channel_subscriptions
+         SET enabled = false, disabled_reason = $2, disabled_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [subscriptionId, reason]
+    );
+}
+
+function isTelegramSourceInaccessibleError(error: unknown): boolean {
+    const anyErr = error as any;
+    const text = `${anyErr?.errorMessage || ''} ${anyErr?.message || ''}`;
+    return /INVITE_HASH_EXPIRED|INVITE_HASH_INVALID|CHANNEL_PRIVATE|USER_NOT_PARTICIPANT|CHAT_ADMIN_REQUIRED|Could not find the input entity|Cannot find any entity|not part of|forbidden|privacy/i.test(text);
+}
+
+function subscriptionDisabledReason(error: unknown): string {
+    const anyErr = error as any;
+    const text = `${anyErr?.errorMessage || ''} ${anyErr?.message || ''}`;
+    if (/INVITE_HASH_EXPIRED/i.test(text)) return '订阅已暂停：私密频道/群邀请链接已过期，无法继续解析或下载。请重新加入/更新链接后再订阅。';
+    if (/INVITE_HASH_INVALID/i.test(text)) return '订阅已暂停：私密频道/群邀请链接无效，无法继续解析或下载。请检查链接后重新订阅。';
+    if (/USER_NOT_PARTICIPANT|not part of/i.test(text)) return '订阅已暂停：当前 Telegram 用户账号已不在该私密频道/群内，无法继续下载。请先重新加入后再订阅。';
+    if (/CHANNEL_PRIVATE|forbidden|privacy/i.test(text)) return '订阅已暂停：当前 Telegram 用户账号无法访问该频道/群，可能已退出、被移除或频道变为私密。请检查账号权限后重新订阅。';
+    return `订阅已暂停：无法访问或下载该频道/群内容（${anyErr?.message || anyErr?.errorMessage || String(error)}）。请检查账号是否仍可访问后重新订阅。`;
 }
 
 
@@ -794,8 +883,10 @@ async function runSegmentedTelegramJob(botClient: TelegramClient, requestMessage
 }
 
 export async function enqueueTelegramDateDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, startDateText: string, endDateText: string, folderOverride?: string | null, options: TelegramCommentScanOptions = {}) {
-    const source = normalizeSource(sourceInput);
-    await assertTelegramSourceAllowed(source);
+    const userClient = requireUserClient();
+    const resolved = await resolveTelegramSource(userClient, sourceInput);
+    await assertTelegramSourceAllowed(resolved.source, [resolved.originalSource]);
+    const source = resolved.source;
     const startDate = parseDateOnly(startDateText);
     const endDate = parseDateOnly(endDateText, true);
     if (startDate > endDate) throw new Error('开始日期不能晚于结束日期');
@@ -838,8 +929,10 @@ async function getMessagesByHashtag(userClient: TelegramClient, source: string, 
 }
 
 export async function enqueueTelegramTagDownload(botClient: TelegramClient, requestMessage: Api.Message, userId: number, sourceInput: string, tagInput: string, folderOverride?: string | null, options: TelegramCommentScanOptions = {}) {
-    const source = normalizeSource(sourceInput);
-    await assertTelegramSourceAllowed(source);
+    const userClient = requireUserClient();
+    const resolved = await resolveTelegramSource(userClient, sourceInput);
+    await assertTelegramSourceAllowed(resolved.source, [resolved.originalSource]);
+    const source = resolved.source;
     const tag = normalizeHashtag(tagInput);
 
     const jobId = await createJob(userId, requestMessage.chatId?.toString(), 'tag_download', source, {
@@ -1002,7 +1095,7 @@ async function runSubscriptionScan(botClient: TelegramClient) {
     if (!userClient || !isTelegramUserClientReady()) return;
 
     const result = await query(
-        `SELECT id, user_id, chat_id, source, last_message_id, folder_override
+        `SELECT id, user_id, chat_id, source, source_original, source_type, last_message_id, folder_override
          FROM telegram_channel_subscriptions
          WHERE enabled = true
          ORDER BY updated_at ASC`
@@ -1010,7 +1103,7 @@ async function runSubscriptionScan(botClient: TelegramClient) {
 
     for (const row of result.rows) {
         try {
-            await assertTelegramSourceAllowed(row.source);
+            await assertTelegramSourceAllowed(row.source, row.source_original ? [row.source_original] : (row.source_type === 'private_invite' ? ['private_invite'] : []));
             const latestMessageId = await getLatestMessageId(userClient, row.source);
             const lastMessageId = Number(row.last_message_id || 0);
             if (!latestMessageId || latestMessageId <= lastMessageId) continue;
@@ -1044,6 +1137,14 @@ async function runSubscriptionScan(botClient: TelegramClient) {
             }
         } catch (error) {
             console.error('🤖 Telegram 订阅同步失败:', error);
+            if (isTelegramSourceInaccessibleError(error)) {
+                const reason = subscriptionDisabledReason(error);
+                await pauseTelegramSubscriptionForError(row.id, reason).catch(updateError => console.error('🤖 暂停不可访问的 Telegram 订阅失败:', updateError));
+                const targetChat = row.chat_id || row.user_id;
+                await botClient.sendMessage(targetChat, {
+                    message: `⚠️ 已暂停订阅 ${row.source_original || row.source}\n${reason}\n\n你可以在 /tg_subs 或 /tg_sub 订阅列表中查看提醒；确认账号可访问后重新添加订阅即可。`,
+                }).catch(() => undefined);
+            }
         }
     }
 }
