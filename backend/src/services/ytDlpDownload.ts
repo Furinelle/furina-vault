@@ -4,7 +4,9 @@ import path from 'path';
 import { spawn } from 'child_process';
 import os from 'os';
 import { query } from '../db/index.js';
-import { storageManager } from './storage.js';
+import { storageManager, isStorageQuotaCooldownError } from './storage.js';
+import { assertActiveStorageWritable, formatStorageCooldownNotice } from './storageCooldownGuard.js';
+import { markStorageAccountCooldown } from './storageCooldown.js';
 import { formatBytes, getFileType, getMimeTypeFromFilename, sanitizeFilename } from '../utils/telegramUtils.js';
 import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
@@ -136,6 +138,7 @@ async function runYtDlpDownload(url: string, taskDir: string): Promise<void> {
 async function uploadDownloadedFile(localFilePath: string, originalFileName: string): Promise<{ finalPath: string; providerName: string; size: number; storedName: string; folder: string }> {
     const provider = storageManager.getProvider();
     const activeAccountId = storageManager.getActiveAccountId();
+    await assertActiveStorageWritable();
 
     const safeName = sanitizeFilename(originalFileName);
     const ext = path.extname(safeName) || path.extname(localFilePath) || '';
@@ -226,11 +229,22 @@ export async function handleYtDlpCommand(message: Api.Message, url: string): Pro
             task.finishedAt = Date.now();
             task.error = (e instanceof Error) ? e.message : String(e);
 
-            const errText = (task.error || '未知错误').toString().trim();
-            const trimmed = errText.length > 1500 ? errText.slice(0, 1500) + '...' : errText;
+            let replyText: string;
+            if (isStorageQuotaCooldownError(e)) {
+                await markStorageAccountCooldown(e.storageAccountId || storageManager.getActiveAccountId(), e.provider, e.reason, e.cooldownUntil, e.message);
+                replyText = [
+                    formatStorageCooldownNotice(e.cooldownUntil),
+                    '',
+                    'yt-dlp 任务没有持久化恢复队列；请在恢复时间后重新发送该链接，或先切换其它存储源。',
+                ].join('\n');
+            } else {
+                const errText = (task.error || '未知错误').toString().trim();
+                const trimmed = errText.length > 1500 ? errText.slice(0, 1500) + '...' : errText;
+                replyText = `❌ 下载/上传失败\n\n原因: ${trimmed}`;
+            }
 
             try {
-                await message.reply({ message: `❌ 下载/上传失败\n\n原因: ${trimmed}` });
+                await message.reply({ message: replyText });
             } catch {
             }
         } finally {

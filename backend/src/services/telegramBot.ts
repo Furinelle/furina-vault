@@ -302,7 +302,15 @@ interface TelegramDownloadScanSummary {
 async function updateJobProgressMessage(statusMessage: Api.Message, summary: TelegramJobProgressSummary): Promise<void> {
     const totalDone = summary.completed + summary.failed + summary.skipped;
     const lines = [
-        summary.status === 'paused' ? `⏸️ **频道下载已暂停**` : summary.status === 'cancelled' ? `🛑 **频道下载已取消**` : totalDone >= summary.totalMediaFound && summary.scanStatus === 'done' ? `✅ **频道任务完成**` : `🔎 **频道任务运行中**`,
+        summary.status === 'paused'
+            ? `⏸️ **频道下载已暂停**`
+            : summary.status === 'cooling'
+                ? `⏸️ **Google Drive 限额冷却中**`
+                : summary.status === 'cancelled'
+                    ? `🛑 **频道下载已取消**`
+                    : totalDone >= summary.totalMediaFound && summary.scanStatus === 'done'
+                        ? `✅ **频道任务完成**`
+                        : `🔎 **频道任务运行中**`,
         `🆔 job: ${summary.jobId.slice(0, 8)}`,
         `📍 频道：${summary.source}`,
         ``,
@@ -312,7 +320,11 @@ async function updateJobProgressMessage(statusMessage: Api.Message, summary: Tel
         ``,
         `⬇️ 下载：${summary.downloadStatus}`,
         `✅ 成功 ${summary.completed}　⏳ 待下载 ${summary.pending}　🔄 下载中 ${summary.downloading}　❌ 失败 ${summary.failed}　⏭ 跳过 ${summary.skipped}`,
-        summary.cooldownUntil ? `⏳ FloodWait 冷却到：${summary.cooldownUntil}` : '',
+        summary.cooldownUntil
+            ? (summary.status === 'cooling'
+                ? `⏸️ Google Drive 限额冷却到：${summary.cooldownUntil}`
+                : `⏳ FloodWait 冷却到：${summary.cooldownUntil}`)
+            : '',
         ``,
         `控制：/task_pause ${summary.jobId.slice(0, 8)} · /task_resume ${summary.jobId.slice(0, 8)} · /task_cancel ${summary.jobId.slice(0, 8)}`,
     ].filter(Boolean);

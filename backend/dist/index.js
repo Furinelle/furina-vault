@@ -97,6 +97,18 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'public'`);
     await pool.query(`ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS disabled_reason TEXT`);
     await pool.query(`ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS storage_account_cooldowns (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            storage_account_id UUID REFERENCES storage_accounts(id) ON DELETE CASCADE,
+            provider VARCHAR(50) NOT NULL,
+            reason VARCHAR(100) NOT NULL,
+            cooldown_until TIMESTAMPTZ NOT NULL,
+            last_error TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(storage_account_id, provider, reason)
+        )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_storage_account_cooldowns_until ON storage_account_cooldowns(cooldown_until)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash) WHERE key_hash IS NOT NULL`);
     console.log("\u2705 \u6570\u636E\u5E93\u8868\u7ED3\u6784\u521D\u59CB\u5316\u5B8C\u6210");
   } catch (err) {
@@ -347,6 +359,72 @@ var init_localPath = __esm({
   }
 });
 
+// src/services/storageCooldown.ts
+async function ensureStorageCooldownSchema() {
+  await query(`
+        CREATE TABLE IF NOT EXISTS storage_account_cooldowns (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            storage_account_id UUID REFERENCES storage_accounts(id) ON DELETE CASCADE,
+            provider VARCHAR(50) NOT NULL,
+            reason VARCHAR(100) NOT NULL,
+            cooldown_until TIMESTAMPTZ NOT NULL,
+            last_error TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(storage_account_id, provider, reason)
+        )
+    `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_storage_account_cooldowns_until ON storage_account_cooldowns(cooldown_until)`);
+}
+async function markStorageAccountCooldown(storageAccountId, provider, reason, cooldownUntil, error) {
+  if (!storageAccountId) return;
+  await ensureStorageCooldownSchema();
+  await query(
+    `INSERT INTO storage_account_cooldowns (storage_account_id, provider, reason, cooldown_until, last_error, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (storage_account_id, provider, reason)
+         DO UPDATE SET cooldown_until = EXCLUDED.cooldown_until, last_error = EXCLUDED.last_error, updated_at = NOW()`,
+    [storageAccountId, provider, reason, cooldownUntil, error || null]
+  );
+}
+async function getStorageAccountCooldown(storageAccountId, provider, reason = STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT) {
+  if (!storageAccountId) return null;
+  await ensureStorageCooldownSchema();
+  const result = await query(
+    `SELECT storage_account_id, provider, reason, cooldown_until, last_error
+         FROM storage_account_cooldowns
+         WHERE storage_account_id = $1
+           AND provider = $2
+           AND reason = $3
+           AND cooldown_until > NOW()
+         LIMIT 1`,
+    [storageAccountId, provider, reason]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    storageAccountId: row.storage_account_id,
+    provider: row.provider,
+    reason: row.reason,
+    cooldownUntil: new Date(row.cooldown_until),
+    lastError: row.last_error
+  };
+}
+async function clearExpiredStorageCooldowns() {
+  await ensureStorageCooldownSchema();
+  const result = await query(`DELETE FROM storage_account_cooldowns WHERE cooldown_until <= NOW()`);
+  return result.rowCount || 0;
+}
+var STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT, DEFAULT_STORAGE_COOLDOWN_MS;
+var init_storageCooldown = __esm({
+  "src/services/storageCooldown.ts"() {
+    "use strict";
+    init_db();
+    STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT = "daily_upload_limit";
+    DEFAULT_STORAGE_COOLDOWN_MS = 24 * 60 * 60 * 1e3;
+  }
+});
+
 // src/services/storage.ts
 var storage_exports = {};
 __export(storage_exports, {
@@ -356,7 +434,9 @@ __export(storage_exports, {
   OneDriveStorageProvider: () => OneDriveStorageProvider,
   S3StorageProvider: () => S3StorageProvider,
   StorageManager: () => StorageManager,
+  StorageQuotaCooldownError: () => StorageQuotaCooldownError,
   WebDAVStorageProvider: () => WebDAVStorageProvider,
+  isStorageQuotaCooldownError: () => isStorageQuotaCooldownError,
   storageManager: () => storageManager
 });
 import fs4 from "fs";
@@ -367,13 +447,48 @@ import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, Head
 import { getSignedUrl as getS3SignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient } from "webdav";
 import { google } from "googleapis";
-var LocalStorageProvider, AliyunOSSStorageProvider, S3StorageProvider, WebDAVStorageProvider, OneDriveStorageProvider, GoogleDriveStorageProvider, StorageManager, storageManager;
+function isStorageQuotaCooldownError(error) {
+  return error instanceof StorageQuotaCooldownError || error?.name === "StorageQuotaCooldownError";
+}
+function googleDriveErrorText(error) {
+  const pieces = [
+    error?.message,
+    error?.errorMessage,
+    error?.response?.data ? JSON.stringify(error.response.data) : void 0,
+    error?.errors ? JSON.stringify(error.errors) : void 0
+  ].filter(Boolean);
+  return pieces.join(" ");
+}
+function isGoogleDriveDailyUploadLimitError(error) {
+  const status = Number(error?.code || error?.response?.status || error?.status || 0);
+  const text = googleDriveErrorText(error);
+  if (status !== 403) return false;
+  return /Drive upload limit|exceeded their Drive upload limit|exceeded.*upload limit|upload limit exceeded|upload limit/i.test(text);
+}
+var StorageQuotaCooldownError, LocalStorageProvider, AliyunOSSStorageProvider, S3StorageProvider, WebDAVStorageProvider, OneDriveStorageProvider, GoogleDriveStorageProvider, StorageManager, storageManager;
 var init_storage = __esm({
   "src/services/storage.ts"() {
     "use strict";
     init_db();
     init_localPath();
     init_credentialCrypto();
+    init_storageCooldown();
+    StorageQuotaCooldownError = class extends Error {
+      provider;
+      reason;
+      storageAccountId;
+      cooldownUntil;
+      originalError;
+      constructor(message, options) {
+        super(message);
+        this.name = "StorageQuotaCooldownError";
+        this.provider = options.provider;
+        this.reason = options.reason;
+        this.storageAccountId = options.storageAccountId;
+        this.cooldownUntil = options.cooldownUntil || new Date(Date.now() + DEFAULT_STORAGE_COOLDOWN_MS);
+        this.originalError = options.originalError;
+      }
+    };
     LocalStorageProvider = class {
       name = "local";
       uploadDir;
@@ -1222,6 +1337,14 @@ var init_storage = __esm({
           return file.data.id;
         } catch (error) {
           console.error("[GoogleDrive] Upload failed:", error.message);
+          if (isGoogleDriveDailyUploadLimitError(error)) {
+            throw new StorageQuotaCooldownError("Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u4EFB\u52A1\u5C06\u81EA\u52A8\u6682\u505C 24 \u5C0F\u65F6\u540E\u7EE7\u7EED\u3002", {
+              provider: "google_drive",
+              reason: STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT,
+              storageAccountId: this.id,
+              originalError: error
+            });
+          }
           throw new Error(`Google Drive upload failed: ${error.message}`);
         }
       }
@@ -2850,6 +2973,58 @@ async function getImageDimensions(filePath, mimeType) {
 // src/services/telegramUpload.ts
 init_storage();
 
+// src/services/storageCooldownGuard.ts
+init_storage();
+init_storageCooldown();
+function formatStorageCooldownNotice(cooldownUntil) {
+  return [
+    "\u23F8\uFE0F Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650",
+    "",
+    "\u5F53\u524D\u4EFB\u52A1\u5DF2\u81EA\u52A8\u6682\u505C\uFF0C\u9884\u8BA1 24 \u5C0F\u65F6\u540E\u7EE7\u7EED\u3002",
+    "\u5269\u4F59\u6587\u4EF6\u4E0D\u4F1A\u4E22\u5931\uFF0C\u6062\u590D\u540E\u4F1A\u4ECE\u672A\u5B8C\u6210\u90E8\u5206\u7EE7\u7EED\u5904\u7406\u3002",
+    "",
+    `\u6062\u590D\u65F6\u95F4\uFF1A${cooldownUntil.toISOString()}`
+  ].join("\n");
+}
+function buildStorageCooldownHttpError(error) {
+  return {
+    status: 429,
+    body: {
+      error: error.message || "Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002",
+      code: "storage_account_cooling",
+      provider: error.provider,
+      reason: error.reason,
+      retryAt: error.cooldownUntil.toISOString()
+    }
+  };
+}
+function sendStorageCooldownHttpError(res, error) {
+  const payload = buildStorageCooldownHttpError(error);
+  res.status(payload.status).json(payload.body);
+}
+async function getActiveStorageCooldown() {
+  const provider = storageManager.getProvider();
+  const activeAccountId = storageManager.getActiveAccountId();
+  if (provider.name !== "google_drive" || !activeAccountId) return null;
+  return getStorageAccountCooldown(activeAccountId, provider.name, STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT);
+}
+async function assertActiveStorageWritable() {
+  const cooldown = await getActiveStorageCooldown();
+  if (!cooldown) return;
+  throw new StorageQuotaCooldownError("Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8BF7\u7B49\u5F85\u81EA\u52A8\u6062\u590D\u540E\u518D\u4E0A\u4F20\uFF0C\u6216\u4E34\u65F6\u5207\u6362\u5176\u5B83\u5B58\u50A8\u6E90\u3002", {
+    provider: cooldown.provider,
+    reason: cooldown.reason,
+    storageAccountId: cooldown.storageAccountId,
+    cooldownUntil: cooldown.cooldownUntil
+  });
+}
+function isStorageCooldownError(error) {
+  return isStorageQuotaCooldownError(error);
+}
+
+// src/services/telegramUpload.ts
+init_storageCooldown();
+
 // src/services/telegramUserClient.ts
 import fs6 from "fs";
 import path7 from "path";
@@ -4430,6 +4605,7 @@ async function processFileUpload(client2, file, queue) {
     let storedName;
     try {
       const activeAccountId = storageManager.getActiveAccountId();
+      await assertActiveStorageWritable();
       const chatName = await getTelegramChatName(file.message);
       const batchFolder = null;
       const storageRules = await getStoragePathRules();
@@ -4511,7 +4687,13 @@ async function processFileUpload(client2, file, queue) {
       });
     } catch (error) {
       console.error("\u{1F916} \u6587\u4EF6\u4E0A\u4F20\u5931\u8D25:", error);
-      file.error = error.message;
+      if (isStorageQuotaCooldownError(error)) {
+        await markStorageAccountCooldown(error.storageAccountId || storageManager.getActiveAccountId(), error.provider, error.reason, error.cooldownUntil, error.message);
+        file.storageCooldownUntil = error.cooldownUntil;
+        file.error = formatStorageCooldownNotice(error.cooldownUntil);
+      } else {
+        file.error = error.message;
+      }
       if (localFilePath && fs7.existsSync(localFilePath)) {
         try {
           fs7.unlinkSync(localFilePath);
@@ -4526,7 +4708,7 @@ async function processFileUpload(client2, file, queue) {
   const queueTask = async (signal) => {
     file.status = "uploading";
     const firstAttemptSuccess = await attemptUpload(signal);
-    if (!firstAttemptSuccess && !signal.aborted && !file.retried) {
+    if (!firstAttemptSuccess && !signal.aborted && !file.retried && !file.storageCooldownUntil) {
       file.retried = true;
       file.status = "uploading";
       file.error = void 0;
@@ -4902,6 +5084,13 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
           successful += 1;
           successfulMessageIds.push(item.id);
           await onItemSettled?.(item, "success");
+        } else if (uploadItem.storageCooldownUntil) {
+          throw new StorageQuotaCooldownError(uploadItem.error || "Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u4EFB\u52A1\u5C06\u81EA\u52A8\u6682\u505C 24 \u5C0F\u65F6\u540E\u7EE7\u7EED\u3002", {
+            provider: "google_drive",
+            reason: "daily_upload_limit",
+            storageAccountId: storageManager.getActiveAccountId() || void 0,
+            cooldownUntil: uploadItem.storageCooldownUntil
+          });
         } else {
           failed += 1;
           failedMessageIds.push(item.id);
@@ -5299,8 +5488,10 @@ init_storage();
 
 // src/services/telegramChannelJobs.ts
 init_db();
+init_storage();
 import { Api as Api5 } from "telegram";
 import { getPeerId } from "telegram/Utils.js";
+init_storageCooldown();
 var SUBSCRIPTION_INTERVAL_MS = Math.max(6e4, parseInt(process.env.TELEGRAM_SUBSCRIPTION_INTERVAL_MS || "300000", 10) || 3e5);
 var SUBSCRIPTION_SCAN_LIMIT = Math.max(1, parseInt(process.env.TELEGRAM_SUBSCRIPTION_SCAN_LIMIT || "100", 10) || 100);
 var TG_JOB_RECOVERY_DELAY_MS = Math.max(1e3, parseInt(process.env.TG_JOB_RECOVERY_DELAY_MS || "10000", 10) || 1e4);
@@ -5802,12 +5993,62 @@ function isFloodWait(error) {
   if (seconds > 0 || /FLOOD|Too many requests/i.test(text)) return { seconds: Math.max(30, seconds || 60) };
   return null;
 }
+async function putJobIntoStorageCooldown(jobId, cooldownUntil, reasonText) {
+  await updateJob(jobId, {
+    status: "cooling",
+    download_status: "cooling",
+    cooldown_until: cooldownUntil,
+    error: reasonText
+  });
+  await query(
+    `UPDATE telegram_download_items
+         SET status = 'pending', locked_at = NULL, last_error = $2, updated_at = NOW()
+         WHERE job_id = $1
+           AND status = 'downloading'`,
+    [jobId, reasonText]
+  );
+}
+async function applyStorageCooldownIfNeeded(jobId) {
+  const provider = storageManager.getProvider();
+  const activeAccountId = storageManager.getActiveAccountId();
+  if (provider.name !== "google_drive" || !activeAccountId) return null;
+  const cooldown = await getStorageAccountCooldown(activeAccountId, provider.name, STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT);
+  if (!cooldown) return null;
+  await putJobIntoStorageCooldown(jobId, cooldown.cooldownUntil, `Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u81EA\u52A8\u6682\u505C\u5230 ${cooldown.cooldownUntil.toISOString()}`);
+  return cooldown;
+}
+async function notifyStorageCooldownOnce(botClient, job, cooldownUntil) {
+  const params = job.params || {};
+  if (params.storageQuotaNoticeSentAt) return;
+  const nextParams = { ...params, storageQuotaNoticeSentAt: (/* @__PURE__ */ new Date()).toISOString(), storageQuotaCooldownUntil: cooldownUntil.toISOString() };
+  await updateJob(job.id, { params: JSON.stringify(nextParams) });
+  const targetChat = job.chat_id || job.user_id;
+  await botClient.sendMessage(targetChat, {
+    message: [
+      formatStorageCooldownNotice(cooldownUntil),
+      "",
+      `\u4EFB\u52A1\uFF1A${String(job.id).slice(0, 8)}`
+    ].join("\n")
+  }).catch(() => void 0);
+}
+async function handleStorageQuotaCooldownError(botClient, jobId, error) {
+  if (!isStorageQuotaCooldownError(error)) return false;
+  const cooldownUntil = error.cooldownUntil;
+  await markStorageAccountCooldown(error.storageAccountId || storageManager.getActiveAccountId(), error.provider, error.reason, cooldownUntil, error.message);
+  await putJobIntoStorageCooldown(jobId, cooldownUntil, error.message);
+  const job = await getJob(jobId);
+  if (job) await notifyStorageCooldownOnce(botClient, job, cooldownUntil);
+  return true;
+}
 async function ensureJobCanRun(jobId) {
   const job = await getJob(jobId);
   if (!job) return "cancelled";
   if (job.cancelled_at || job.status === "cancelled") return "cancelled";
   if (job.paused_at || job.status === "paused") return "paused";
   if (job.cooldown_until && new Date(job.cooldown_until).getTime() > Date.now()) return "cooldown";
+  if (job.status === "cooling" && (!job.cooldown_until || new Date(job.cooldown_until).getTime() <= Date.now())) return "run";
+  const storageCooldown = await applyStorageCooldownIfNeeded(jobId);
+  if (storageCooldown) return "cooldown";
   return "run";
 }
 async function waitUntilRunnable(jobId, options) {
@@ -5861,6 +6102,9 @@ async function downloadClaimedRefs(botClient, requestMessage, jobId, source, ref
       await updateJob(jobId, { status: "running", cooldown_until: cooldownUntil, error: `Telegram FloodWait\uFF0C\u51B7\u5374\u5230 ${cooldownUntil.toISOString()}` });
       for (const ref of refs) await markDownloadRefStatus(jobId, ref, "failed", `FloodWait ${flood.seconds}s`);
       return { found: 0, skipped: 0, failed: refs.length, successful: 0 };
+    }
+    if (await handleStorageQuotaCooldownError(botClient, jobId, error)) {
+      return { found: 0, skipped: 0, failed: 0, successful: 0 };
     }
     for (const ref of refs) await markDownloadRefStatus(jobId, ref, "failed", error instanceof Error ? error.message : String(error));
     throw error;
@@ -6078,7 +6322,7 @@ async function listTelegramActiveTaskQueues(userId, limit = 10) {
                    )
                )
                OR (
-                   j.status = 'paused'
+                   j.status IN ('paused', 'cooling')
                    AND (COALESCE(s.pending_count, 0) > 0 OR COALESCE(s.downloading_count, 0) > 0 OR j.scan_status = 'scanning')
                )
            )
@@ -6187,6 +6431,11 @@ async function runSubscriptionScan(botClient) {
       const subscriptionRefs = candidateMessages.map((message) => toChannelDownloadRef(row.source, message)).filter((ref) => Boolean(ref));
       await markDownloadRefsDownloading(jobId, subscriptionRefs);
       const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, "newer", ids, row.folder_override || null, subscriptionRefs, (ref, status, error) => markDownloadRefStatus(jobId, ref, status, error));
+      const cooledJob = await getJob(jobId);
+      if (cooledJob?.status === "cooling") {
+        await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
+        continue;
+      }
       await updateJob(jobId, {
         status: downloadResult.failed > 0 ? "completed_with_errors" : "completed",
         enqueued_count: downloadResult.found,
@@ -6261,6 +6510,11 @@ async function recoverTelegramJob(botClient, job) {
       refs,
       (ref, status, error) => markDownloadRefStatus(job.id, ref, status, error)
     );
+    const cooledJob = await getJob(job.id);
+    if (cooledJob?.status === "cooling") {
+      await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
+      return;
+    }
     await updateJob(job.id, {
       status: result.failed > 0 ? "completed_with_errors" : "completed",
       enqueued_count: result.found,
@@ -6280,6 +6534,16 @@ async function recoverInterruptedTelegramJobs(botClient) {
   if (recoveryRunning) return;
   recoveryRunning = true;
   try {
+    await clearExpiredStorageCooldowns();
+    await query(
+      `UPDATE telegram_background_jobs
+             SET status = 'running', download_status = 'active', cooldown_until = NULL, error = NULL, updated_at = NOW()
+             WHERE status = 'cooling'
+               AND cooldown_until IS NOT NULL
+               AND cooldown_until <= NOW()
+               AND cancelled_at IS NULL
+               AND finished_at IS NULL`
+    );
     await query(
       `UPDATE telegram_download_items
              SET status = 'pending', locked_at = NULL, updated_at = NOW()
@@ -6293,7 +6557,7 @@ async function recoverInterruptedTelegramJobs(botClient) {
              WHERE j.kind IN ('date_range', 'tag_download')
                AND j.finished_at IS NULL
                AND j.cancelled_at IS NULL
-               AND j.status IN ('pending', 'running', 'failed', 'completed_with_errors')
+               AND j.status IN ('pending', 'running', 'failed', 'completed_with_errors', 'cooling')
                AND i.status = 'pending'
              ORDER BY j.created_at ASC
              LIMIT 5`
@@ -7710,6 +7974,7 @@ import fs10 from "fs";
 import path14 from "path";
 import { spawn } from "child_process";
 import os2 from "os";
+init_storageCooldown();
 var YtDlpQueue = class {
   constructor(maxConcurrent) {
     this.maxConcurrent = maxConcurrent;
@@ -7803,6 +8068,7 @@ async function runYtDlpDownload(url, taskDir) {
 async function uploadDownloadedFile(localFilePath, originalFileName) {
   const provider = storageManager.getProvider();
   const activeAccountId = storageManager.getActiveAccountId();
+  await assertActiveStorageWritable();
   const safeName = sanitizeFilename(originalFileName);
   const ext = path14.extname(safeName) || path14.extname(localFilePath) || "";
   const mimeType = getMimeTypeFromFilename(safeName);
@@ -7876,12 +8142,23 @@ Task: ${task.id}` });
       task.status = "failed";
       task.finishedAt = Date.now();
       task.error = e instanceof Error ? e.message : String(e);
-      const errText = (task.error || "\u672A\u77E5\u9519\u8BEF").toString().trim();
-      const trimmed = errText.length > 1500 ? errText.slice(0, 1500) + "..." : errText;
-      try {
-        await message.reply({ message: `\u274C \u4E0B\u8F7D/\u4E0A\u4F20\u5931\u8D25
+      let replyText;
+      if (isStorageQuotaCooldownError(e)) {
+        await markStorageAccountCooldown(e.storageAccountId || storageManager.getActiveAccountId(), e.provider, e.reason, e.cooldownUntil, e.message);
+        replyText = [
+          formatStorageCooldownNotice(e.cooldownUntil),
+          "",
+          "yt-dlp \u4EFB\u52A1\u6CA1\u6709\u6301\u4E45\u5316\u6062\u590D\u961F\u5217\uFF1B\u8BF7\u5728\u6062\u590D\u65F6\u95F4\u540E\u91CD\u65B0\u53D1\u9001\u8BE5\u94FE\u63A5\uFF0C\u6216\u5148\u5207\u6362\u5176\u5B83\u5B58\u50A8\u6E90\u3002"
+        ].join("\n");
+      } else {
+        const errText = (task.error || "\u672A\u77E5\u9519\u8BEF").toString().trim();
+        const trimmed = errText.length > 1500 ? errText.slice(0, 1500) + "..." : errText;
+        replyText = `\u274C \u4E0B\u8F7D/\u4E0A\u4F20\u5931\u8D25
 
-\u539F\u56E0: ${trimmed}` });
+\u539F\u56E0: ${trimmed}`;
+      }
+      try {
+        await message.reply({ message: replyText });
       } catch {
       }
     } finally {
@@ -8148,7 +8425,7 @@ function isDateOnly(text) {
 async function updateJobProgressMessage(statusMessage, summary) {
   const totalDone = summary.completed + summary.failed + summary.skipped;
   const lines = [
-    summary.status === "paused" ? `\u23F8\uFE0F **\u9891\u9053\u4E0B\u8F7D\u5DF2\u6682\u505C**` : summary.status === "cancelled" ? `\u{1F6D1} **\u9891\u9053\u4E0B\u8F7D\u5DF2\u53D6\u6D88**` : totalDone >= summary.totalMediaFound && summary.scanStatus === "done" ? `\u2705 **\u9891\u9053\u4EFB\u52A1\u5B8C\u6210**` : `\u{1F50E} **\u9891\u9053\u4EFB\u52A1\u8FD0\u884C\u4E2D**`,
+    summary.status === "paused" ? `\u23F8\uFE0F **\u9891\u9053\u4E0B\u8F7D\u5DF2\u6682\u505C**` : summary.status === "cooling" ? `\u23F8\uFE0F **Google Drive \u9650\u989D\u51B7\u5374\u4E2D**` : summary.status === "cancelled" ? `\u{1F6D1} **\u9891\u9053\u4E0B\u8F7D\u5DF2\u53D6\u6D88**` : totalDone >= summary.totalMediaFound && summary.scanStatus === "done" ? `\u2705 **\u9891\u9053\u4EFB\u52A1\u5B8C\u6210**` : `\u{1F50E} **\u9891\u9053\u4EFB\u52A1\u8FD0\u884C\u4E2D**`,
     `\u{1F194} job: ${summary.jobId.slice(0, 8)}`,
     `\u{1F4CD} \u9891\u9053\uFF1A${summary.source}`,
     ``,
@@ -8158,7 +8435,7 @@ async function updateJobProgressMessage(statusMessage, summary) {
     ``,
     `\u2B07\uFE0F \u4E0B\u8F7D\uFF1A${summary.downloadStatus}`,
     `\u2705 \u6210\u529F ${summary.completed}\u3000\u23F3 \u5F85\u4E0B\u8F7D ${summary.pending}\u3000\u{1F504} \u4E0B\u8F7D\u4E2D ${summary.downloading}\u3000\u274C \u5931\u8D25 ${summary.failed}\u3000\u23ED \u8DF3\u8FC7 ${summary.skipped}`,
-    summary.cooldownUntil ? `\u23F3 FloodWait \u51B7\u5374\u5230\uFF1A${summary.cooldownUntil}` : "",
+    summary.cooldownUntil ? summary.status === "cooling" ? `\u23F8\uFE0F Google Drive \u9650\u989D\u51B7\u5374\u5230\uFF1A${summary.cooldownUntil}` : `\u23F3 FloodWait \u51B7\u5374\u5230\uFF1A${summary.cooldownUntil}` : "",
     ``,
     `\u63A7\u5236\uFF1A/task_pause ${summary.jobId.slice(0, 8)} \xB7 /task_resume ${summary.jobId.slice(0, 8)} \xB7 /task_cancel ${summary.jobId.slice(0, 8)}`
   ].filter(Boolean);
@@ -10682,6 +10959,7 @@ var handleUpload = async (req, res, source = "web") => {
   console.log(`[Upload] \u{1F3E0} Local temp path: ${tempPath}`);
   try {
     const provider = storageManager.getProvider();
+    await assertActiveStorageWritable();
     console.log(`[Upload] \u{1F6E0}\uFE0F  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || "none (local)"}`);
     let thumbnailPath = null;
     let previewPath = null;
@@ -10784,6 +11062,9 @@ var handleUpload = async (req, res, source = "web") => {
   } catch (error) {
     console.error("\u4E0A\u4F20\u5904\u7406\u5931\u8D25:", error);
     if (fs13.existsSync(tempPath)) fs13.unlinkSync(tempPath);
+    if (isStorageCooldownError(error)) {
+      return sendStorageCooldownHttpError(res, error);
+    }
     res.status(500).json({ error: "\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25" });
   }
 };
@@ -11511,6 +11792,7 @@ router6.post("/complete", async (req, res) => {
     let width = null;
     let height = null;
     const provider = storageManager.getProvider();
+    await assertActiveStorageWritable();
     if (provider.name === "local" && (session.mimeType.startsWith("image/") || session.mimeType.startsWith("video/"))) {
       try {
         console.log(`[ChunkedComplete] \u{1F5BC}\uFE0F  MIME: ${session.mimeType}, starting generation...`);
@@ -11585,6 +11867,9 @@ router6.post("/complete", async (req, res) => {
     });
   } catch (error) {
     console.error("\u5B8C\u6210\u4E0A\u4F20\u5931\u8D25:", error);
+    if (isStorageCooldownError(error)) {
+      return sendStorageCooldownHttpError(res, error);
+    }
     res.status(500).json({ error: "\u5B8C\u6210\u4E0A\u4F20\u5931\u8D25" });
   }
 });

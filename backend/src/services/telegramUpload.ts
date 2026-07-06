@@ -6,7 +6,9 @@ import crypto from 'crypto';
 import bigInt from 'big-integer';
 import { query } from '../db/index.js';
 import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
-import { storageManager } from '../services/storage.js';
+import { storageManager, isStorageQuotaCooldownError, StorageQuotaCooldownError } from '../services/storage.js';
+import { assertActiveStorageWritable, formatStorageCooldownNotice } from './storageCooldownGuard.js';
+import { markStorageAccountCooldown } from './storageCooldown.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
 import { getSetting } from '../utils/settings.js';
 import { isAuthenticatedAsync } from './telegramState.js';
@@ -1241,6 +1243,7 @@ interface FileUploadItem {
     size?: number;
     fileType?: string;
     error?: string;
+    storageCooldownUntil?: Date;
     retried?: boolean;           // 是否已重试过
     targetDir?: string;          // 批量上传时文件的目标目录
     folderOverride?: string | null; // 任务级保存目录覆盖，不影响全局路径规则
@@ -1415,6 +1418,7 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
 
         try {
             const activeAccountId = storageManager.getActiveAccountId();
+            await assertActiveStorageWritable();
             const chatName = await getTelegramChatName(file.message);
             const batchFolder = null;
             const storageRules = await getStoragePathRules();
@@ -1510,7 +1514,13 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
 
         } catch (error) {
             console.error('🤖 文件上传失败:', error);
-            file.error = (error as Error).message;
+            if (isStorageQuotaCooldownError(error)) {
+                await markStorageAccountCooldown(error.storageAccountId || storageManager.getActiveAccountId(), error.provider, error.reason, error.cooldownUntil, error.message);
+                file.storageCooldownUntil = error.cooldownUntil;
+                file.error = formatStorageCooldownNotice(error.cooldownUntil);
+            } else {
+                file.error = (error as Error).message;
+            }
             // 立即清理本地临时文件
             if (localFilePath && fs.existsSync(localFilePath)) {
                 try {
@@ -1531,7 +1541,7 @@ async function processFileUpload(client: TelegramClient, file: FileUploadItem, q
 
         const firstAttemptSuccess = await attemptUpload(signal);
 
-        if (!firstAttemptSuccess && !signal.aborted && !file.retried) {
+        if (!firstAttemptSuccess && !signal.aborted && !file.retried && !file.storageCooldownUntil) {
             file.retried = true;
             file.status = 'uploading'; // 保持 uploading 状态供外部显示
             file.error = undefined;
@@ -2037,6 +2047,13 @@ export async function downloadTelegramChannelRange(
                     successful += 1;
                     successfulMessageIds.push(item.id);
                     await onItemSettled?.(item, 'success');
+                } else if (uploadItem.storageCooldownUntil) {
+                    throw new StorageQuotaCooldownError(uploadItem.error || 'Google Drive 今日上传额度已达上限，任务将自动暂停 24 小时后继续。', {
+                        provider: 'google_drive',
+                        reason: 'daily_upload_limit',
+                        storageAccountId: storageManager.getActiveAccountId() || undefined,
+                        cooldownUntil: uploadItem.storageCooldownUntil,
+                    });
                 } else {
                     failed += 1;
                     failedMessageIds.push(item.id);

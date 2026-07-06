@@ -107,6 +107,18 @@ async function initializeDatabase() {
         await pool.query(`ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'public'`);
         await pool.query(`ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS disabled_reason TEXT`);
         await pool.query(`ALTER TABLE telegram_channel_subscriptions ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS storage_account_cooldowns (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            storage_account_id UUID REFERENCES storage_accounts(id) ON DELETE CASCADE,
+            provider VARCHAR(50) NOT NULL,
+            reason VARCHAR(100) NOT NULL,
+            cooldown_until TIMESTAMPTZ NOT NULL,
+            last_error TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(storage_account_id, provider, reason)
+        )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_storage_account_cooldowns_until ON storage_account_cooldowns(cooldown_until)`);
         await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash) WHERE key_hash IS NOT NULL`);
 
         console.log('✅ 数据库表结构初始化完成');

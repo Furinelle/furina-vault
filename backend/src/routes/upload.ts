@@ -8,6 +8,7 @@ import { query } from '../db/index.js';
 import { validateApiKey } from '../middleware/apiKey.js';
 import { generateThumbnail, getImageDimensions, generateMediaPreview } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
+import { assertActiveStorageWritable, isStorageCooldownError, sendStorageCooldownHttpError } from '../services/storageCooldownGuard.js';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
 import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/storagePath.js';
@@ -97,6 +98,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     try {
         // 1. 获取当前存储提供商
         const provider = storageManager.getProvider();
+        await assertActiveStorageWritable();
         console.log(`[Upload] 🛠️  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || 'none (local)'}`);
 
         // 2. 在保存到永久存储前生成缩略图和获取尺寸
@@ -219,6 +221,9 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     } catch (error) {
         console.error('上传处理失败:', error);
         if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        if (isStorageCooldownError(error)) {
+            return sendStorageCooldownHttpError(res, error);
+        }
         res.status(500).json({ error: '文件上传失败' });
     }
 };

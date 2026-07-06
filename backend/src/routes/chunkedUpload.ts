@@ -6,6 +6,7 @@ import { pipeline } from 'stream/promises';
 import { query } from '../db/index.js';
 import { generateThumbnail, getImageDimensions, generateMediaPreview } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
+import { assertActiveStorageWritable, isStorageCooldownError, sendStorageCooldownHttpError } from '../services/storageCooldownGuard.js';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
 import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/storagePath.js';
@@ -321,6 +322,7 @@ router.post('/complete', async (req: Request, res: Response) => {
         let width = null;
         let height = null;
         const provider = storageManager.getProvider();
+        await assertActiveStorageWritable();
 
         if (provider.name === 'local' && (session.mimeType.startsWith('image/') || session.mimeType.startsWith('video/'))) {
             try {
@@ -412,6 +414,9 @@ router.post('/complete', async (req: Request, res: Response) => {
         });
     } catch (error) {
         console.error('完成上传失败:', error);
+        if (isStorageCooldownError(error)) {
+            return sendStorageCooldownHttpError(res, error);
+        }
         res.status(500).json({ error: '完成上传失败' });
     }
 });

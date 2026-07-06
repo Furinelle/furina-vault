@@ -28,6 +28,26 @@ CREATE OR REPLACE TRIGGER storage_accounts_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
 
+-- 存储账户冷却表（如 Google Drive 每日上传限额触发后暂停 24 小时）
+CREATE TABLE IF NOT EXISTS storage_account_cooldowns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    storage_account_id UUID REFERENCES storage_accounts(id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL,
+    reason VARCHAR(100) NOT NULL,
+    cooldown_until TIMESTAMPTZ NOT NULL,
+    last_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(storage_account_id, provider, reason)
+);
+
+CREATE INDEX IF NOT EXISTS idx_storage_account_cooldowns_until ON storage_account_cooldowns(cooldown_until);
+
+CREATE OR REPLACE TRIGGER storage_account_cooldowns_updated_at
+    BEFORE UPDATE ON storage_account_cooldowns
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
 -- 文件表
 CREATE TABLE IF NOT EXISTS files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
