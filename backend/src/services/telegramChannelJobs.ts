@@ -1,7 +1,15 @@
 import { Api, TelegramClient } from 'telegram';
 import { getPeerId } from 'telegram/Utils.js';
 import { query } from '../db/index.js';
-import { storageManager } from './storage.js';
+import { storageManager, isStorageQuotaCooldownError } from './storage.js';
+import { formatStorageCooldownNotice } from './storageCooldownGuard.js';
+import {
+    clearExpiredStorageCooldowns,
+    getStorageAccountCooldown,
+    markStorageAccountCooldown,
+    STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT,
+    type StorageAccountCooldown,
+} from './storageCooldown.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
 import { downloadTelegramChannelRange, getTelegramDownloadPreview, type TelegramDownloadMessageRef } from './telegramUpload.js';
 import { getSetting } from '../utils/settings.js';
@@ -685,12 +693,68 @@ function isFloodWait(error: unknown): { seconds: number } | null {
     return null;
 }
 
-async function ensureJobCanRun(jobId: string): Promise<'run' | 'paused' | 'cancelled' | 'cooldown'> {
+type TelegramJobControlState = 'run' | 'paused' | 'cancelled' | 'cooldown';
+
+async function putJobIntoStorageCooldown(jobId: string, cooldownUntil: Date, reasonText: string): Promise<void> {
+    await updateJob(jobId, {
+        status: 'cooling',
+        download_status: 'cooling',
+        cooldown_until: cooldownUntil,
+        error: reasonText,
+    });
+    await query(
+        `UPDATE telegram_download_items
+         SET status = 'pending', locked_at = NULL, last_error = $2, updated_at = NOW()
+         WHERE job_id = $1
+           AND status = 'downloading'`,
+        [jobId, reasonText],
+    );
+}
+
+async function applyStorageCooldownIfNeeded(jobId: string): Promise<StorageAccountCooldown | null> {
+    const provider = storageManager.getProvider();
+    const activeAccountId = storageManager.getActiveAccountId();
+    if (provider.name !== 'google_drive' || !activeAccountId) return null;
+    const cooldown = await getStorageAccountCooldown(activeAccountId, provider.name, STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT);
+    if (!cooldown) return null;
+    await putJobIntoStorageCooldown(jobId, cooldown.cooldownUntil, `Google Drive 今日上传额度已达上限，自动暂停到 ${cooldown.cooldownUntil.toISOString()}`);
+    return cooldown;
+}
+
+async function notifyStorageCooldownOnce(botClient: TelegramClient, job: any, cooldownUntil: Date): Promise<void> {
+    const params = job.params || {};
+    if (params.storageQuotaNoticeSentAt) return;
+    const nextParams = { ...params, storageQuotaNoticeSentAt: new Date().toISOString(), storageQuotaCooldownUntil: cooldownUntil.toISOString() };
+    await updateJob(job.id, { params: JSON.stringify(nextParams) });
+    const targetChat = job.chat_id || job.user_id;
+    await botClient.sendMessage(targetChat, {
+        message: [
+            formatStorageCooldownNotice(cooldownUntil),
+            '',
+            `任务：${String(job.id).slice(0, 8)}`,
+        ].join('\n'),
+    }).catch(() => undefined);
+}
+
+async function handleStorageQuotaCooldownError(botClient: TelegramClient, jobId: string, error: unknown): Promise<boolean> {
+    if (!isStorageQuotaCooldownError(error)) return false;
+    const cooldownUntil = error.cooldownUntil;
+    await markStorageAccountCooldown(error.storageAccountId || storageManager.getActiveAccountId(), error.provider, error.reason, cooldownUntil, error.message);
+    await putJobIntoStorageCooldown(jobId, cooldownUntil, error.message);
+    const job = await getJob(jobId);
+    if (job) await notifyStorageCooldownOnce(botClient, job, cooldownUntil);
+    return true;
+}
+
+async function ensureJobCanRun(jobId: string): Promise<TelegramJobControlState> {
     const job = await getJob(jobId);
     if (!job) return 'cancelled';
     if (job.cancelled_at || job.status === 'cancelled') return 'cancelled';
     if (job.paused_at || job.status === 'paused') return 'paused';
     if (job.cooldown_until && new Date(job.cooldown_until).getTime() > Date.now()) return 'cooldown';
+    if (job.status === 'cooling' && (!job.cooldown_until || new Date(job.cooldown_until).getTime() <= Date.now())) return 'run';
+    const storageCooldown = await applyStorageCooldownIfNeeded(jobId);
+    if (storageCooldown) return 'cooldown';
     return 'run';
 }
 
@@ -749,6 +813,9 @@ async function downloadClaimedRefs(botClient: TelegramClient, requestMessage: Ap
             await updateJob(jobId, { status: 'running', cooldown_until: cooldownUntil, error: `Telegram FloodWait，冷却到 ${cooldownUntil.toISOString()}` });
             for (const ref of refs) await markDownloadRefStatus(jobId, ref, 'failed', `FloodWait ${flood.seconds}s`);
             return { found: 0, skipped: 0, failed: refs.length, successful: 0 };
+        }
+        if (await handleStorageQuotaCooldownError(botClient, jobId, error)) {
+            return { found: 0, skipped: 0, failed: 0, successful: 0 };
         }
         for (const ref of refs) await markDownloadRefStatus(jobId, ref, 'failed', error instanceof Error ? error.message : String(error));
         throw error;
@@ -998,7 +1065,7 @@ export async function listTelegramActiveTaskQueues(userId: number, limit = 10) {
                    )
                )
                OR (
-                   j.status = 'paused'
+                   j.status IN ('paused', 'cooling')
                    AND (COALESCE(s.pending_count, 0) > 0 OR COALESCE(s.downloading_count, 0) > 0 OR j.scan_status = 'scanning')
                )
            )
@@ -1122,6 +1189,11 @@ async function runSubscriptionScan(botClient: TelegramClient) {
                 .filter((ref): ref is TelegramDownloadMessageRef => Boolean(ref));
             await markDownloadRefsDownloading(jobId, subscriptionRefs);
             const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, 'newer', ids, row.folder_override || null, subscriptionRefs, (ref, status, error) => markDownloadRefStatus(jobId, ref, status, error));
+            const cooledJob = await getJob(jobId);
+            if (cooledJob?.status === 'cooling') {
+                await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
+                continue;
+            }
             await updateJob(jobId, {
                 status: downloadResult.failed > 0 ? 'completed_with_errors' : 'completed',
                 enqueued_count: downloadResult.found,
@@ -1201,6 +1273,11 @@ async function recoverTelegramJob(botClient: TelegramClient, job: any): Promise<
             refs,
             (ref, status, error) => markDownloadRefStatus(job.id, ref, status, error),
         );
+        const cooledJob = await getJob(job.id);
+        if (cooledJob?.status === 'cooling') {
+            await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
+            return;
+        }
         await updateJob(job.id, {
             status: result.failed > 0 ? 'completed_with_errors' : 'completed',
             enqueued_count: result.found,
@@ -1221,6 +1298,16 @@ export async function recoverInterruptedTelegramJobs(botClient: TelegramClient):
     if (recoveryRunning) return;
     recoveryRunning = true;
     try {
+        await clearExpiredStorageCooldowns();
+        await query(
+            `UPDATE telegram_background_jobs
+             SET status = 'running', download_status = 'active', cooldown_until = NULL, error = NULL, updated_at = NOW()
+             WHERE status = 'cooling'
+               AND cooldown_until IS NOT NULL
+               AND cooldown_until <= NOW()
+               AND cancelled_at IS NULL
+               AND finished_at IS NULL`
+        );
         await query(
             `UPDATE telegram_download_items
              SET status = 'pending', locked_at = NULL, updated_at = NOW()
@@ -1234,7 +1321,7 @@ export async function recoverInterruptedTelegramJobs(botClient: TelegramClient):
              WHERE j.kind IN ('date_range', 'tag_download')
                AND j.finished_at IS NULL
                AND j.cancelled_at IS NULL
-               AND j.status IN ('pending', 'running', 'failed', 'completed_with_errors')
+               AND j.status IN ('pending', 'running', 'failed', 'completed_with_errors', 'cooling')
                AND i.status = 'pending'
              ORDER BY j.created_at ASC
              LIMIT 5`

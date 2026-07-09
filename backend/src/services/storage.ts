@@ -18,6 +18,49 @@ import {
     isSensitiveSettingKey,
     storageConfigNeedsEncryption,
 } from '../utils/credentialCrypto.js';
+import { DEFAULT_STORAGE_COOLDOWN_MS, STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT } from './storageCooldown.js';
+
+export class StorageQuotaCooldownError extends Error {
+    provider: string;
+    reason: string;
+    storageAccountId?: string;
+    cooldownUntil: Date;
+    originalError?: unknown;
+
+    constructor(message: string, options: { provider: string; reason: string; storageAccountId?: string; cooldownUntil?: Date; originalError?: unknown }) {
+        super(message);
+        this.name = 'StorageQuotaCooldownError';
+        this.provider = options.provider;
+        this.reason = options.reason;
+        this.storageAccountId = options.storageAccountId;
+        this.cooldownUntil = options.cooldownUntil || new Date(Date.now() + DEFAULT_STORAGE_COOLDOWN_MS);
+        this.originalError = options.originalError;
+    }
+}
+
+export function isStorageQuotaCooldownError(error: unknown): error is StorageQuotaCooldownError {
+    return error instanceof StorageQuotaCooldownError || (error as any)?.name === 'StorageQuotaCooldownError';
+}
+
+function googleDriveErrorText(error: any): string {
+    const pieces = [
+        error?.message,
+        error?.errorMessage,
+        error?.response?.data ? JSON.stringify(error.response.data) : undefined,
+        error?.errors ? JSON.stringify(error.errors) : undefined,
+    ].filter(Boolean);
+    return pieces.join(' ');
+}
+
+function isGoogleDriveDailyUploadLimitError(error: any): boolean {
+    const status = Number(error?.code || error?.response?.status || error?.status || 0);
+    const text = googleDriveErrorText(error);
+    if (status !== 403) return false;
+    // Treat only explicit Drive/upload-limit responses as the 24h daily upload cap.
+    // Generic userRateLimitExceeded/rateLimitExceeded/429 errors are usually short-lived API throttles
+    // and must not pause background transfers for a full day.
+    return /Drive upload limit|exceeded their Drive upload limit|exceeded.*upload limit|upload limit exceeded|upload limit/i.test(text);
+}
 
 // 接口定义
 export interface IStorageProvider {
@@ -1075,6 +1118,14 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
             return file.data.id;
         } catch (error: any) {
             console.error('[GoogleDrive] Upload failed:', error.message);
+            if (isGoogleDriveDailyUploadLimitError(error)) {
+                throw new StorageQuotaCooldownError('Google Drive 今日上传额度已达上限，任务将自动暂停 24 小时后继续。', {
+                    provider: 'google_drive',
+                    reason: STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT,
+                    storageAccountId: this.id,
+                    originalError: error,
+                });
+            }
             throw new Error(`Google Drive upload failed: ${error.message}`);
         }
     }
