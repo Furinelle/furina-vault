@@ -7,7 +7,7 @@ import path from 'path';
 import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleDelete, handleDeleteConfirmCallback, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleChannelTaskQueueCallback, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
+import { handleStart, handleHelp, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleDelete, handleDeleteConfirmCallback, handleTasks, handleTaskCenterCallback, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleChannelTaskQueueCallback, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
 import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask, loadFileDownloadConcurrencySetting } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
 import {
@@ -311,7 +311,7 @@ async function updateJobProgressMessage(statusMessage: Api.Message, summary: Tel
                     : totalDone >= summary.totalMediaFound && summary.scanStatus === 'done'
                         ? `✅ **频道任务完成**`
                         : `🔎 **频道任务运行中**`,
-        `🆔 job: ${summary.jobId.slice(0, 8)}`,
+        `🆔 job: ${summary.jobId.slice(0, 12)}`,
         `📍 频道：${summary.source}`,
         ``,
         `🔎 扫描：${summary.scanStatus}`,
@@ -326,7 +326,7 @@ async function updateJobProgressMessage(statusMessage: Api.Message, summary: Tel
                 : `⏳ FloodWait 冷却到：${summary.cooldownUntil}`)
             : '',
         ``,
-        `控制：/task_pause ${summary.jobId.slice(0, 8)} · /task_resume ${summary.jobId.slice(0, 8)} · /task_cancel ${summary.jobId.slice(0, 8)}`,
+        `控制：/task_pause ${summary.jobId.slice(0, 12)} · /task_resume ${summary.jobId.slice(0, 12)} · /task_cancel ${summary.jobId.slice(0, 12)}`,
     ].filter(Boolean);
     await statusMessage.edit({ text: lines.join('\n') }).catch(() => undefined);
 }
@@ -350,12 +350,15 @@ async function updateScanStatusMessage(statusMessage: Api.Message, summary: Tele
 async function replyWithJobResult(statusMessage: Api.Message, fallbackMessage: Api.Message, promise: Promise<any>, kind: 'date' | 'tag'): Promise<void> {
     promise
         .then(result => {
+            const cancelled = Boolean(result.cancelled);
             const commentLine = result.commentMediaFound || result.commentMessagesScanned
                 ? `\n评论区: 扫描 ${result.commentMessagesScanned || 0} 条，发现 ${result.commentMediaFound || 0} 个文件`
                 : '';
-            const text = kind === 'tag'
-                ? `✅ 标签下载任务完成\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`
-                : `✅ 日期范围任务完成\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`;
+            const text = cancelled
+                ? `🛑 ${kind === 'tag' ? '标签' : '日期'}下载任务已取消\nID: ${String(result.jobId).slice(0, 12)}\n已完成: ${result.successful || 0}\n跳过: ${result.skipped || 0}${commentLine}`
+                : kind === 'tag'
+                    ? `✅ 标签下载任务完成\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 12)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`
+                    : `✅ 日期范围任务完成\nID: ${String(result.jobId).slice(0, 12)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`;
             statusMessage.edit({ text }).catch(() => fallbackMessage.reply({ message: text }).catch(() => undefined));
         })
         .catch(error => {
@@ -863,15 +866,15 @@ async function handleTaskQueueCallback(update: Api.UpdateBotCallbackQuery, data:
     }
     try {
         if (action === 'pause') {
-            pauseDownloadTasks(taskId);
-            await refreshSilentProgress(client, update.peer);
-            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已暂停全局下载队列' }));
+            const result = pauseDownloadTasks(taskId);
+            await refreshSilentProgress(client, update.peer, userId);
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.total > 0 ? '已暂停下载队列' : '当前没有可暂停的下载任务' }));
             return;
         }
         if (action === 'resume') {
-            resumeDownloadTasks(taskId);
-            await refreshSilentProgress(client, update.peer);
-            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已继续全局下载队列' }));
+            const result = resumeDownloadTasks(taskId);
+            await refreshSilentProgress(client, update.peer, userId);
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.total > 0 ? '已继续下载队列' : '当前没有等待中的下载任务' }));
             return;
         }
         await cancelSilentTask(client, update.peer, taskId, update.msgId, userId);
@@ -1733,7 +1736,13 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
-                // 处理 /tasks 频道任务队列按钮
+                // 处理新版 /tasks 任务中心导航与控制
+                if (data.startsWith('tc_')) {
+                    await handleTaskCenterCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
+                // 处理旧版 /tasks 频道任务队列按钮（兼容历史消息）
                 if (data.startsWith('ctq_')) {
                     await handleChannelTaskQueueCallback(activeClient, callbackUpdate, data);
                     return;

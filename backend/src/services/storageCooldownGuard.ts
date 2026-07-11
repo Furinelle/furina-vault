@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { storageManager, StorageQuotaCooldownError, isStorageQuotaCooldownError } from './storage.js';
 import {
     getStorageAccountCooldown,
+    describeStorageCooldownRecovery,
     STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT,
     type StorageAccountCooldown,
 } from './storageCooldown.js';
@@ -18,8 +19,8 @@ export function formatStorageCooldownNotice(cooldownUntil: Date): string {
     return [
         '⏸️ Google Drive 今日上传额度已达上限',
         '',
-        '当前任务已自动暂停，预计 24 小时后继续。',
-        '剩余文件不会丢失，恢复后会从未完成部分继续处理。',
+        '当前任务已自动暂停，剩余文件不会丢失；无需点击“继续”。',
+        describeStorageCooldownRecovery(cooldownUntil),
         '',
         `恢复时间：${cooldownUntil.toISOString()}`,
     ].join('\n');

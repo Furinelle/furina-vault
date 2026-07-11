@@ -4,6 +4,7 @@ import { getMimeTypeFromFilename, sanitizeFilename } from './telegramUtils.js';
 export interface TelegramFileInfo {
     fileName: string;
     mimeType: string;
+    generatedName: boolean;
 }
 
 export function getDownloadableMedia(message: Api.Message): any | null {
@@ -44,61 +45,72 @@ function getDocumentFilename(document: any, fallback: string): string {
     return fileNameAttr?.fileName || fallback;
 }
 
+function isGeneratedTelegramName(fileName: string, messageId: number): boolean {
+    const lower = fileName.toLowerCase();
+    return new RegExp(`^(?:file|video|audio|voice)_${messageId}(?:\\.[^.]+)?$`, 'i').test(lower);
+}
+
 export function extractFileInfo(message: Api.Message): TelegramFileInfo | null {
     const downloadableMedia = getDownloadableMedia(message);
     if (!downloadableMedia) return null;
 
     let fileName = 'unknown';
     let mimeType = 'application/octet-stream';
+    let generatedName = false;
 
     try {
         if (message.document) {
             const doc = message.document as Api.Document;
             const fileNameAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
+            generatedName = !fileNameAttr?.fileName;
             fileName = fileNameAttr?.fileName || `file_${message.id}`;
             mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
 
-            if (fileName.startsWith('file_')) {
+            if (isGeneratedTelegramName(fileName, message.id)) {
                 const videoAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeVideo');
                 const audioAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeAudio');
                 if (videoAttr) fileName = `video_${message.id}.mp4`;
                 else if (audioAttr) fileName = `audio_${message.id}.mp3`;
             }
         } else if (message.photo) {
-            const date = new Date((message.date || Math.floor(Date.now() / 1000)) * 1000);
-            const timestamp = date.toISOString().replace(/[-:T]/g, '').slice(0, 14);
-            fileName = `Img_${timestamp}_${message.id}.jpg`;
+            generatedName = true;
+            fileName = `image_${message.id}.jpg`;
             mimeType = 'image/jpeg';
         } else if (message.video) {
             const video = message.video as Api.Document;
             const fileNameAttr = video.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
+            generatedName = !fileNameAttr?.fileName;
             fileName = fileNameAttr?.fileName || `video_${message.id}.mp4`;
             mimeType = video.mimeType || 'video/mp4';
         } else if (message.audio) {
             const audio = message.audio as Api.Document;
             const fileNameAttr = audio.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
+            generatedName = !fileNameAttr?.fileName;
             fileName = fileNameAttr?.fileName || `audio_${message.id}.mp3`;
             mimeType = audio.mimeType || 'audio/mpeg';
         } else if (message.voice) {
-            fileName = `voice_${message.id}.ogg`;
+            generatedName = true;
+            fileName = `audio_${message.id}.ogg`;
             mimeType = 'audio/ogg';
         } else {
             const media = message.media as any;
             if (media.document && media.document instanceof Api.Document) {
                 const doc = media.document;
                 const fileNameAttr = doc.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename') as any;
+                generatedName = !fileNameAttr?.fileName;
                 fileName = fileNameAttr?.fileName || `file_${message.id}`;
                 mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
             } else {
                 const document = (downloadableMedia as any).document || (downloadableMedia as any);
                 const photo = (downloadableMedia as any).photo || (downloadableMedia as any);
                 if (document?.className === 'Document' || document?.attributes) {
-                    fileName = getDocumentFilename(document, `file_${message.id}`);
+                    const documentFileName = getDocumentFilename(document, '');
+                    generatedName = !documentFileName;
+                    fileName = documentFileName || `file_${message.id}`;
                     mimeType = document.mimeType || getMimeTypeFromFilename(fileName);
                 } else if (photo?.className === 'Photo' || photo?.sizes) {
-                    const date = new Date((message.date || Math.floor(Date.now() / 1000)) * 1000);
-                    const timestamp = date.toISOString().replace(/[-:T]/g, '').slice(0, 14);
-                    fileName = `Img_${timestamp}_${message.id}.jpg`;
+                    generatedName = true;
+                    fileName = `image_${message.id}.jpg`;
                     mimeType = 'image/jpeg';
                 } else {
                     return null;
@@ -110,5 +122,5 @@ export function extractFileInfo(message: Api.Message): TelegramFileInfo | null {
         return null;
     }
 
-    return { fileName: sanitizeFilename(fileName), mimeType };
+    return { fileName: sanitizeFilename(fileName), mimeType, generatedName };
 }

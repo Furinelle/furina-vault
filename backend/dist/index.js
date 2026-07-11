@@ -415,6 +415,9 @@ async function clearExpiredStorageCooldowns() {
   const result = await query(`DELETE FROM storage_account_cooldowns WHERE cooldown_until <= NOW()`);
   return result.rowCount || 0;
 }
+function describeStorageCooldownRecovery(cooldownUntil) {
+  return `\u7CFB\u7EDF\u4F1A\u5728 ${cooldownUntil.toISOString()} \u540E\u91CD\u65B0\u68C0\u67E5\uFF1B\u5982\u679C\u9650\u5236\u5DF2\u89E3\u9664\uFF0C\u5C06\u81EA\u52A8\u7EE7\u7EED\uFF0C\u5426\u5219\u4F1A\u66F4\u65B0\u51B7\u5374\u65F6\u95F4\u5E76\u7EE7\u7EED\u7B49\u5F85\u3002`;
+}
 var STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT, DEFAULT_STORAGE_COOLDOWN_MS;
 var init_storageCooldown = __esm({
   "src/services/storageCooldown.ts"() {
@@ -1773,17 +1776,17 @@ var init_storage = __esm({
 import express from "express";
 import cors from "cors";
 import dotenv3 from "dotenv";
-import path21 from "path";
+import path22 from "path";
 import fs16 from "fs";
 
 // src/routes/files.ts
 init_db();
 import { Router as Router2 } from "express";
 import fs12 from "fs";
-import path16 from "path";
+import path17 from "path";
 
 // src/middleware/signedUrl.ts
-import crypto8 from "crypto";
+import crypto9 from "crypto";
 
 // src/utils/config.ts
 init_secretStore();
@@ -1806,7 +1809,7 @@ var TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TE
 
 // src/routes/auth.ts
 import { Router } from "express";
-import crypto7 from "crypto";
+import crypto8 from "crypto";
 import { rateLimit } from "express-rate-limit";
 
 // src/utils/security.ts
@@ -1937,7 +1940,7 @@ import { StringSession as StringSession2 } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { Raw } from "telegram/events/index.js";
 import fs11 from "fs";
-import path15 from "path";
+import path16 from "path";
 
 // src/services/telegramState.ts
 init_db();
@@ -2081,10 +2084,11 @@ async function isAuthenticatedAsync(userId) {
 // src/services/telegramCommands.ts
 init_db();
 import { Api as Api6 } from "telegram";
+import { getPeerId as getPeerId2 } from "telegram/Utils.js";
 import checkDiskSpaceModule from "check-disk-space";
 import os from "os";
 import fs9 from "fs";
-import path13 from "path";
+import path14 from "path";
 
 // src/utils/telegramUtils.ts
 import path5 from "path";
@@ -2213,35 +2217,32 @@ var PROVIDER_DISPLAY_MAP = {
 function getProviderDisplayName(providerName) {
   return PROVIDER_DISPLAY_MAP[providerName] || `\u{1F4E6} ${providerName}`;
 }
-function buildTaskControlLines(taskId, queuePaused = false, pauseReason) {
+function buildTaskControlLines(taskId, queuePaused = false, pauseReason, systemPause) {
   if (!taskId) return [`\u{1F4A1} \u53D1\u9001 /tasks \u67E5\u770B\u5B9E\u65F6\u4EFB\u52A1\u72B6\u6001`];
   if (queuePaused) {
+    const systemPaused = Boolean(systemPause);
+    const pausing = !systemPause && /随后暂停|完成当前文件/.test(pauseReason || "");
+    const recoveryLine = systemPause ? systemPause.autoResume ? systemPause.retryAt ? `\u267B\uFE0F \u9884\u8BA1\u5728 ${systemPause.retryAt} \u540E\u81EA\u52A8\u6062\u590D\uFF1B\u65E0\u9700\u624B\u52A8\u64CD\u4F5C` : systemPause.recheckMs ? `\u267B\uFE0F \u7CFB\u7EDF\u6BCF ${Math.max(1, Math.round(systemPause.recheckMs / 1e3))} \u79D2\u91CD\u65B0\u68C0\u67E5\uFF0C\u6761\u4EF6\u6EE1\u8DB3\u540E\u81EA\u52A8\u6062\u590D` : `\u267B\uFE0F \u7CFB\u7EDF\u4F1A\u6301\u7EED\u68C0\u67E5\uFF0C\u6761\u4EF6\u6EE1\u8DB3\u540E\u81EA\u52A8\u6062\u590D` : `\u26A0\uFE0F \u6B64\u72B6\u6001\u4E0D\u4F1A\u81EA\u52A8\u6062\u590D\uFF0C\u8BF7\u6309\u539F\u56E0\u5904\u7406\u540E\u91CD\u8BD5` : pausing ? `\u25B6\uFE0F \u53EF\u70B9\u51FB\u201C\u7EE7\u7EED\u201D\u64A4\u9500\u6682\u505C\u8BF7\u6C42` : `\u25B6\uFE0F \u70B9\u51FB\u4E0B\u65B9\u201C\u7EE7\u7EED\u201D\u4F1A\u6062\u590D\u4E0B\u8F7D\u961F\u5217`;
     return [
-      `\u23F8\uFE0F **\u5F53\u524D\u72B6\u6001\uFF1A\u5168\u5C40\u4E0B\u8F7D\u961F\u5217\u5DF2\u6682\u505C**`,
+      `\u23F8\uFE0F **\u5F53\u524D\u72B6\u6001\uFF1A${systemPaused ? "\u7CFB\u7EDF\u4FDD\u62A4\u6682\u505C" : pausing ? "\u6B63\u5728\u6682\u505C" : "\u7528\u6237\u6682\u505C"}**`,
       pauseReason ? `\u{1F4CC} \u539F\u56E0\uFF1A${pauseReason}` : `\u{1F4CC} \u7B49\u5F85\u4E2D\u7684\u4E0B\u8F7D\u4EFB\u52A1\u4E0D\u4F1A\u7EE7\u7EED\u5F00\u59CB`,
-      `\u25B6\uFE0F \u70B9\u51FB\u4E0B\u65B9\u201C\u7EE7\u7EED\u201D\u4F1A\u6062\u590D\u5168\u5C40\u4E0B\u8F7D\u961F\u5217`,
+      recoveryLine,
       `\u{1F6D1} \u70B9\u51FB\u201C\u53D6\u6D88\u201D\u53EA\u4F1A\u7ED3\u675F\u8FD9\u5F20\u540E\u53F0\u4EFB\u52A1\u5361\uFF1B\u4E0D\u4F1A\u518D\u8BEF\u6E05\u7A7A\u5176\u5B83\u4EFB\u52A1`
     ];
   }
   return [
     `\u{1F4A1} \u961F\u5217\u63A7\u5236\uFF1A\u6309\u94AE\u53EA\u5BF9\u5F53\u524D\u804A\u5929\u7684\u4EFB\u52A1\u5361\u6709\u6548`,
-    `\u23F8 \u6682\u505C\uFF1A\u6682\u505C\u5168\u5C40\u4E0B\u8F7D\u961F\u5217\uFF0C\u5DF2\u5728\u5904\u7406\u7684\u6587\u4EF6\u4F1A\u5C3D\u5FEB\u505C\u4F4F`,
-    `\u25B6\uFE0F \u7EE7\u7EED\uFF1A\u6062\u590D\u5168\u5C40\u4E0B\u8F7D\u961F\u5217`,
+    `\u23F8 \u6682\u505C\uFF1A\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\u540E\u6682\u505C\u8BE5\u4EFB\u52A1`,
+    `\u25B6\uFE0F \u7EE7\u7EED\uFF1A\u7EE7\u7EED\u8BE5\u4EFB\u52A1\uFF1B\u82E5\u662F\u7528\u6237\u6682\u505C\uFF0C\u4E5F\u4F1A\u89E3\u9664\u7528\u6237\u6682\u505C\u72B6\u6001`,
     `\u{1F6D1} \u53D6\u6D88\uFF1A\u7ED3\u675F\u5F53\u524D\u4EFB\u52A1\u5361\u5E76\u79FB\u9664\u6309\u94AE\uFF0C\u4E0D\u4F1A\u8BEF\u53D6\u6D88\u5176\u5B83\u804A\u5929\u4EFB\u52A1`
   ];
 }
-function buildTaskControlButtons(taskId) {
+function buildTaskControlButtons(taskId, queuePaused = false, systemPause, queuePausing = false, userPaused = queuePaused && !systemPause) {
   if (!taskId) return void 0;
+  const actionButtons = queuePaused || queuePausing ? systemPause && !userPaused ? [] : [new Api.KeyboardButtonCallback({ text: "\u25B6\uFE0F \u7EE7\u7EED", data: Buffer.from(`tq_resume_${taskId}`) })] : [new Api.KeyboardButtonCallback({ text: "\u23F8 \u6682\u505C", data: Buffer.from(`tq_pause_${taskId}`) })];
+  actionButtons.push(new Api.KeyboardButtonCallback({ text: "\u{1F6D1} \u53D6\u6D88", data: Buffer.from(`tq_cancel_${taskId}`) }));
   return new Api.ReplyInlineMarkup({
-    rows: [
-      new Api.KeyboardButtonRow({
-        buttons: [
-          new Api.KeyboardButtonCallback({ text: "\u23F8 \u6682\u505C", data: Buffer.from(`tq_pause_${taskId}`) }),
-          new Api.KeyboardButtonCallback({ text: "\u25B6\uFE0F \u7EE7\u7EED", data: Buffer.from(`tq_resume_${taskId}`) }),
-          new Api.KeyboardButtonCallback({ text: "\u{1F6D1} \u53D6\u6D88", data: Buffer.from(`tq_cancel_${taskId}`) })
-        ]
-      })
-    ]
+    rows: [new Api.KeyboardButtonRow({ buttons: actionButtons })]
   });
 }
 function collectCompletedFolders(singleFiles, batches) {
@@ -2418,37 +2419,6 @@ function buildStorageReport(data) {
     `  \u{1F504} \u5904\u7406\u4E2D ${data.queueActive}\u3000\u23F3 \u7B49\u5F85\u4E2D ${data.queuePending}`
   ].join("\n");
 }
-function buildTasksReport(active, pending, _history = []) {
-  const lines = [
-    `\u{1F4CB} **\u5B9E\u65F6\u4E0B\u8F7D\u961F\u5217**`,
-    `\u{1F504} ${active.length} \u6B63\u5728\u4E0B\u8F7D\u3000\u23F3 ${pending.length} \u7B49\u5F85\u5F00\u59CB`,
-    LINE
-  ];
-  if (active.length > 0) {
-    lines.push("");
-    lines.push(`**\u{1F504} \u6B63\u5728\u4E0B\u8F7D**`);
-    active.forEach((task) => {
-      lines.push(`  \u25B8 ${task.fileName}`);
-      if (task.totalSize && task.downloadedSize) {
-        const bar = generateProgressBar(task.downloadedSize, task.totalSize, 10);
-        lines.push(`    ${bar}  (${formatBytes(task.downloadedSize)}/${formatBytes(task.totalSize)})`);
-      } else {
-        lines.push(`    \u4F20\u8F93\u4E2D\uFF0C\u8BF7\u7A0D\u5019...`);
-      }
-    });
-  }
-  if (pending.length > 0) {
-    lines.push("");
-    lines.push(`**\u23F3 \u7B49\u5F85\u5F00\u59CB** (\u524D 5 \u4E2A)`);
-    pending.slice(0, 5).forEach((task, i) => {
-      lines.push(`  ${i + 1}. ${task.fileName}`);
-    });
-    if (pending.length > 5) {
-      lines.push(`  ... \u8FD8\u6709 ${pending.length - 5} \u4E2A\u7B49\u5F85\u4EFB\u52A1`);
-    }
-  }
-  return lines.join("\n");
-}
 function buildUploadSuccess(fileName, size, fileType, providerName, folder) {
   const typeEmoji = getTypeEmoji(
     fileType === "image" ? "image/" : fileType === "video" ? "video/" : fileType === "audio" ? "audio/" : "other"
@@ -2531,17 +2501,17 @@ function buildDeleteSuccess(fileName, fileId) {
     `\u{1F5D1}\uFE0F ID: ${fileId}`
   ].join("\n");
 }
-function buildSilentModeNotice(fileCount, taskId, queuePaused = false, pauseReason) {
+function buildSilentModeNotice(fileCount, taskId, queuePaused = false, pauseReason, systemPause) {
   return [
-    queuePaused ? `\u23F8\uFE0F **\u540E\u53F0\u4E0B\u8F7D\u5DF2\u6682\u505C**` : `\u{1F910} **\u5DF2\u5207\u6362\u5230\u9759\u9ED8\u6A21\u5F0F**`,
+    queuePaused ? systemPause ? `\u23F8\uFE0F **\u5DF2\u8FDB\u5165\u7CFB\u7EDF\u4FDD\u62A4\u6682\u505C**` : `\u23F8\uFE0F **\u540E\u53F0\u4E0B\u8F7D\u5DF2\u6682\u505C**` : `\u{1F910} **\u5DF2\u5207\u6362\u5230\u9759\u9ED8\u6A21\u5F0F**`,
     ...taskId ? [`\u{1F194} \u4EFB\u52A1\uFF1A\`${taskId}\``] : [],
     ``,
     queuePaused ? `\u7B49\u5F85\u4EFB\u52A1\u5DF2\u6682\u505C\uFF0C\u4E0D\u4F1A\u7EE7\u7EED\u5F00\u59CB\u65B0\u7684\u4E0B\u8F7D\u3002` : `Bot \u5C06\u5728\u540E\u53F0\u7EE7\u7EED\u5904\u7406\u6240\u6709\u6587\u4EF6\uFF0C\u8BF7\u8010\u5FC3\u7B49\u5F85\u3002`,
     ``,
-    ...buildTaskControlLines(taskId, queuePaused, pauseReason)
+    ...buildTaskControlLines(taskId, queuePaused, pauseReason, systemPause)
   ].join("\n");
 }
-function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCompleted = 0, sessionFailed = 0, taskId, queuePaused = false, pauseReason) {
+function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCompleted = 0, sessionFailed = 0, taskId, queuePaused = false, pauseReason, queuePausing = false, systemPause) {
   const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
   const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
   const successfulBatchFiles = batches.reduce((sum, batch) => sum + batch.successful, 0);
@@ -2556,13 +2526,13 @@ function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCom
   const isComplete = totalFiles > 0 && remainingFiles === 0;
   const activeBatch = batches.find((batch) => batch.completed < batch.totalFiles);
   const activeSingle = singleFiles.find((file) => !["success", "failed"].includes(file.phase));
-  const currentFile = activeBatch?.currentFileName || activeSingle?.fileName;
+  const currentFile = queuePaused || queuePausing ? void 0 : activeBatch?.currentFileActive ? activeBatch.currentFileName : activeSingle?.phase === "downloading" || activeSingle?.phase === "saving" ? activeSingle.fileName : void 0;
   const progress = generateProgressBar(completedFiles, Math.max(totalFiles, 1));
   if (isComplete) {
     return buildSilentAllTasksComplete(totalFiles, failedFiles, taskId, singleFiles, batches);
   }
   return [
-    queuePaused ? `\u23F8\uFE0F **\u540E\u53F0\u4E0B\u8F7D\u5DF2\u6682\u505C**` : `\u{1F910} **\u540E\u53F0\u6279\u91CF\u5904\u7406\u4E2D**`,
+    queuePaused ? systemPause ? `\u23F8\uFE0F **\u7CFB\u7EDF\u4FDD\u62A4\u6682\u505C**` : `\u23F8\uFE0F **\u540E\u53F0\u4E0B\u8F7D\u5DF2\u6682\u505C**` : queuePausing ? `\u23F8\uFE0F **\u6B63\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\uFF0C\u968F\u540E\u6682\u505C**` : `\u{1F910} **\u540E\u53F0\u6279\u91CF\u5904\u7406\u4E2D**`,
     `${progress} (${completedFiles}/${totalFiles})`,
     ``,
     `\u2705 \u6210\u529F: ${successfulFiles}\u3000\u274C \u5931\u8D25: ${failedFiles}\u3000\u23F3 \u5269\u4F59: ${remainingFiles}`,
@@ -2570,7 +2540,7 @@ function buildSilentProgress(sessionTotal, batches, singleFiles = [], sessionCom
     ...activeBatch ? [`\u{1F4C1} \u6279\u6B21: ${activeBatch.folderName}`] : [],
     ...activeBatch?.queuePending ? [`\u{1F552} \u961F\u5217\u7B49\u5F85: ${activeBatch.queuePending}`] : [],
     ``,
-    ...buildTaskControlLines(taskId, queuePaused, pauseReason),
+    ...buildTaskControlLines(taskId, queuePaused || queuePausing, pauseReason, systemPause),
     ...taskId && failedFiles > 0 && remainingFiles === 0 ? [`\u{1F504} \u68C0\u6D4B\u5230\u5931\u8D25\u4EFB\u52A1\uFF0C\u53EF\u53D1\u9001 /tg_retry ${taskId} \u91CD\u8BD5\u6700\u8FD1\u5931\u8D25\u9879`] : []
   ].join("\n");
 }
@@ -2729,7 +2699,7 @@ async function buildConsolidatedStatus(singleFiles, batches) {
       if (!isDone) {
         const progress = generateProgressBar(batch.completed, batch.totalFiles);
         lines.push(`    ${progress} (${batch.completed}/${batch.totalFiles})`);
-        if (batch.currentFileName) {
+        if (batch.currentFileActive && batch.currentFileName) {
           lines.push(`    \u{1F4C4} \u5F53\u524D: ${batch.currentFileName}`);
         }
       } else {
@@ -2794,8 +2764,8 @@ function buildCleanupNotice(deletedCount, freedSpace) {
 init_db();
 import { Api as Api4 } from "telegram";
 import fs7 from "fs";
-import path10 from "path";
-import crypto6 from "crypto";
+import path11 from "path";
+import crypto7 from "crypto";
 import bigInt from "big-integer";
 
 // src/utils/thumbnail.ts
@@ -2980,8 +2950,8 @@ function formatStorageCooldownNotice(cooldownUntil) {
   return [
     "\u23F8\uFE0F Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650",
     "",
-    "\u5F53\u524D\u4EFB\u52A1\u5DF2\u81EA\u52A8\u6682\u505C\uFF0C\u9884\u8BA1 24 \u5C0F\u65F6\u540E\u7EE7\u7EED\u3002",
-    "\u5269\u4F59\u6587\u4EF6\u4E0D\u4F1A\u4E22\u5931\uFF0C\u6062\u590D\u540E\u4F1A\u4ECE\u672A\u5B8C\u6210\u90E8\u5206\u7EE7\u7EED\u5904\u7406\u3002",
+    "\u5F53\u524D\u4EFB\u52A1\u5DF2\u81EA\u52A8\u6682\u505C\uFF0C\u5269\u4F59\u6587\u4EF6\u4E0D\u4F1A\u4E22\u5931\uFF1B\u65E0\u9700\u70B9\u51FB\u201C\u7EE7\u7EED\u201D\u3002",
+    describeStorageCooldownRecovery(cooldownUntil),
     "",
     `\u6062\u590D\u65F6\u95F4\uFF1A${cooldownUntil.toISOString()}`
   ].join("\n");
@@ -3123,58 +3093,68 @@ function getDocumentFilename(document, fallback) {
   const fileNameAttr = document.attributes?.find((a) => a.className === "DocumentAttributeFilename");
   return fileNameAttr?.fileName || fallback;
 }
+function isGeneratedTelegramName(fileName, messageId) {
+  const lower = fileName.toLowerCase();
+  return new RegExp(`^(?:file|video|audio|voice)_${messageId}(?:\\.[^.]+)?$`, "i").test(lower);
+}
 function extractFileInfo(message) {
   const downloadableMedia = getDownloadableMedia(message);
   if (!downloadableMedia) return null;
   let fileName = "unknown";
   let mimeType = "application/octet-stream";
+  let generatedName = false;
   try {
     if (message.document) {
       const doc = message.document;
       const fileNameAttr = doc.attributes?.find((a) => a.className === "DocumentAttributeFilename");
+      generatedName = !fileNameAttr?.fileName;
       fileName = fileNameAttr?.fileName || `file_${message.id}`;
       mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
-      if (fileName.startsWith("file_")) {
+      if (isGeneratedTelegramName(fileName, message.id)) {
         const videoAttr = doc.attributes?.find((a) => a.className === "DocumentAttributeVideo");
         const audioAttr = doc.attributes?.find((a) => a.className === "DocumentAttributeAudio");
         if (videoAttr) fileName = `video_${message.id}.mp4`;
         else if (audioAttr) fileName = `audio_${message.id}.mp3`;
       }
     } else if (message.photo) {
-      const date = new Date((message.date || Math.floor(Date.now() / 1e3)) * 1e3);
-      const timestamp = date.toISOString().replace(/[-:T]/g, "").slice(0, 14);
-      fileName = `Img_${timestamp}_${message.id}.jpg`;
+      generatedName = true;
+      fileName = `image_${message.id}.jpg`;
       mimeType = "image/jpeg";
     } else if (message.video) {
       const video = message.video;
       const fileNameAttr = video.attributes?.find((a) => a.className === "DocumentAttributeFilename");
+      generatedName = !fileNameAttr?.fileName;
       fileName = fileNameAttr?.fileName || `video_${message.id}.mp4`;
       mimeType = video.mimeType || "video/mp4";
     } else if (message.audio) {
       const audio = message.audio;
       const fileNameAttr = audio.attributes?.find((a) => a.className === "DocumentAttributeFilename");
+      generatedName = !fileNameAttr?.fileName;
       fileName = fileNameAttr?.fileName || `audio_${message.id}.mp3`;
       mimeType = audio.mimeType || "audio/mpeg";
     } else if (message.voice) {
-      fileName = `voice_${message.id}.ogg`;
+      generatedName = true;
+      fileName = `audio_${message.id}.ogg`;
       mimeType = "audio/ogg";
     } else {
       const media = message.media;
       if (media.document && media.document instanceof Api2.Document) {
         const doc = media.document;
         const fileNameAttr = doc.attributes?.find((a) => a.className === "DocumentAttributeFilename");
+        generatedName = !fileNameAttr?.fileName;
         fileName = fileNameAttr?.fileName || `file_${message.id}`;
         mimeType = doc.mimeType || getMimeTypeFromFilename(fileName);
       } else {
         const document = downloadableMedia.document || downloadableMedia;
         const photo = downloadableMedia.photo || downloadableMedia;
         if (document?.className === "Document" || document?.attributes) {
-          fileName = getDocumentFilename(document, `file_${message.id}`);
+          const documentFileName = getDocumentFilename(document, "");
+          generatedName = !documentFileName;
+          fileName = documentFileName || `file_${message.id}`;
           mimeType = document.mimeType || getMimeTypeFromFilename(fileName);
         } else if (photo?.className === "Photo" || photo?.sizes) {
-          const date = new Date((message.date || Math.floor(Date.now() / 1e3)) * 1e3);
-          const timestamp = date.toISOString().replace(/[-:T]/g, "").slice(0, 14);
-          fileName = `Img_${timestamp}_${message.id}.jpg`;
+          generatedName = true;
+          fileName = `image_${message.id}.jpg`;
           mimeType = "image/jpeg";
         } else {
           return null;
@@ -3185,7 +3165,7 @@ function extractFileInfo(message) {
     console.error("\u{1F916} \u63D0\u53D6\u6587\u4EF6\u4FE1\u606F\u51FA\u9519:", e);
     return null;
   }
-  return { fileName: sanitizeFilename(fileName), mimeType };
+  return { fileName: sanitizeFilename(fileName), mimeType, generatedName };
 }
 
 // src/utils/fileUtils.ts
@@ -3375,6 +3355,203 @@ async function getTelegramBatchFolderName(message, fallback) {
   const title = getEntityDisplayName(chat);
   if (title) return normalizeSegment(title, "telegram");
   return normalizeSegment(fallback, "telegram-batch");
+}
+
+// src/utils/telegramNaming.ts
+import path10 from "path";
+import crypto6 from "crypto";
+function normalizeExtension(extension) {
+  if (!extension) return "";
+  const trimmed = extension.trim();
+  if (!trimmed) return "";
+  return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
+}
+function extensionFromMimeType(mimeType) {
+  if (!mimeType) return "";
+  const extensions = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "application/zip": ".zip"
+  };
+  return extensions[mimeType.toLowerCase()] || "";
+}
+function fallbackPrefix(mimeType) {
+  const type = getFileType(mimeType || "");
+  const map = {
+    image: "image",
+    video: "video",
+    audio: "audio",
+    document: "document"
+  };
+  return map[type] || "file";
+}
+function firstCaptionLine(caption) {
+  return (caption || "").split(/\r?\n/)[0]?.trim() || "";
+}
+function replaceCaptionExtension(fileName, extension) {
+  if (!extension) return fileName;
+  const captionExtension = path10.extname(fileName);
+  if (!captionExtension) return `${fileName}${extension}`;
+  if (captionExtension.toLowerCase() === extension.toLowerCase()) return fileName;
+  return `${fileName.slice(0, -captionExtension.length)}${extension}`;
+}
+function isGeneratedTelegramDisplayName(fileName, messageId) {
+  if (messageId === void 0) return false;
+  const base = path10.basename(fileName).toLowerCase();
+  const escapedMessageId = String(messageId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^(?:image|video|audio|voice|file)_${escapedMessageId}(?:\\.[^.]+)?$`, "i").test(base);
+}
+function hasMeaningfulBaseName(fileName) {
+  const base = path10.extname(fileName) ? fileName.slice(0, -path10.extname(fileName).length) : fileName;
+  return /[\p{L}\p{N}]/u.test(base);
+}
+function appendSequenceNumber(fileName, sequenceNumber) {
+  if (sequenceNumber === void 0) return fileName;
+  const sequence = String(sequenceNumber).padStart(2, "0");
+  const existingExtension = path10.extname(fileName);
+  const base = existingExtension ? fileName.slice(0, -existingExtension.length) : fileName;
+  return `${base}_${sequence}${existingExtension}`;
+}
+function buildTelegramGeneratedFileName(options) {
+  const ext = normalizeExtension(options.extension);
+  const captionLine = firstCaptionLine(options.caption);
+  if (captionLine) {
+    const captionName = sanitizeFilename(captionLine);
+    if (hasMeaningfulBaseName(captionName)) {
+      const nameWithExtension = replaceCaptionExtension(captionName, ext);
+      return appendSequenceNumber(nameWithExtension, options.sequenceNumber);
+    }
+  }
+  const suffix = sanitizeFilename(options.randomSuffix || crypto6.randomBytes(4).toString("hex")).replace(/\s+/g, "_");
+  return appendSequenceNumber(`${fallbackPrefix(options.mimeType)}_${suffix}${ext}`, options.sequenceNumber);
+}
+function resolveTelegramGeneratedFileName(options) {
+  if (!isGeneratedTelegramDisplayName(options.currentFileName, options.messageId)) {
+    return options.currentFileName;
+  }
+  return buildTelegramGeneratedFileName({
+    caption: firstCaptionLine(options.caption) || firstCaptionLine(options.sharedCaption),
+    mimeType: options.mimeType,
+    extension: path10.extname(options.currentFileName) || extensionFromMimeType(options.mimeType),
+    randomSuffix: options.messageId === void 0 ? options.randomSuffix : String(options.messageId),
+    sequenceNumber: options.sequenceNumber
+  });
+}
+
+// src/utils/telegramMediaGroup.ts
+function createTelegramMediaGroupDebouncer(options) {
+  const timers = /* @__PURE__ */ new Map();
+  const delayMs = Math.max(0, options.delayMs);
+  const fire = (mediaGroupId) => {
+    const timer = timers.get(mediaGroupId);
+    if (timer) clearTimeout(timer);
+    if (!timers.has(mediaGroupId)) return;
+    timers.delete(mediaGroupId);
+    void Promise.resolve(options.onReady(mediaGroupId)).catch((error) => {
+      console.error(`\u{1F916} Telegram media group processor failed: group=${mediaGroupId}`, error);
+    });
+  };
+  return {
+    bump(mediaGroupId) {
+      const existing = timers.get(mediaGroupId);
+      if (existing) clearTimeout(existing);
+      timers.set(mediaGroupId, setTimeout(() => fire(mediaGroupId), delayMs));
+    },
+    flush(mediaGroupId) {
+      fire(mediaGroupId);
+    },
+    cancel(mediaGroupId) {
+      const timer = timers.get(mediaGroupId);
+      if (timer) clearTimeout(timer);
+      timers.delete(mediaGroupId);
+    }
+  };
+}
+function telegramMediaGroupQueueKey(chatId, mediaGroupId) {
+  return `${chatId === void 0 || chatId === null ? "unknown" : String(chatId)}:${mediaGroupId}`;
+}
+function firstCaptionLine2(message) {
+  return String(message.message || message.text || message.caption || "").split(/\r?\n/)[0].trim();
+}
+function annotateTelegramMediaGroup(items) {
+  const caption = items.map((item) => firstCaptionLine2(item.message)).find(Boolean) || "";
+  const ordered = [...items].sort((a, b) => Number(a.message.id || 0) - Number(b.message.id || 0));
+  const indexByItem = new Map(ordered.map((item, index) => [item, index + 1]));
+  for (const item of items) {
+    item.sharedCaption = caption;
+    item.groupIndex = indexByItem.get(item);
+    item.groupSize = items.length;
+  }
+  return items;
+}
+function takePendingMediaGroupSnapshot(items) {
+  const seen = /* @__PURE__ */ new Set();
+  return items.filter((item) => item.status === void 0 || item.status === "pending").sort((a, b) => Number(a.message.id || 0) - Number(b.message.id || 0)).filter((item) => {
+    const id = Number(item.message.id || 0);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+function peerKeyForForwardedSource(peer) {
+  if (typeof peer === "string" || typeof peer === "number" || typeof peer === "bigint") return String(peer);
+  const anyPeer = peer;
+  const id = anyPeer?.channelId || anyPeer?.chatId || anyPeer?.userId || anyPeer?.id;
+  if (id !== void 0 && id !== null) return `${anyPeer?.className || "peer"}:${id.toString()}`;
+  return JSON.stringify(peer);
+}
+function forwardedSourceRef(message) {
+  const fwdFrom = message.fwdFrom;
+  const peer = fwdFrom?.savedFromPeer || fwdFrom?.fromId;
+  const rawMessageId = fwdFrom?.savedFromMsgId || fwdFrom?.channelPost;
+  const messageId = Number(rawMessageId);
+  if (!peer || !Number.isFinite(messageId) || messageId <= 0) return void 0;
+  return { peer, peerKey: peerKeyForForwardedSource(peer), messageId };
+}
+function forwardedMessageCacheKey(peerKey, messageId) {
+  return `${peerKey}:${messageId}`;
+}
+function getForwardedSourceLookup(cache, message) {
+  const ref = forwardedSourceRef(message);
+  if (!cache || !ref) return void 0;
+  return cache.get(forwardedMessageCacheKey(ref.peerKey, ref.messageId));
+}
+async function prefetchForwardedSourceMessages(userClient2, messages) {
+  const grouped = /* @__PURE__ */ new Map();
+  for (const message of messages) {
+    const ref = forwardedSourceRef(message);
+    if (!ref) continue;
+    let group = grouped.get(ref.peerKey);
+    if (!group) {
+      group = { peer: ref.peer, ids: /* @__PURE__ */ new Set() };
+      grouped.set(ref.peerKey, group);
+    }
+    group.ids.add(ref.messageId);
+  }
+  const cache = /* @__PURE__ */ new Map();
+  await Promise.all(Array.from(grouped.entries()).map(async ([peerKey, group]) => {
+    const ids = Array.from(group.ids);
+    try {
+      const fetched = await userClient2.getMessages(group.peer, { ids });
+      for (const message of fetched) {
+        if (message?.media) {
+          cache.set(forwardedMessageCacheKey(peerKey, message.id), message);
+        }
+      }
+    } catch (error) {
+      console.warn("\u{1F916} \u6279\u91CF\u9884\u53D6 Telegram \u8F6C\u53D1\u6E90\u5A92\u4F53\u5931\u8D25:", error);
+    }
+  }));
+  return cache;
 }
 
 // src/utils/telegramPathSettings.ts
@@ -3591,6 +3768,593 @@ async function findDuplicateFile(name, folder, size, storageAccountId) {
   return result.rows[0] || null;
 }
 
+// src/services/downloadTaskQueue.ts
+var DownloadTaskQueue = class {
+  queue = [];
+  active = [];
+  history = [];
+  groups = /* @__PURE__ */ new Map();
+  maxHistory = 50;
+  maxConcurrent;
+  idFactory;
+  userPaused = false;
+  systemPause;
+  diskPressureBlockers = /* @__PURE__ */ new Map();
+  constructor(options = {}) {
+    this.maxConcurrent = Math.max(1, Math.floor(options.maxConcurrent || 1));
+    this.idFactory = options.idFactory || (() => `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+  }
+  ensureGroup(input) {
+    if (this.userPaused && this.active.length === 0 && this.queue.length === 0) this.userPaused = false;
+    const id = input.id.trim();
+    if (!id) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u7EC4 ID \u4E0D\u80FD\u4E3A\u7A7A");
+    const now = Date.now();
+    const existing = this.groups.get(id);
+    if (existing && ["completed", "cancelled"].includes(this.snapshotGroup(existing).state)) {
+      this.groups.delete(id);
+    }
+    const current = this.groups.get(id);
+    if (current) {
+      current.kind = input.kind;
+      current.title = input.title || current.title;
+      current.chatId = input.chatId || current.chatId;
+      current.userId = input.userId ?? current.userId;
+      current.source = input.source ?? current.source;
+      current.targetFolder = input.targetFolder ?? current.targetFolder;
+      current.hidden = input.hidden ?? current.hidden;
+      current.expectedTotal = Math.max(current.expectedTotal, Math.max(0, input.expectedTotal || 0));
+      current.updatedAt = now;
+      return this.snapshotGroup(current);
+    }
+    const record = {
+      ...input,
+      id,
+      expectedTotal: Math.max(0, input.expectedTotal || 0),
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      createdAt: now,
+      updatedAt: now
+    };
+    this.groups.set(id, record);
+    return this.snapshotGroup(record);
+  }
+  async add(groupId, fileName, execute, totalSize = 0, onPendingCancelled) {
+    const group = this.groups.get(groupId);
+    if (!group) throw new Error(`\u4E0B\u8F7D\u4EFB\u52A1\u7EC4\u4E0D\u5B58\u5728: ${groupId}`);
+    if (group.stateOverride === "cancelled" || group.stateOverride === "cancelling") {
+      try {
+        await Promise.resolve(onPendingCancelled?.());
+      } catch (error) {
+        console.error(`[Queue] late cancellation callback failed: ${fileName}`, error);
+      }
+      return;
+    }
+    const queuedBehindPausedGroup = group.stateOverride === "paused" || group.stateOverride === "pausing";
+    group.expectedTotal = Math.max(
+      group.expectedTotal,
+      this.countGroupFiles(groupId) + group.completed + group.failed + group.cancelled + 1
+    );
+    group.updatedAt = Date.now();
+    return new Promise((resolve, reject) => {
+      const abortController = new AbortController();
+      const id = this.idFactory();
+      const task = {
+        id,
+        groupId,
+        fileName,
+        status: "pending",
+        abortController,
+        totalSize,
+        downloadedSize: 0,
+        rawExecute: execute,
+        settleCancelled: resolve,
+        onPendingCancelled,
+        execute: async () => {
+          task.status = "active";
+          task.startTime = Date.now();
+          group.updatedAt = task.startTime;
+          this.active.push(task);
+          try {
+            const outcome = await execute(abortController.signal, task.id);
+            if (abortController.signal.aborted) {
+              task.status = "cancelled";
+              group.cancelled += 1;
+            } else if (outcome?.status === "failed") {
+              task.status = "failed";
+              task.error = outcome.error;
+              group.failed += 1;
+            } else {
+              task.status = "success";
+              group.completed += 1;
+            }
+            resolve();
+          } catch (error) {
+            task.status = abortController.signal.aborted ? "cancelled" : "failed";
+            task.error = error instanceof Error ? error.message : String(error);
+            if (task.status === "cancelled") {
+              group.cancelled += 1;
+              resolve();
+            } else {
+              group.failed += 1;
+              reject(error);
+            }
+          } finally {
+            task.endTime = Date.now();
+            group.updatedAt = task.endTime;
+            const activeIndex = this.active.findIndex((item) => item.id === task.id);
+            if (activeIndex >= 0) this.active.splice(activeIndex, 1);
+            if (group.stateOverride === "pausing" && !this.hasActiveGroupTask(group.id)) {
+              group.stateOverride = this.queue.some((item) => item.groupId === group.id) ? "paused" : void 0;
+            } else if (group.stateOverride === "cancelling" && !this.hasActiveGroupTask(group.id)) {
+              group.stateOverride = "cancelled";
+            }
+            this.pushHistory(task);
+            this.processNext();
+          }
+        }
+      };
+      this.queue.push(task);
+      if (queuedBehindPausedGroup && group.stateOverride === "pausing" && !this.hasActiveGroupTask(group.id)) {
+        group.stateOverride = "paused";
+      }
+      this.processNext();
+    });
+  }
+  getDebugGroupCount() {
+    return this.groups.size;
+  }
+  getSnapshot(scope = {}) {
+    const groups = Array.from(this.groups.values()).filter((group) => !group.hidden).filter((group) => this.matchesScope(group, scope)).map((group) => this.snapshotForDisplay(group)).filter((group) => !["completed", "cancelled"].includes(group.state)).sort((a, b) => a.createdAt - b.createdAt);
+    return {
+      groups,
+      active: this.active.length,
+      pending: this.queue.length,
+      paused: this.isGloballyPaused(),
+      pauseReason: this.getPauseReason(),
+      userPaused: this.userPaused,
+      systemPause: this.systemPause
+    };
+  }
+  getGroupForControl(groupId, scope = {}, includeHidden = false) {
+    const access = this.resolveGroupForControl(groupId, scope, includeHidden);
+    if (access.status !== "ok" || !access.record) return void 0;
+    return this.snapshotGroup(access.record);
+  }
+  getGroup(groupId, scope = {}, includeHidden = false) {
+    const matches = Array.from(this.groups.values()).filter((group) => includeHidden || !group.hidden).filter((group) => this.matchesScope(group, scope)).filter((group) => group.id === groupId || group.id.startsWith(groupId)).map((group) => this.snapshotForDisplay(group)).filter((group) => !["completed", "cancelled"].includes(group.state));
+    return matches.length === 1 ? matches[0] : void 0;
+  }
+  getScopeStatus(scope = {}) {
+    const groups = Array.from(this.groups.values()).filter((group) => this.matchesScope(group, scope)).map((group) => this.snapshotGroup(group)).filter((group) => !["completed", "cancelled"].includes(group.state));
+    const systemBlocked = Boolean(this.systemPause);
+    const pausing = groups.some((group) => group.state === "pausing");
+    const groupPaused = groups.some((group) => group.state === "paused");
+    const paused = systemBlocked || this.userPaused || groupPaused;
+    return {
+      paused,
+      pausing,
+      systemBlocked,
+      userPaused: this.userPaused || groupPaused,
+      reason: systemBlocked ? this.systemPause?.reason || "\u7CFB\u7EDF\u4FDD\u62A4\u6682\u505C" : this.userPaused || groupPaused ? "\u7528\u6237\u5DF2\u6682\u505C\u4EFB\u52A1" : pausing ? "\u6B63\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\uFF0C\u968F\u540E\u6682\u505C" : void 0,
+      systemPause: this.systemPause
+    };
+  }
+  getStats() {
+    return {
+      ...this.counts(),
+      maxConcurrent: this.maxConcurrent,
+      paused: this.isGloballyPaused(),
+      userPaused: this.userPaused,
+      diskPressurePaused: Boolean(this.systemPause),
+      diskPressureReason: this.systemPause?.reason,
+      systemPause: this.systemPause,
+      pauseReason: this.getPauseReason()
+    };
+  }
+  getDetailedStatus() {
+    const stats = this.getStats();
+    return {
+      active: this.active.map((task) => this.publicTask(task)),
+      pending: this.queue.map((task) => this.publicTask(task)),
+      history: this.history.map((task) => this.publicTask(task)),
+      maxConcurrent: stats.maxConcurrent,
+      paused: stats.paused,
+      diskPressurePaused: stats.diskPressurePaused,
+      systemPause: stats.systemPause,
+      pauseReason: stats.pauseReason
+    };
+  }
+  getMaxConcurrent() {
+    return this.maxConcurrent;
+  }
+  setMaxConcurrent(value) {
+    this.maxConcurrent = Math.max(1, Math.floor(value || 1));
+    this.processNext();
+    return this.maxConcurrent;
+  }
+  updateProgress(taskId, downloaded, total) {
+    const task = this.active.find((item) => item.id === taskId);
+    if (task) {
+      task.downloadedSize = Math.max(0, downloaded);
+      if (total !== void 0 && total > 0) task.totalSize = total;
+      const group = this.groups.get(task.groupId);
+      if (group) group.updatedAt = Date.now();
+    }
+  }
+  prioritizeGroup(groupId, scope = {}) {
+    const access = this.resolveGroupForControl(groupId, scope);
+    if (access.status !== "ok" || !access.record) return this.controlResult(access.status, access.record);
+    const group = access.record;
+    if (group.stateOverride === "paused" || group.stateOverride === "pausing" || group.stateOverride === "cancelling") {
+      return this.controlResult("blocked", group);
+    }
+    const selected = this.queue.filter((task) => task.groupId === group.id);
+    if (selected.length === 0) return this.controlResult("terminal", group);
+    this.queue = [...selected, ...this.queue.filter((task) => task.groupId !== group.id)];
+    group.updatedAt = Date.now();
+    this.processNext();
+    return this.controlResult("ok", group);
+  }
+  pauseGroup(groupId, scope = {}, includeHidden = false) {
+    const access = this.resolveGroupForControl(groupId, scope, includeHidden);
+    if (access.status !== "ok" || !access.record) return this.controlResult(access.status, access.record);
+    const group = access.record;
+    if (group.stateOverride === "paused" || group.stateOverride === "pausing") {
+      return this.controlResult("ok", group);
+    }
+    group.stateOverride = this.hasActiveGroupTask(group.id) ? "pausing" : "paused";
+    group.updatedAt = Date.now();
+    this.processNext();
+    return this.controlResult("ok", group);
+  }
+  resumeGroup(groupId, scope = {}, includeHidden = false) {
+    const access = this.resolveGroupForControl(groupId, scope, includeHidden);
+    if (access.status !== "ok" || !access.record) return this.controlResult(access.status, access.record);
+    const group = access.record;
+    if (this.systemPause) return this.controlResult("blocked", group);
+    if (this.userPaused) this.userPaused = false;
+    if (group.stateOverride === "cancelling" || group.stateOverride === "cancelled") {
+      return this.controlResult("terminal", group);
+    }
+    group.stateOverride = void 0;
+    group.updatedAt = Date.now();
+    this.processNext();
+    return this.controlResult("ok", group);
+  }
+  cancelGroup(groupId, scope = {}, reason = "\u7528\u6237\u53D6\u6D88\u4EFB\u52A1", includeHidden = false) {
+    const access = this.resolveGroupForControl(groupId, scope, includeHidden);
+    if (access.status === "terminal" && access.record?.stateOverride === "cancelled") {
+      return this.controlResult("ok", access.record);
+    }
+    if (access.status !== "ok" || !access.record) return this.controlResult(access.status, access.record);
+    const group = access.record;
+    if (group.stateOverride === "cancelled" || group.stateOverride === "cancelling") {
+      return this.controlResult("ok", group);
+    }
+    if (this.snapshotGroup(group).state === "completed") return this.controlResult("terminal", group);
+    group.stateOverride = "cancelling";
+    if (this.userPaused) this.userPaused = false;
+    group.updatedAt = Date.now();
+    const removed = [];
+    this.queue = this.queue.filter((task) => {
+      if (task.groupId !== group.id) return true;
+      removed.push(task);
+      return false;
+    });
+    for (const task of removed) this.settlePendingCancellation(task, reason);
+    for (const task of this.active) {
+      if (task.groupId === group.id && !task.abortController.signal.aborted) {
+        task.error = reason;
+        task.abortController.abort(reason);
+      }
+    }
+    if (!this.hasActiveGroupTask(group.id)) group.stateOverride = "cancelled";
+    this.processNext();
+    return this.controlResult("ok", group);
+  }
+  pauseAll(reason = "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217", origin = "user") {
+    if (origin === "system") {
+      return this.pauseForDiskPressure(reason);
+    } else {
+      this.userPaused = true;
+    }
+    return this.counts();
+  }
+  resumeAll(origin = "user") {
+    if (origin === "system") {
+      return this.resumeFromDiskPressure();
+    } else {
+      this.userPaused = false;
+    }
+    this.processNext();
+    return this.counts();
+  }
+  pause() {
+    return this.pauseAll("\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217", "user");
+  }
+  resume() {
+    return this.resumeAll("user");
+  }
+  acquireDiskPressureBlocker(blockerId, reason, recheckMs) {
+    const id = blockerId.trim();
+    if (!id) throw new Error("\u78C1\u76D8\u4FDD\u62A4 blocker ID \u4E0D\u80FD\u4E3A\u7A7A");
+    this.diskPressureBlockers.set(id, { reason, recheckMs });
+    this.refreshDiskPressurePause();
+    return this.counts();
+  }
+  releaseDiskPressureBlocker(blockerId) {
+    this.diskPressureBlockers.delete(blockerId.trim());
+    this.refreshDiskPressurePause();
+    if (!this.systemPause) this.processNext();
+    return this.counts();
+  }
+  pauseForDiskPressure(reason, recheckMs) {
+    return this.acquireDiskPressureBlocker("__legacy_disk_pressure__", reason, recheckMs);
+  }
+  resumeFromDiskPressure() {
+    return this.releaseDiskPressureBlocker("__legacy_disk_pressure__");
+  }
+  cancel(selector, reason = "\u7528\u6237\u53D6\u6D88\u4EFB\u52A1") {
+    const normalized = selector?.trim();
+    if (!normalized || normalized === "all") return this.forceStopAll(reason);
+    const group = this.findGroup(normalized);
+    if (group) {
+      const active2 = this.active.filter((task) => task.groupId === group.id).length;
+      const pending2 = this.queue.filter((task) => task.groupId === group.id).length;
+      this.cancelGroup(group.id, {}, reason);
+      return { active: active2, pending: pending2, total: active2 + pending2 };
+    }
+    const pendingIndex = this.queue.findIndex((task, index) => task.id.startsWith(normalized) || String(index + 1) === normalized || task.fileName.includes(normalized));
+    let pending = 0;
+    if (pendingIndex >= 0) {
+      const [task] = this.queue.splice(pendingIndex, 1);
+      this.settlePendingCancellation(task, reason);
+      pending = 1;
+    }
+    let active = 0;
+    for (const task of this.active) {
+      if (task.id.startsWith(normalized) || task.fileName.includes(normalized)) {
+        task.error = reason;
+        if (!task.abortController.signal.aborted) task.abortController.abort(reason);
+        active += 1;
+      }
+    }
+    this.processNext();
+    return { active, pending, total: active + pending };
+  }
+  async retryFailed(limit = 10, scope = {}, groupId) {
+    const failed = this.history.filter((task) => task.status === "failed").filter((task) => !groupId || task.groupId === groupId).filter((task) => {
+      const group = this.groups.get(task.groupId);
+      return Boolean(group && this.matchesScope(group, scope));
+    }).slice(0, Math.max(1, limit));
+    let retried = 0;
+    for (const task of failed) {
+      const group = this.groups.get(task.groupId);
+      if (!group || group.stateOverride === "cancelled" || group.stateOverride === "cancelling") continue;
+      group.failed = Math.max(0, group.failed - 1);
+      this.removeHistoryTask(task);
+      void this.add(task.groupId, task.fileName, task.rawExecute, task.totalSize || 0, task.onPendingCancelled).catch((error) => console.error(`[Queue] retry failed: ${task.fileName}`, error));
+      retried += 1;
+    }
+    return { retried };
+  }
+  cancelScope(scope, reason = "\u7528\u6237\u53D6\u6D88\u5F53\u524D\u804A\u5929\u4EFB\u52A1") {
+    let active = 0;
+    let pending = 0;
+    const groupIds = Array.from(this.groups.values()).filter((group) => this.matchesScope(group, scope)).map((group) => group.id);
+    for (const groupId of groupIds) {
+      const result = this.cancelGroup(groupId, scope, reason, true);
+      if (result.status !== "ok") continue;
+      active += result.active;
+      pending += result.pending;
+    }
+    if (this.userPaused) this.userPaused = false;
+    this.processNext();
+    return { active, pending, total: active + pending };
+  }
+  forceStopAll(reason = "\u7528\u6237\u5F3A\u5236\u505C\u6B62") {
+    const active = this.active.length;
+    const pending = this.queue.length;
+    const touchedGroups = new Set([...this.active, ...this.queue].map((task) => task.groupId));
+    const removed = this.queue.splice(0);
+    for (const task of removed) this.settlePendingCancellation(task, reason);
+    for (const task of this.active) {
+      task.error = reason;
+      if (!task.abortController.signal.aborted) task.abortController.abort(reason);
+    }
+    for (const groupId of touchedGroups) {
+      const group = this.groups.get(groupId);
+      if (!group) continue;
+      group.stateOverride = this.hasActiveGroupTask(groupId) ? "cancelling" : "cancelled";
+      group.updatedAt = Date.now();
+    }
+    return { active, pending, total: active + pending };
+  }
+  processNext() {
+    while (!this.isGloballyPaused() && this.active.length < this.maxConcurrent && this.queue.length > 0) {
+      const runnableIndex = this.queue.findIndex((task2) => {
+        const group = this.groups.get(task2.groupId);
+        return group && !["pausing", "paused", "cancelling", "cancelled"].includes(group.stateOverride || "");
+      });
+      if (runnableIndex < 0) break;
+      const [task] = this.queue.splice(runnableIndex, 1);
+      if (!task) break;
+      void task.execute();
+    }
+  }
+  settlePendingCancellation(task, reason) {
+    task.status = "cancelled";
+    task.error = reason;
+    task.endTime = Date.now();
+    const group = this.groups.get(task.groupId);
+    if (group) {
+      group.cancelled += 1;
+      group.updatedAt = task.endTime;
+    }
+    task.settleCancelled?.();
+    if (task.onPendingCancelled) {
+      void Promise.resolve(task.onPendingCancelled()).catch((error) => {
+        console.error(`[Queue] pending cancellation callback failed: ${task.fileName}`, error);
+      });
+    }
+    this.pushHistory(task);
+  }
+  removeHistoryTask(task) {
+    const index = this.history.indexOf(task);
+    if (index >= 0) this.history.splice(index, 1);
+  }
+  pruneTerminalGroups() {
+    if (this.groups.size <= 500) return;
+    const terminal = Array.from(this.groups.values()).filter((group) => ["completed", "cancelled"].includes(this.snapshotGroup(group).state)).sort((a, b) => a.updatedAt - b.updatedAt);
+    for (const group of terminal.slice(0, Math.max(0, this.groups.size - 500))) {
+      this.groups.delete(group.id);
+    }
+  }
+  pushHistory(task) {
+    this.removeHistoryTask(task);
+    this.history.unshift(task);
+    if (this.history.length > this.maxHistory) this.history.splice(this.maxHistory);
+    this.pruneTerminalGroups();
+  }
+  publicTask(task) {
+    return {
+      id: task.id,
+      groupId: task.groupId,
+      fileName: task.fileName,
+      status: task.status,
+      error: task.error,
+      startTime: task.startTime,
+      endTime: task.endTime,
+      totalSize: task.totalSize,
+      downloadedSize: task.downloadedSize
+    };
+  }
+  countGroupFiles(groupId) {
+    return this.queue.filter((task) => task.groupId === groupId).length + this.active.filter((task) => task.groupId === groupId).length;
+  }
+  hasActiveGroupTask(groupId) {
+    return this.active.some((task) => task.groupId === groupId);
+  }
+  counts() {
+    return {
+      active: this.active.length,
+      pending: this.queue.length,
+      total: this.active.length + this.queue.length
+    };
+  }
+  refreshDiskPressurePause() {
+    if (this.diskPressureBlockers.size === 0) {
+      this.systemPause = void 0;
+      return;
+    }
+    const blockers = Array.from(this.diskPressureBlockers.values());
+    const latest = blockers[blockers.length - 1];
+    const recheckValues = blockers.map((blocker) => blocker.recheckMs).filter((value) => typeof value === "number" && value > 0);
+    this.systemPause = {
+      kind: "disk_pressure",
+      reason: latest?.reason || "\u78C1\u76D8\u7A7A\u95F4\u4FDD\u62A4",
+      autoResume: true,
+      recheckMs: recheckValues.length > 0 ? Math.min(...recheckValues) : void 0,
+      blockerCount: blockers.length
+    };
+  }
+  isGloballyPaused() {
+    return this.userPaused || Boolean(this.systemPause);
+  }
+  getPauseReason() {
+    if (this.systemPause) return this.systemPause.reason;
+    if (this.userPaused) return "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217";
+    return void 0;
+  }
+  snapshotForDisplay(group) {
+    const snapshot = this.snapshotGroup(group);
+    if (this.isGloballyPaused() && snapshot.state === "waiting") snapshot.state = "paused";
+    snapshot.reason = this.systemPause ? this.systemPause.reason : this.userPaused ? "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : snapshot.reason;
+    snapshot.systemPause = this.systemPause;
+    return snapshot;
+  }
+  snapshotGroup(group) {
+    const activeTasks = this.active.filter((task) => task.groupId === group.id);
+    const pendingTasks = this.queue.filter((task) => task.groupId === group.id);
+    const settled = group.completed + group.failed + group.cancelled;
+    const total = Math.max(group.expectedTotal, activeTasks.length + pendingTasks.length + settled);
+    let state;
+    if (group.stateOverride) {
+      state = group.stateOverride;
+    } else if (activeTasks.length > 0) {
+      state = "running";
+    } else if (pendingTasks.length > 0 || settled < total) {
+      state = "waiting";
+    } else {
+      state = "completed";
+    }
+    if (this.isGloballyPaused() && state === "waiting" && pendingTasks.length > 0) {
+      state = "paused";
+    }
+    return {
+      id: group.id,
+      kind: group.kind,
+      title: group.title,
+      chatId: group.chatId,
+      userId: group.userId,
+      source: group.source,
+      targetFolder: group.targetFolder,
+      expectedTotal: group.expectedTotal,
+      hidden: group.hidden,
+      state,
+      total,
+      active: activeTasks.length,
+      pending: pendingTasks.length,
+      completed: group.completed,
+      failed: group.failed,
+      cancelled: group.cancelled,
+      currentFileName: activeTasks[0]?.fileName,
+      reason: this.systemPause ? this.systemPause.reason : this.userPaused && state === "paused" ? "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : void 0,
+      systemPause: this.systemPause,
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt
+    };
+  }
+  findGroup(selector) {
+    const exact = this.groups.get(selector);
+    if (exact) return exact;
+    const matches = this.findGroupMatches(selector);
+    return matches.length === 1 ? matches[0] : void 0;
+  }
+  findGroupMatches(selector) {
+    return Array.from(this.groups.values()).filter((group) => group.id.startsWith(selector));
+  }
+  matchesScope(group, scope) {
+    if (scope.chatId !== void 0 && group.chatId !== scope.chatId) return false;
+    if (scope.userId !== void 0 && group.userId !== scope.userId) return false;
+    return true;
+  }
+  resolveGroupForControl(groupId, scope, includeHidden = false) {
+    const exact = this.groups.get(groupId);
+    const visibleCandidates = (exact ? [exact] : this.findGroupMatches(groupId)).filter((group2) => includeHidden || !group2.hidden);
+    if (visibleCandidates.length === 0) return { status: "not_found" };
+    const candidates = visibleCandidates.filter((group2) => this.matchesScope(group2, scope));
+    if (candidates.length === 0) return { status: "forbidden", record: visibleCandidates.length === 1 ? visibleCandidates[0] : void 0 };
+    if (candidates.length !== 1) return { status: "not_found" };
+    const group = candidates[0];
+    const state = this.snapshotGroup(group).state;
+    if (state === "completed" || state === "cancelled") {
+      if (!this.history.some((task) => task.groupId === group.id && task.status === "failed")) this.groups.delete(group.id);
+      return { status: "terminal", record: group };
+    }
+    return { status: "ok", record: group };
+  }
+  controlResult(status, group) {
+    return {
+      status,
+      group: group ? this.snapshotGroup(group) : void 0,
+      active: group ? this.active.filter((task) => task.groupId === group.id).length : 0,
+      pending: group ? this.queue.filter((task) => task.groupId === group.id).length : 0
+    };
+  }
+};
+
 // src/services/telegramUpload.ts
 var UPLOAD_DIR = process.env.UPLOAD_DIR || "./data/uploads";
 var DEFAULT_TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TELEGRAM_DOWNLOAD_WORKERS || "4", 10) || 4));
@@ -3602,16 +4366,18 @@ var TG_LARGE_TASK_REFRESH_INTERVAL_MS = Math.max(3e3, parseInt(process.env.TG_LA
 var TG_DISK_WATERMARK_RECHECK_MS = Math.max(5e3, parseInt(process.env.TG_DISK_WATERMARK_RECHECK_MS || "30000", 10) || 3e4);
 var TG_DISK_WATERMARK_MAX_WAIT_MS = Math.max(0, parseInt(process.env.TG_DISK_WATERMARK_MAX_WAIT_MS || "0", 10) || 0);
 var TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE = Math.max(1, parseInt(process.env.TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE || "50", 10) || 50);
+var MEDIA_GROUP_DEBOUNCE_MS = 200;
+var MEDIA_GROUP_MAX_WAIT_MS = 1500;
 function normalizeFileDownloadConcurrency(value) {
   const parsed = parseInt(String(value ?? process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY ?? "2"), 10);
   return [1, 2, 3, 4].includes(parsed) ? parsed : 2;
 }
-var TG_DEBUG_LOG_PATH = process.env.TG_STATUS_DEBUG_LOG || path10.join(process.cwd(), "data", "logs", "tg_silent_debug.log");
+var TG_DEBUG_LOG_PATH = process.env.TG_STATUS_DEBUG_LOG || path11.join(process.cwd(), "data", "logs", "tg_silent_debug.log");
 var TG_DEBUG_LOG_MAX_BYTES = Math.max(1024 * 1024, parseInt(process.env.TG_DEBUG_LOG_MAX_MB || "5", 10) * 1024 * 1024);
 function appendTelegramDebugLog(line) {
   if (process.env.TG_STATUS_DEBUG !== "1") return;
   try {
-    fs7.mkdirSync(path10.dirname(TG_DEBUG_LOG_PATH), { recursive: true });
+    fs7.mkdirSync(path11.dirname(TG_DEBUG_LOG_PATH), { recursive: true });
     if (fs7.existsSync(TG_DEBUG_LOG_PATH) && fs7.statSync(TG_DEBUG_LOG_PATH).size > TG_DEBUG_LOG_MAX_BYTES) {
       fs7.renameSync(TG_DEBUG_LOG_PATH, `${TG_DEBUG_LOG_PATH}.${Date.now()}.old`);
     }
@@ -3638,7 +4404,7 @@ async function getFirstUserVisibleMediaMessage(userClient2, sourceEntity, source
     return void 0;
   }
 }
-async function resolveDownloadSource(botClient, message) {
+async function resolveDownloadSource(botClient, message, forwardedSourceCache) {
   const activeUserClient = getTelegramUserClient();
   if (activeUserClient && botClient === activeUserClient) {
     return { client: botClient, message };
@@ -3650,6 +4416,11 @@ async function resolveDownloadSource(botClient, message) {
   const userClient2 = getTelegramUserClient();
   if (!userClient2 || !isTelegramUserClientReady()) {
     throw new Error("Telegram \u7528\u6237\u8D26\u53F7\u4E0B\u8F7D\u5DF2\u5F00\u542F\uFF0C\u4F46 user session \u672A\u5C31\u7EEA");
+  }
+  const cachedForwardedSourceMessage = getForwardedSourceLookup(forwardedSourceCache, message);
+  if (cachedForwardedSourceMessage) {
+    console.log(`\u{1F916} \u4F7F\u7528\u6279\u91CF\u9884\u53D6\u7684\u8F6C\u53D1\u6765\u6E90\u5A92\u4F53: msg=${cachedForwardedSourceMessage.id}`);
+    return { client: userClient2, message: cachedForwardedSourceMessage };
   }
   const fwdFrom = message.fwdFrom;
   const forwardedSourcePeer = fwdFrom?.savedFromPeer || fwdFrom?.fromId;
@@ -3673,35 +4444,77 @@ async function resolveDownloadSource(botClient, message) {
   console.warn("\u{1F916} \u7528\u6237\u8D26\u53F7\u65E0\u6CD5\u8BFB\u53D6\u8BE5\u5A92\u4F53\u6D88\u606F\uFF0C\u56DE\u9000\u5230 bot \u4F1A\u8BDD\u4E0B\u8F7D\uFF1B\u5927\u4E8E bot \u9650\u5236\u7684\u6587\u4EF6\u53EF\u80FD\u4ECD\u4F1A\u5931\u8D25\u3002");
   return { client: botClient, message };
 }
-async function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function getMessageCaptionFirstLine(message) {
+  return String(message.message || message.text || message.caption || "").split(/\r?\n/)[0].trim();
+}
+function rebuildGeneratedTelegramDisplayName(message, currentFileName, mimeType, sharedCaption, sequenceNumber) {
+  return resolveTelegramGeneratedFileName({
+    currentFileName,
+    mimeType,
+    caption: getMessageCaptionFirstLine(message),
+    sharedCaption,
+    messageId: message.id,
+    sequenceNumber
+  });
+}
+async function getCanonicalTelegramFileName(message, currentFileName, mimeType, sharedCaption, sequenceNumber, generatedName = true) {
+  if (!generatedName) return currentFileName;
+  return rebuildGeneratedTelegramDisplayName(message, currentFileName, mimeType, sharedCaption, sequenceNumber);
 }
 async function getDiskWatermarkState(requiredBytes = 0) {
   const statfs = await fs7.promises.statfs(UPLOAD_DIR);
   const availableBytes = Number(statfs.bavail) * Number(statfs.bsize);
   return { availableBytes, ok: availableBytes - requiredBytes >= TG_MIN_FREE_DISK_BYTES };
 }
-async function waitForDiskWatermark(requiredBytes = 0) {
+async function waitForDiskWatermark(requiredBytes = 0, signal) {
   const startedAt = Date.now();
+  const blockerId = crypto7.randomUUID();
   let announcedPause = false;
-  while (true) {
-    const { availableBytes, ok } = await getDiskWatermarkState(requiredBytes);
-    if (ok) {
-      if (announcedPause) {
-        const stats = downloadQueue.resumeFromDiskPressure();
-        console.log(`[Queue] \u{1F4A7} \u78C1\u76D8\u6C34\u4F4D\u6062\u590D\uFF0C\u7EE7\u7EED\u4E0B\u8F7D\u961F\u5217: active=${stats.active}, pending=${stats.pending}`);
+  try {
+    while (true) {
+      if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
+      const { availableBytes, ok } = await getDiskWatermarkState(requiredBytes);
+      if (ok) {
+        if (announcedPause) {
+          const stats = downloadQueue.releaseDiskPressureBlocker(blockerId);
+          console.log(`[Queue] \u{1F4A7} \u78C1\u76D8\u6C34\u4F4D\u6062\u590D\uFF0C\u7EE7\u7EED\u4E0B\u8F7D\u961F\u5217: active=${stats.active}, pending=${stats.pending}`);
+        }
+        return;
       }
-      return;
+      if (!announcedPause) {
+        const stats = downloadQueue.acquireDiskPressureBlocker(
+          blockerId,
+          `\u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF1A\u53EF\u7528 ${formatBytes(availableBytes)}\uFF0C\u5F53\u524D\u6587\u4EF6\u9884\u8BA1\u8FD8\u9700 ${formatBytes(requiredBytes)}\uFF0C\u7CFB\u7EDF\u9700\u4FDD\u7559 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`,
+          TG_DISK_WATERMARK_RECHECK_MS
+        );
+        console.warn(`[Queue] \u{1F4A7} \u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217: active=${stats.active}, pending=${stats.pending}, available=${formatBytes(availableBytes)}, required=${formatBytes(requiredBytes)}, reserve=${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
+        announcedPause = true;
+      }
+      if (TG_DISK_WATERMARK_MAX_WAIT_MS > 0 && Date.now() - startedAt >= TG_DISK_WATERMARK_MAX_WAIT_MS) {
+        throw new Error(`\u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217\u540E\u7B49\u5F85\u8D85\u65F6\uFF1A\u53EF\u7528 ${formatBytes(availableBytes)}\uFF0C\u9884\u8BA1\u8FD8\u9700 ${formatBytes(requiredBytes)}\uFF0C\u9700\u4FDD\u7559 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
+      }
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, TG_DISK_WATERMARK_RECHECK_MS);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62"));
+        };
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
     }
-    if (!announcedPause) {
-      const stats = downloadQueue.pauseForDiskPressure(`\u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217\uFF1A\u53EF\u7528 ${formatBytes(availableBytes)}\uFF0C\u9884\u8BA1\u8FD8\u9700 ${formatBytes(requiredBytes)}\uFF0C\u9700\u4FDD\u7559 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
-      console.warn(`[Queue] \u{1F4A7} \u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217: active=${stats.active}, pending=${stats.pending}, available=${formatBytes(availableBytes)}, required=${formatBytes(requiredBytes)}, reserve=${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
-      announcedPause = true;
+  } finally {
+    if (announcedPause) {
+      const stats = downloadQueue.releaseDiskPressureBlocker(blockerId);
+      const exitReason = signal?.aborted ? "\u7B49\u5F85\u4EFB\u52A1\u5DF2\u53D6\u6D88" : "\u78C1\u76D8\u7B49\u5F85\u5DF2\u7ED3\u675F";
+      console.log(`[Queue] \u{1F4A7} ${exitReason}\uFF0C\u91CA\u653E\u672C\u4EFB\u52A1\u78C1\u76D8\u4FDD\u62A4: active=${stats.active}, pending=${stats.pending}`);
     }
-    if (TG_DISK_WATERMARK_MAX_WAIT_MS > 0 && Date.now() - startedAt >= TG_DISK_WATERMARK_MAX_WAIT_MS) {
-      throw new Error(`\u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217\u540E\u7B49\u5F85\u8D85\u65F6\uFF1A\u53EF\u7528 ${formatBytes(availableBytes)}\uFF0C\u9884\u8BA1\u8FD8\u9700 ${formatBytes(requiredBytes)}\uFF0C\u9700\u4FDD\u7559 ${formatBytes(TG_MIN_FREE_DISK_BYTES)}`);
-    }
-    await sleep(TG_DISK_WATERMARK_RECHECK_MS);
   }
 }
 function shouldRefreshLargeTaskStatus(lastStatusRefresh, completed, force = false) {
@@ -3775,16 +4588,40 @@ async function ensureSilentNotice(client2, chatId, fileCount, replyToMsg) {
     }
     if (silentNoticeMessageIdMap.get(chatIdStr)) return;
   }
-  const queueStats = getDownloadQueueStats();
-  const text = buildSilentModeNotice(fileCount, getSessionTaskId(chatIdStr), queueStats.paused, queueStats.pauseReason);
+  const initialCardState = getDownloadTaskCardState(chatIdStr);
+  const text = buildSilentModeNotice(
+    fileCount,
+    getSessionTaskId(chatIdStr),
+    initialCardState.paused || initialCardState.pausing,
+    initialCardState.reason,
+    initialCardState.systemPause
+  );
   const sendPromise = (async () => {
     let sMsg;
     if (replyToMsg) {
-      sMsg = await safeReply(replyToMsg, { message: text, buttons: buildTaskControlButtons(getSessionTaskId(chatIdStr)) });
+      sMsg = await safeReply(replyToMsg, {
+        message: text,
+        buttons: buildTaskControlButtons(
+          getSessionTaskId(chatIdStr),
+          initialCardState.paused,
+          initialCardState.systemPause,
+          initialCardState.pausing,
+          initialCardState.userPaused
+        )
+      });
     }
     if (!sMsg) {
       try {
-        sMsg = await client2.sendMessage(chatId, { message: text, buttons: buildTaskControlButtons(getSessionTaskId(chatIdStr)) });
+        sMsg = await client2.sendMessage(chatId, {
+          message: text,
+          buttons: buildTaskControlButtons(
+            getSessionTaskId(chatIdStr),
+            initialCardState.paused,
+            initialCardState.systemPause,
+            initialCardState.pausing,
+            initialCardState.userPaused
+          )
+        });
       } catch (e) {
         console.error(`[TG][silent] notice-send-failed chat=${chatIdStr}:`, e);
       }
@@ -3824,189 +4661,9 @@ async function safeReply(message, params) {
     return null;
   }
 }
-var BetterDownloadQueue = class {
-  queue = [];
-  active = [];
-  history = [];
-  maxHistory = 50;
-  maxConcurrent = normalizeFileDownloadConcurrency(process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY);
-  paused = false;
-  diskPressurePaused = false;
-  diskPressureReason;
-  async add(fileName, execute, totalSize = 0) {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    return new Promise((resolve, reject) => {
-      const abortController = new AbortController();
-      const task = {
-        id,
-        fileName,
-        status: "pending",
-        abortController,
-        totalSize,
-        downloadedSize: 0,
-        rawExecute: execute,
-        settleCancelled: () => resolve(),
-        // The actual execution logic
-        execute: async () => {
-          task.status = "active";
-          task.startTime = Date.now();
-          this.active.push(task);
-          try {
-            await execute(abortController.signal);
-            task.status = abortController.signal.aborted ? "cancelled" : "success";
-            resolve();
-          } catch (error) {
-            task.status = abortController.signal.aborted ? "cancelled" : "failed";
-            task.error = error instanceof Error ? error.message : String(error);
-            if (abortController.signal.aborted) {
-              resolve();
-            } else {
-              reject(error);
-            }
-          } finally {
-            task.endTime = Date.now();
-            const idx = this.active.findIndex((t) => t.id === id);
-            if (idx !== -1) this.active.splice(idx, 1);
-            this.history.unshift(task);
-            if (this.history.length > this.maxHistory) this.history.pop();
-            this.processNext();
-          }
-        }
-      };
-      this.queue.push(task);
-      console.log(`[Queue] \u{1F4E5} Task added: ${fileName}. Queue size: ${this.queue.length}`);
-      this.processNext();
-    });
-  }
-  processNext() {
-    while (!this.paused && this.active.length < this.maxConcurrent && this.queue.length > 0) {
-      const task = this.queue.shift();
-      if (task) {
-        console.log(`[Queue] \u{1F680} Processing task: ${task.fileName}. Active: ${this.active.length + 1}, Pending: ${this.queue.length}`);
-        task.execute();
-      }
-    }
-  }
-  getStats() {
-    return {
-      active: this.active.length,
-      pending: this.queue.length,
-      total: this.active.length + this.queue.length,
-      maxConcurrent: this.maxConcurrent,
-      paused: this.paused,
-      diskPressurePaused: this.diskPressurePaused,
-      diskPressureReason: this.diskPressureReason,
-      pauseReason: this.diskPressureReason || (this.paused ? "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : void 0)
-    };
-  }
-  getDetailedStatus() {
-    return {
-      active: [...this.active],
-      pending: [...this.queue],
-      history: [...this.history],
-      maxConcurrent: this.maxConcurrent,
-      paused: this.paused,
-      diskPressurePaused: this.diskPressurePaused,
-      diskPressureReason: this.diskPressureReason,
-      pauseReason: this.diskPressureReason || (this.paused ? "\u7528\u6237\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : void 0)
-    };
-  }
-  // Update progress method
-  updateProgress(taskId, downloaded) {
-    const task = this.active.find((t) => t.id === taskId);
-    if (task) {
-      task.downloadedSize = downloaded;
-    }
-  }
-  getMaxConcurrent() {
-    return this.maxConcurrent;
-  }
-  setMaxConcurrent(value) {
-    this.maxConcurrent = normalizeFileDownloadConcurrency(value);
-    this.processNext();
-    return this.maxConcurrent;
-  }
-  pause() {
-    this.paused = true;
-    return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
-  }
-  pauseForDiskPressure(reason) {
-    this.diskPressurePaused = true;
-    this.diskPressureReason = reason;
-    this.paused = true;
-    return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
-  }
-  resume() {
-    this.diskPressurePaused = false;
-    this.diskPressureReason = void 0;
-    this.paused = false;
-    this.processNext();
-    return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
-  }
-  resumeFromDiskPressure() {
-    if (!this.diskPressurePaused) {
-      return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
-    }
-    this.diskPressurePaused = false;
-    this.diskPressureReason = void 0;
-    this.paused = false;
-    this.processNext();
-    return { active: this.active.length, pending: this.queue.length, total: this.active.length + this.queue.length };
-  }
-  cancel(selector, reason = "\u7528\u6237\u53D6\u6D88\u4EFB\u52A1") {
-    const normalized = selector?.trim();
-    if (!normalized || normalized === "all") return this.forceStopAll(reason);
-    let cancelledPending = 0;
-    const pendingIndex = this.queue.findIndex((task, index) => task.id.startsWith(normalized) || String(index + 1) === normalized || task.fileName.includes(normalized));
-    if (pendingIndex >= 0) {
-      const [task] = this.queue.splice(pendingIndex, 1);
-      task.status = "cancelled";
-      task.error = reason;
-      task.endTime = Date.now();
-      task.settleCancelled?.();
-      this.history.unshift(task);
-      cancelledPending = 1;
-    }
-    let cancelledActive = 0;
-    for (const task of this.active) {
-      if (task.id.startsWith(normalized) || task.fileName.includes(normalized)) {
-        task.error = reason;
-        task.abortController.abort(reason);
-        cancelledActive += 1;
-      }
-    }
-    if (this.history.length > this.maxHistory) this.history.splice(this.maxHistory);
-    return { active: cancelledActive, pending: cancelledPending, total: cancelledActive + cancelledPending };
-  }
-  async retryFailed(limit = 10) {
-    const failed = this.history.filter((task) => task.status === "failed").slice(0, Math.max(1, limit));
-    let retried = 0;
-    for (const task of failed) {
-      this.add(task.fileName, task.rawExecute, task.totalSize || 0).catch((err) => console.error(`[Queue] retry failed: ${task.fileName}`, err));
-      retried += 1;
-    }
-    return { retried };
-  }
-  forceStopAll(reason = "\u7528\u6237\u5F3A\u5236\u505C\u6B62") {
-    const pending = this.queue.splice(0);
-    for (const task of pending) {
-      task.status = "cancelled";
-      task.error = reason;
-      task.endTime = Date.now();
-      task.settleCancelled?.();
-      this.history.unshift(task);
-    }
-    for (const task of this.active) {
-      task.error = reason;
-      task.abortController.abort(reason);
-    }
-    if (this.history.length > this.maxHistory) {
-      this.history.splice(this.maxHistory);
-    }
-    return { active: this.active.length, pending: pending.length, total: this.active.length + pending.length };
-  }
-};
-var downloadQueue = new BetterDownloadQueue();
+var downloadQueue = new DownloadTaskQueue({
+  maxConcurrent: normalizeFileDownloadConcurrency(process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY)
+});
 var statusActionLocks = /* @__PURE__ */ new Map();
 var lastSilentNotificationTimeMap = /* @__PURE__ */ new Map();
 async function runStatusAction(chatId, action) {
@@ -4099,7 +4756,10 @@ async function finalizeSilentSessionIfDone(client2, chatId) {
         }))
       ]
     );
-    const controls = s?.failed ? buildTaskControlButtons(s?.taskId) : void 0;
+    const controls = s?.failed ? (() => {
+      const queueStats = getDownloadQueueStats();
+      return buildTaskControlButtons(s?.taskId, queueStats.paused, queueStats.systemPause);
+    })() : void 0;
     const edited = await safeEditMessage(client2, chatId, { message: silentMsgId, text, buttons: controls });
     if (!edited) {
       try {
@@ -4340,7 +5000,7 @@ function syncSilentSessionTotals(chatIdStr) {
   session.failed = Math.max(session.failed, transferSession.failed);
   return session;
 }
-async function refreshSilentProgress(client2, chatId) {
+async function refreshSilentProgress(client2, chatId, userId, pauseHint) {
   const chatIdStr = chatId.toString();
   if (!silentSessionMap.has(chatIdStr)) return;
   const silentMsgId = silentNoticeMessageIdMap.get(chatIdStr);
@@ -4354,7 +5014,12 @@ async function refreshSilentProgress(client2, chatId) {
   const totalFiles = Math.max(session.total, totalBatchFiles + files.length, completedBatchFiles + completedSingleFiles, session.completed);
   const completedFiles = Math.max(session.completed, completedBatchFiles + completedSingleFiles);
   const isComplete = totalFiles > 0 && completedFiles >= totalFiles;
-  const queueStats = getDownloadQueueStats();
+  const cardState = getDownloadTaskCardState(chatIdStr, userId);
+  const cardPaused = cardState.paused || Boolean(pauseHint?.paused);
+  const cardPausing = !cardPaused && (cardState.pausing || Boolean(pauseHint?.pausing));
+  const cardPauseReason = cardState.reason || pauseHint?.reason;
+  const cardSystemPause = cardState.systemPause;
+  const cardUserPaused = cardState.userPaused || Boolean(pauseHint?.paused) || Boolean(pauseHint?.pausing);
   const text = buildSilentProgress(
     session.total,
     batches,
@@ -4362,10 +5027,13 @@ async function refreshSilentProgress(client2, chatId) {
     session.completed,
     session.failed,
     session.taskId,
-    queueStats.paused,
-    queueStats.pauseReason
+    cardPaused,
+    cardPauseReason,
+    cardPausing,
+    cardSystemPause
   );
-  const buttons = isComplete && session.failed === 0 ? void 0 : buildTaskControlButtons(session.taskId);
+  const controls = isComplete && session.failed === 0 ? void 0 : buildTaskControlButtons(session.taskId, cardPaused, cardSystemPause, cardPausing, cardUserPaused);
+  const buttons = controls;
   await safeEditMessage(client2, chatId, { message: silentMsgId, text, buttons });
 }
 async function checkAndResetSession(client2, chatId) {
@@ -4436,21 +5104,107 @@ async function loadFileDownloadConcurrencySetting() {
   const value = await getSetting("telegram_file_download_concurrency", process.env.TELEGRAM_FILE_DOWNLOAD_CONCURRENCY || "2");
   return setFileDownloadConcurrency(normalizeFileDownloadConcurrency(value));
 }
-function getTaskStatus() {
-  return downloadQueue.getDetailedStatus();
+function listDownloadTaskGroups(chatId, userId) {
+  return downloadQueue.getSnapshot({ chatId, userId }).groups;
+}
+function getDownloadTaskScopeStatus(chatId, userId) {
+  return downloadQueue.getScopeStatus({ chatId, userId });
+}
+function mergeTaskCardPauseState(queuePaused, queueReason, scopeStatus, queueSystemPause, queueUserPaused = false) {
+  const paused = queuePaused || scopeStatus.paused;
+  const sourceSystemPause = queueSystemPause || scopeStatus.systemPause;
+  const systemPause = sourceSystemPause ? { ...sourceSystemPause } : void 0;
+  const reason = queueReason || scopeStatus.reason;
+  if (systemPause && queueReason) systemPause.reason = queueReason;
+  return {
+    paused,
+    pausing: !paused && scopeStatus.pausing,
+    reason,
+    systemPause,
+    userPaused: scopeStatus.userPaused || queuePaused && queueUserPaused
+  };
+}
+function getDownloadTaskCardState(chatId, userId) {
+  const queueStats = downloadQueue.getStats();
+  const scopeStatus = downloadQueue.getScopeStatus({ chatId, userId });
+  return mergeTaskCardPauseState(queueStats.paused, queueStats.pauseReason, scopeStatus, queueStats.systemPause, queueStats.userPaused);
+}
+function getDownloadTaskGroup(groupId, chatId, userId) {
+  return downloadQueue.getGroup(groupId, { chatId, userId });
+}
+function prioritizeDownloadTaskGroup(groupId, chatId, userId) {
+  return downloadQueue.prioritizeGroup(groupId, { chatId, userId });
+}
+function pauseDownloadTaskGroup(groupId, chatId, userId) {
+  return downloadQueue.pauseGroup(groupId, { chatId, userId });
+}
+function resumeDownloadTaskGroup(groupId, chatId, userId) {
+  return downloadQueue.resumeGroup(groupId, { chatId, userId });
+}
+function cancelDownloadTaskGroup(groupId, chatId, userId) {
+  return downloadQueue.cancelGroup(groupId, { chatId, userId }, "\u7528\u6237\u901A\u8FC7\u4EFB\u52A1\u4E2D\u5FC3\u53D6\u6D88\u4EFB\u52A1");
+}
+function ordinaryGroupId(prefix, chatId, identity) {
+  return `${prefix}${crypto7.createHash("sha256").update(`${chatId}:${identity}`).digest("base64url").slice(0, 22)}`;
+}
+function channelExecutionGroupId(key) {
+  return `j${crypto7.createHash("sha256").update(key).digest("base64url").slice(0, 22)}`;
+}
+function getChannelExecutionGroup(jobId) {
+  return downloadQueue.getGroup(channelExecutionGroupId(jobId), {}, true);
+}
+function prioritizeChannelExecutionGroup(jobId) {
+  return downloadQueue.prioritizeGroup(channelExecutionGroupId(jobId), {});
+}
+function pauseChannelExecutionGroup(jobId) {
+  return downloadQueue.pauseGroup(channelExecutionGroupId(jobId), {}, true);
+}
+function resumeChannelExecutionGroup(jobId) {
+  return downloadQueue.resumeGroup(channelExecutionGroupId(jobId), {}, true);
+}
+function cancelChannelExecutionGroup(jobId) {
+  return downloadQueue.cancelGroup(channelExecutionGroupId(jobId), {}, "\u7528\u6237\u53D6\u6D88\u9891\u9053\u4EFB\u52A1", true);
 }
 function resolveTaskChatIdForControl(taskId) {
   return resolveTaskChatId(taskId);
 }
-function forceStopDownloadTasks(reason) {
-  return downloadQueue.forceStopAll(reason);
+function forceStopDownloadTasksForScope(chatId, userId, reason) {
+  return downloadQueue.cancelScope({ chatId, userId }, reason);
 }
 function pauseDownloadTasks(taskId) {
-  if (taskId && !resolveTaskChatId(taskId)) return { active: 0, pending: 0, total: 0 };
+  if (taskId) {
+    const scope = taskIdControlScopes.get(taskId.trim());
+    if (!scope) return { active: 0, pending: 0, total: 0 };
+    downloadQueue.resumeAll("user");
+    const groups = downloadQueue.getSnapshot(scope).groups;
+    let active = 0;
+    let pending = 0;
+    for (const group of groups) {
+      const result = downloadQueue.pauseGroup(group.id, scope);
+      if (result.status !== "ok") continue;
+      active += result.active;
+      pending += result.pending;
+    }
+    return { active, pending, total: active + pending };
+  }
   return downloadQueue.pause();
 }
 function resumeDownloadTasks(taskId) {
-  if (taskId && !resolveTaskChatId(taskId)) return { active: 0, pending: 0, total: 0 };
+  if (taskId) {
+    const scope = taskIdControlScopes.get(taskId.trim());
+    if (!scope) return { active: 0, pending: 0, total: 0 };
+    downloadQueue.resumeAll("user");
+    const groups = downloadQueue.getSnapshot(scope).groups;
+    let active = 0;
+    let pending = 0;
+    for (const group of groups) {
+      const result = downloadQueue.resumeGroup(group.id, scope);
+      if (result.status !== "ok") continue;
+      active += result.active;
+      pending += result.pending;
+    }
+    return { active, pending, total: active + pending };
+  }
   return downloadQueue.resume();
 }
 function cancelDownloadTask(selector) {
@@ -4496,14 +5250,17 @@ async function cancelSilentTask(client2, chatId, taskId, fallbackMessageId, user
   resetChatTransferSession(chatIdStr);
   return result;
 }
-function retryFailedDownloadTasks(limit = 10, _taskId) {
-  return downloadQueue.retryFailed(limit);
+function retryFailedDownloadTasks(limit = 10, taskId, chatId, userId) {
+  return downloadQueue.retryFailed(limit, { chatId, userId }, taskId);
 }
 var mediaGroupQueues = /* @__PURE__ */ new Map();
-var MEDIA_GROUP_DELAY = 1500;
+var mediaGroupDebouncer = createTelegramMediaGroupDebouncer({
+  delayMs: MEDIA_GROUP_DEBOUNCE_MS,
+  onReady: (mediaGroupId) => processBatchUpload(void 0, mediaGroupId)
+});
 async function downloadAndSaveFile(client2, message, originalFileName, targetDir, onProgress, signal) {
-  const ext = path10.extname(originalFileName) || "";
-  const tempStoredName = `${crypto6.randomUUID()}${ext}`;
+  const ext = path11.extname(originalFileName) || "";
+  const tempStoredName = `${crypto7.randomUUID()}${ext}`;
   let saveDir = targetDir || UPLOAD_DIR;
   if (!fs7.existsSync(saveDir)) {
     try {
@@ -4514,12 +5271,12 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
       saveDir = UPLOAD_DIR;
     }
   }
-  const filePath = path10.join(saveDir, tempStoredName);
+  const filePath = path11.join(saveDir, tempStoredName);
   const totalSize = getEstimatedFileSize(message);
   let downloadedSize = 0;
   try {
     if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
-    await waitForDiskWatermark(totalSize || 0);
+    await waitForDiskWatermark(totalSize || 0, signal);
     const configuredWorkers = await getTelegramDownloadWorkers();
     const media = getDownloadableMedia(message);
     if (!media) {
@@ -4598,15 +5355,62 @@ async function downloadAndSaveFile(client2, message, originalFileName, targetDir
     return null;
   }
 }
-async function processFileUpload(client2, file, queue) {
+async function waitForChannelExecutionPermission(getExecutionControlState, signal) {
+  if (!getExecutionControlState) return "run";
+  while (true) {
+    if (signal.aborted) return "cancelled";
+    const state = await getExecutionControlState();
+    if (state === "run") return "run";
+    if (state === "cancelled") return "cancelled";
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, state === "cooldown" ? 5e3 : 1e3);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }).catch(() => void 0);
+  }
+}
+async function waitForStorageCooldownRetry(initialRetryAt, signal, retry, onWaiting, now = Date.now) {
+  let retryAt = initialRetryAt;
+  while (retryAt && !signal.aborted) {
+    await onWaiting?.(retryAt);
+    while (!signal.aborted && now() < retryAt.getTime()) {
+      await new Promise((resolve) => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, Math.min(3e4, Math.max(1e3, retryAt.getTime() - now())));
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+    if (signal.aborted) return "cancelled";
+    retryAt = await retry();
+  }
+  return signal.aborted ? "cancelled" : "success";
+}
+async function processFileUpload(client2, file, queue, groupId, getExecutionControlState) {
   file.status = "queued";
-  const attemptUpload = async (signal) => {
+  const attemptUpload = async (signal, reportProgress) => {
     let localFilePath;
     let storedName;
     try {
       const activeAccountId = storageManager.getActiveAccountId();
       await assertActiveStorageWritable();
       const chatName = await getTelegramChatName(file.message);
+      file.fileName = await getCanonicalTelegramFileName(file.message, file.fileName, file.mimeType, file.sharedCaption, file.groupIndex, file.generatedName !== false);
+      if (queue?.chatId) {
+        const batchId = file.message.groupedId?.toString();
+        if (batchId) updateBatch(queue.chatId.toString(), batchId, { currentFileName: file.fileName, currentFileActive: true });
+      }
       const batchFolder = null;
       const storageRules = await getStoragePathRules();
       const automaticFolder = buildStorageFolderWithRules({
@@ -4618,8 +5422,8 @@ async function processFileUpload(client2, file, queue) {
       }, storageRules);
       const chatIdForPath = queue?.chatId?.toString() || file.message.chatId?.toString() || "unknown";
       const storageFolder = file.folderOverride !== void 0 ? file.folderOverride : queue?.storageFolder !== void 0 ? queue.storageFolder : resolveTelegramStorageFolder(chatIdForPath, automaticFolder);
-      const downloadSource = await resolveDownloadSource(client2, file.message);
-      const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, file.fileName, file.targetDir, void 0, signal);
+      const downloadSource = await resolveDownloadSource(client2, file.message, file.forwardedSourceCache);
+      const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, file.fileName, file.targetDir, reportProgress, signal);
       if (!result) {
         file.error = "\u4E0B\u8F7D\u5931\u8D25";
         return false;
@@ -4644,9 +5448,11 @@ async function processFileUpload(client2, file, queue) {
           return true;
         }
       }
+      if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
       const provider = storageManager.getProvider();
       const storageLockKey = `${provider.name}:${activeAccountId || "local"}:${storageFolder || ""}`;
       return await withTelegramStorageWriteLock(storageLockKey, async () => {
+        if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         storedName = await getUniqueStoredName(file.fileName, storageFolder, activeAccountId);
         let thumbnailPath = null;
         let dimensions = {};
@@ -4660,6 +5466,8 @@ async function processFileUpload(client2, file, queue) {
         }
         let finalPath = localFilePath;
         let sourceRef = provider.name;
+        const permissionBeforeStore = await waitForChannelExecutionPermission(getExecutionControlState, signal || new AbortController().signal);
+        if (permissionBeforeStore === "cancelled" || signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         try {
           finalPath = await provider.saveFile(localFilePath, storedName, file.mimeType, storageFolder);
           if (fs7.existsSync(localFilePath)) {
@@ -4669,6 +5477,10 @@ async function processFileUpload(client2, file, queue) {
         } catch (err) {
           console.error("\u4FDD\u5B58\u6587\u4EF6\u5230\u5B58\u50A8\u63D0\u4F9B\u5546\u5931\u8D25:", err);
           throw err;
+        }
+        if (signal?.aborted) {
+          await provider.deleteFile(finalPath).catch((error) => console.error(`\u{1F916} \u53D6\u6D88\u4EFB\u52A1\u65F6\u56DE\u6EDA\u5DF2\u4FDD\u5B58\u6587\u4EF6\u5931\u8D25: ${finalPath}`, error));
+          throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         }
         await query(`
                     INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
@@ -4691,6 +5503,13 @@ async function processFileUpload(client2, file, queue) {
         await markStorageAccountCooldown(error.storageAccountId || storageManager.getActiveAccountId(), error.provider, error.reason, error.cooldownUntil, error.message);
         file.storageCooldownUntil = error.cooldownUntil;
         file.error = formatStorageCooldownNotice(error.cooldownUntil);
+        if (localFilePath && fs7.existsSync(localFilePath)) {
+          try {
+            fs7.unlinkSync(localFilePath);
+          } catch {
+          }
+        }
+        throw error;
       } else {
         file.error = error.message;
       }
@@ -4705,55 +5524,106 @@ async function processFileUpload(client2, file, queue) {
       return false;
     }
   };
-  const queueTask = async (signal) => {
-    file.status = "uploading";
-    const firstAttemptSuccess = await attemptUpload(signal);
-    if (!firstAttemptSuccess && !signal.aborted && !file.retried && !file.storageCooldownUntil) {
-      file.retried = true;
+  const queueTask = async (signal, taskId) => {
+    try {
+      const permission = await waitForChannelExecutionPermission(getExecutionControlState, signal);
+      if (permission === "cancelled") {
+        file.status = "failed";
+        file.error = "\u4EFB\u52A1\u5DF2\u53D6\u6D88";
+        return { status: "success" };
+      }
       file.status = "uploading";
-      file.error = void 0;
-      const secondAttemptSuccess = await attemptUpload(signal);
-      if (!secondAttemptSuccess) {
+      const reportProgress = taskId ? (downloaded, total) => downloadQueue.updateProgress(taskId, downloaded, total) : void 0;
+      const firstAttemptSuccess = await attemptUpload(signal, reportProgress);
+      if (!firstAttemptSuccess && !signal.aborted && !file.retried && !file.storageCooldownUntil) {
+        file.retried = true;
+        file.status = "uploading";
+        file.error = void 0;
+        const secondAttemptSuccess = await attemptUpload(signal, reportProgress);
+        if (!secondAttemptSuccess) {
+          file.status = "failed";
+        }
+      } else if (!firstAttemptSuccess) {
         file.status = "failed";
       }
-    } else if (!firstAttemptSuccess) {
-      file.status = "failed";
+      return file.status === "failed" ? { status: "failed", error: file.error || "\u4E0B\u8F7D\u5931\u8D25" } : { status: "success" };
+    } finally {
+      if (queue?.chatId) {
+        const batchId = file.message.groupedId?.toString();
+        if (batchId) updateBatch(queue.chatId.toString(), batchId, { currentFileActive: false, currentFileName: void 0 });
+      }
     }
   };
+  if (file.generatedName !== false) {
+    file.fileName = await getCanonicalTelegramFileName(file.message, file.fileName, file.mimeType, file.sharedCaption, file.groupIndex, true);
+  }
   const taskDisplayName = queue?.folderName ? `${queue.folderName}/${file.fileName}` : file.fileName;
-  return downloadQueue.add(taskDisplayName, queueTask);
+  if (!groupId) throw new Error(`\u4E0B\u8F7D\u4EFB\u52A1\u7F3A\u5C11\u4EFB\u52A1\u7EC4: ${taskDisplayName}`);
+  const onPendingCancelled = () => {
+    file.status = "failed";
+    file.error = "\u7528\u6237\u53D6\u6D88\u4EFB\u52A1";
+  };
+  return downloadQueue.add(groupId, taskDisplayName, queueTask, file.size || 0, onPendingCancelled);
 }
-async function processMediaGroupFilesBounded(client2, queue, onFileSettled) {
-  for (let offset = 0; offset < queue.files.length; offset += TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE) {
-    const batch = queue.files.slice(offset, offset + TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE);
-    await Promise.all(batch.map((file) => processFileUpload(client2, file, queue).finally(onFileSettled)));
-  }
-}
-async function processBatchUpload(client2, mediaGroupId) {
-  const queue = mediaGroupQueues.get(mediaGroupId);
+async function processBatchUpload(client2, queueKey) {
+  const queue = mediaGroupQueues.get(queueKey);
   if (!queue || queue.processingStarted) return;
+  mediaGroupDebouncer.cancel(queueKey);
   queue.processingStarted = true;
-  const firstMessage = queue.files[0]?.message;
-  if (!firstMessage) return;
-  let folderName = "";
-  for (const file of queue.files) {
-    const caption = file.message.message || file.message.text || "";
-    if (caption && caption.trim()) {
-      folderName = caption.split(/\r?\n/)[0].trim();
-      break;
-    }
+  try {
+    await processBatchUploadSnapshot(client2, queueKey, queue);
+  } catch (error) {
+    console.error(`\u{1F916} Telegram \u76F8\u518C\u5904\u7406\u5931\u8D25: group=${queue.mediaGroupId}`, error);
+    queue.processingStarted = false;
+    mediaGroupDebouncer.bump(queueKey);
   }
+}
+async function processBatchUploadSnapshot(client2, queueKey, queue) {
+  const mediaGroupId = queue.mediaGroupId;
+  const batchClient = client2 || queue.client || queue.files[0]?.message?.client;
+  if (!batchClient) throw new Error("Telegram \u76F8\u518C\u7F3A\u5C11\u53EF\u7528\u5BA2\u6237\u7AEF");
+  const snapshot = takePendingMediaGroupSnapshot(queue.files);
+  if (snapshot.length === 0) {
+    mediaGroupQueues.delete(queueKey);
+    return;
+  }
+  const firstMessage = snapshot[0]?.message;
+  if (!firstMessage) throw new Error("Telegram \u76F8\u518C\u6CA1\u6709\u6709\u6548\u5A92\u4F53\u6D88\u606F");
+  annotateTelegramMediaGroup(snapshot);
+  const mediaGroupCaption = snapshot[0]?.sharedCaption || "";
+  let folderName = mediaGroupCaption;
   const chatId = queue.chatId;
   const batchId = mediaGroupId;
+  const groupId = ordinaryGroupId("a", chatId.toString(), queueKey);
   if (!folderName || isOpaqueTelegramIdentifier(folderName)) {
     folderName = await getTelegramBatchFolderName(firstMessage, mediaGroupId);
   }
-  await checkAndResetSession(client2, chatId);
+  downloadQueue.ensureGroup({
+    id: groupId,
+    kind: "album",
+    title: folderName,
+    chatId: chatId.toString(),
+    userId: queue.userId || firstMessage.senderId?.toJSNumber(),
+    targetFolder: queue.storageFolder,
+    expectedTotal: snapshot.length
+  });
+  const sharedCaption = mediaGroupCaption;
+  const activeUserClient = getTelegramUserClient();
+  const shouldPrefetchForwardedSources = activeUserClient && isTelegramUserClientReady() && await getSetting("telegram_user_download_enabled", "false") === "true" && batchClient !== activeUserClient;
+  const forwardedSourceCache = shouldPrefetchForwardedSources ? await prefetchForwardedSourceMessages(activeUserClient, snapshot.map((file) => file.message)) : void 0;
+  if (forwardedSourceCache?.size) {
+    console.log(`\u{1F916} \u6279\u91CF\u9884\u53D6\u8F6C\u53D1\u6765\u6E90\u5A92\u4F53: group=${mediaGroupId} cached=${forwardedSourceCache.size}/${snapshot.length}`);
+  }
+  for (const file of snapshot) {
+    file.sharedCaption = sharedCaption;
+    file.forwardedSourceCache = forwardedSourceCache;
+  }
+  await checkAndResetSession(batchClient, chatId);
   registerBatch(chatId.toString(), batchId, {
     id: batchId,
     folderName,
     folderPath: void 0,
-    totalFiles: queue.files.length,
+    totalFiles: snapshot.length,
     completed: 0,
     successful: 0,
     failed: 0,
@@ -4761,7 +5631,7 @@ async function processBatchUpload(client2, mediaGroupId) {
     queuePending: 0
   });
   const sanitizedFolderName = sanitizeFilename(folderName);
-  const targetDir = path10.join(UPLOAD_DIR, sanitizedFolderName);
+  const targetDir = path11.join(UPLOAD_DIR, sanitizedFolderName);
   if (!fs7.existsSync(targetDir)) {
     fs7.mkdirSync(targetDir, { recursive: true });
   }
@@ -4783,6 +5653,15 @@ async function processBatchUpload(client2, mediaGroupId) {
     }, storageRules);
     const storageFolder = resolveTelegramBatchStorageFolder(chatId.toString(), automaticPreview);
     queue.storageFolder = storageFolder;
+    downloadQueue.ensureGroup({
+      id: groupId,
+      kind: "album",
+      title: queue.folderName || folderName,
+      chatId: chatId.toString(),
+      userId: queue.userId || firstMessage.senderId?.toJSNumber(),
+      targetFolder: storageFolder,
+      expectedTotal: snapshot.length
+    });
     const folderPreview = storageFolder;
     updateBatch(chatId.toString(), batchId, { folderName: queue.folderName, folderPath: folderPreview || void 0 });
     queue.folderPath = folderPreview || void 0;
@@ -4791,29 +5670,30 @@ async function processBatchUpload(client2, mediaGroupId) {
   if (!silentSessionMap.has(chatId.toString())) {
     await runStatusAction(chatId, async () => {
       const stats = downloadQueue.getStats();
-      await refreshConsolidatedMessage(client2, chatId, firstMessage);
+      await refreshConsolidatedMessage(batchClient, chatId, firstMessage);
     });
   }
   const onBatchProgress = async () => {
     const completed = queue.files.filter((f) => f.status === "success" || f.status === "failed").length;
     const successful = queue.files.filter((f) => f.status === "success").length;
     const failed = queue.files.filter((f) => f.status === "failed").length;
-    const currentFile = queue.files.find((f) => f.status === "uploading" || f.status === "queued") || queue.files.find((f) => f.status === "pending");
+    const currentFile = queue.files.find((f) => f.status === "uploading");
     const stats = downloadQueue.getStats();
     updateBatch(chatId.toString(), batchId, {
       completed,
       successful,
       failed,
       queuePending: stats.pending,
-      currentFileName: currentFile?.fileName
+      currentFileName: currentFile?.fileName,
+      currentFileActive: Boolean(currentFile)
     });
     if (silentSessionMap.has(chatId.toString())) {
       await runStatusAction(chatId, async () => {
-        await refreshSilentProgress(client2, chatId);
+        await refreshSilentProgress(batchClient, chatId);
       });
     } else {
       await runStatusAction(chatId, async () => {
-        await refreshConsolidatedMessage(client2, chatId);
+        await refreshConsolidatedMessage(batchClient, chatId);
       });
     }
   };
@@ -4825,7 +5705,7 @@ async function processBatchUpload(client2, mediaGroupId) {
       const failedFiles = getConsolidatedFiles(chatIdStr).filter((f) => f.phase === "failed").length;
       const failedBatches = getConsolidatedBatches(chatIdStr).reduce((sum, b) => sum + (b.failed || 0), 0);
       sess.failed = Math.max(sess.failed, failedFiles + failedBatches);
-      await finalizeSilentSessionIfDone(client2, chatId);
+      await finalizeSilentSessionIfDone(batchClient, chatId);
     }
   };
   let lastTime = 0;
@@ -4835,16 +5715,33 @@ async function processBatchUpload(client2, mediaGroupId) {
     lastTime = now;
     await onBatchProgress();
   }, 3e3);
+  const queuedFilePromises = [];
   try {
-    await processMediaGroupFilesBounded(client2, queue, refreshBatchProgressAndFinalizeSilent);
+    for (let offset = 0; offset < snapshot.length; offset += TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE) {
+      const files = snapshot.slice(offset, offset + TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE);
+      for (const file of files) {
+        file.targetDir = targetDir;
+        file.forwardedSourceCache = forwardedSourceCache;
+        queuedFilePromises.push(
+          processFileUpload(batchClient, file, queue, groupId).finally(refreshBatchProgressAndFinalizeSilent)
+        );
+      }
+    }
+    updateBatch(chatId.toString(), batchId, { totalFiles: snapshot.length });
+    await Promise.allSettled(queuedFilePromises);
     await onBatchProgress();
-    await finalizeSilentSessionIfDone(client2, chatId);
+    await finalizeSilentSessionIfDone(batchClient, chatId);
   } finally {
     clearInterval(statusUpdater);
     setTimeout(() => {
       removeBatch(chatId.toString(), batchId);
     }, 8e3);
-    mediaGroupQueues.delete(mediaGroupId);
+    if (queue.files.some((file) => file.status === "pending")) {
+      queue.processingStarted = false;
+      mediaGroupDebouncer.bump(queueKey);
+    } else {
+      mediaGroupQueues.delete(queueKey);
+    }
   }
 }
 var pendingCleanups = /* @__PURE__ */ new Map();
@@ -4880,7 +5777,7 @@ function normalizeTelegramDownloadRefs(refs, defaultSourceEntity) {
   if (!refs) return void 0;
   return refs.filter((ref) => ref.id > 0).map((ref) => ({ ...ref, source: ref.source || defaultSourceEntity }));
 }
-async function downloadTelegramChannelRange(botClient, requestMessage, source, startMessageId, limit = 50, direction = "older", explicitIds, folderOverride, explicitRefs, onItemSettled) {
+async function downloadTelegramChannelRange(botClient, requestMessage, source, startMessageId, limit = 50, direction = "older", explicitIds, folderOverride, explicitRefs, onItemSettled, executionGroupKey, getExecutionControlState) {
   const userClient2 = getTelegramUserClient();
   if (!userClient2 || !isTelegramUserClientReady()) {
     throw new Error("Telegram \u7528\u6237\u8D26\u53F7\u4E0B\u8F7D\u5668\u672A\u5C31\u7EEA\uFF1A\u8BF7\u5148\u914D\u7F6E TELEGRAM_API_ID / TELEGRAM_API_HASH \u5E76\u751F\u6210 user session");
@@ -4924,7 +5821,11 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
         channelPostId: ref.channelPostId,
         fileInfo,
         totalSize: ref.totalSize || 0,
-        message: ref.message
+        message: ref.message,
+        groupedId: ref.groupedId,
+        sharedCaption: ref.sharedCaption,
+        groupIndex: ref.groupIndex,
+        groupSize: ref.groupSize
       });
     }
   } else {
@@ -4959,6 +5860,35 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
     }
   }
   const batchId = `tg-range-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const channelGroupId = channelExecutionGroupId(executionGroupKey || `${chatIdStr}:${batchId}`);
+  if (executionGroupKey) {
+    const controlState = await getExecutionControlState?.();
+    if (controlState && controlState !== "run") {
+      if (controlState === "cancelled") {
+        for (const ref of downloadableRefs) await onItemSettled?.(ref, "skipped", "\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+      }
+      return {
+        requested: ids.length,
+        found: 0,
+        skipped: controlState === "cancelled" ? downloadableRefs.length : 0,
+        failed: 0,
+        successful: 0,
+        successfulMessageIds,
+        failedMessageIds,
+        skippedMessageIds: controlState === "cancelled" ? downloadableRefs.map((ref) => ref.id) : skippedMessageIds,
+        firstId: ids[0],
+        lastId: ids[ids.length - 1]
+      };
+    }
+  }
+  downloadQueue.ensureGroup({
+    id: channelGroupId,
+    kind: "channel",
+    title: sourceEntity.toString(),
+    chatId: chatIdStr,
+    hidden: true,
+    expectedTotal: downloadableRefs.length
+  });
   if (downloadableRefs.length > 0) {
     const firstRef = downloadableRefs[0];
     if (taskFolderOverride !== void 0) {
@@ -5016,7 +5946,7 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
   for (let offset = 0; offset < downloadableRefs.length; offset += TG_LARGE_TASK_SEGMENT_SIZE) {
     const segment = downloadableRefs.slice(offset, offset + TG_LARGE_TASK_SEGMENT_SIZE);
     const segmentBytes = segment.reduce((sum, item) => sum + (item.totalSize || 0), 0);
-    await waitForDiskWatermark(segmentBytes);
+    await waitForDiskWatermark(segmentBytes, void 0);
     const segmentMessagesBySource = /* @__PURE__ */ new Map();
     const refsBySource = /* @__PURE__ */ new Map();
     for (const item of segment) {
@@ -5044,6 +5974,18 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
       segmentMessagesBySource.set(sourceKey, preloadedMessageById);
     }
     await Promise.all(segment.map(async (item) => {
+      if (getExecutionControlState) {
+        const controlState = await getExecutionControlState();
+        if (controlState !== "run") {
+          if (controlState === "cancelled") {
+            skipped += 1;
+            completed += 1;
+            skippedMessageIds.push(item.id);
+            await onItemSettled?.(item, "skipped", "\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+          }
+          return;
+        }
+      }
       const { fileName, mimeType } = item.fileInfo;
       const message = segmentMessagesBySource.get(item.sourceKey)?.get(item.id);
       if (!message) {
@@ -5058,8 +6000,12 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
       const uploadItem = {
         fileName,
         mimeType,
+        generatedName: item.fileInfo.generatedName,
         message,
-        status: "pending"
+        status: "pending",
+        sharedCaption: item.sharedCaption,
+        groupIndex: item.groupIndex,
+        groupSize: item.groupSize
       };
       try {
         if (taskResolvedStorageFolder !== void 0) {
@@ -5079,7 +6025,7 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
         }
         uploadItem.folderOverride = taskResolvedStorageFolder !== void 0 ? taskResolvedStorageFolder : taskFolderOverride;
         await refreshSegmentStatus(true, fileName);
-        await processFileUpload(userClient2, uploadItem);
+        await processFileUpload(userClient2, uploadItem, void 0, channelGroupId, getExecutionControlState);
         if (uploadItem.status === "success") {
           successful += 1;
           successfulMessageIds.push(item.id);
@@ -5097,13 +6043,29 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
           await onItemSettled?.(item, "failed", uploadItem.error || "\u4E0B\u8F7D\u5931\u8D25");
         }
       } catch (err) {
+        if (isStorageQuotaCooldownError(err)) {
+          throw err;
+        }
+        const flood = (() => {
+          const anyErr = err;
+          const text = `${anyErr?.message || ""} ${anyErr?.errorMessage || ""}`;
+          const seconds = Number(anyErr?.seconds || anyErr?.value || text.match(/FLOOD_WAIT_?(\d+)/i)?.[1] || 0);
+          return seconds > 0 || /FLOOD|Too many requests/i.test(text) ? Math.max(30, seconds || 60) : 0;
+        })();
+        if (flood > 0) {
+          const floodError = new Error(`Telegram FloodWait ${flood}s`);
+          floodError.seconds = flood;
+          throw floodError;
+        }
         console.error(`\u{1F916} \u9891\u9053\u5206\u6BB5\u4E0B\u8F7D\u4EFB\u52A1\u5F02\u5E38: ${fileName}`, err);
         failed += 1;
         failedMessageIds.push(item.id);
         await onItemSettled?.(item, "failed", err instanceof Error ? err.message : String(err));
       } finally {
-        completed += 1;
-        found += 1;
+        if (!uploadItem.storageCooldownUntil) {
+          completed += 1;
+          found += 1;
+        }
         await refreshSegmentStatus(false, fileName);
       }
     }));
@@ -5144,31 +6106,43 @@ async function handleFileUpload(client2, event) {
     }
     return;
   }
-  const { fileName, mimeType } = fileInfo;
+  const { fileName, mimeType, generatedName } = fileInfo;
   const mediaGroupId = message.groupedId?.toString();
   if (mediaGroupId) {
     if (message.chatId) {
       await checkAndResetSession(client2, message.chatId);
     }
-    let queue = mediaGroupQueues.get(mediaGroupId);
+    const queueKey = telegramMediaGroupQueueKey(message.chatId, mediaGroupId);
+    let queue = mediaGroupQueues.get(queueKey);
     if (!queue) {
       queue = {
+        mediaGroupId,
+        queueKey,
         chatId: message.chatId,
+        userId: senderId,
+        client: client2,
         files: [],
         processingStarted: false,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        lastAddedAt: Date.now()
       };
-      mediaGroupQueues.set(mediaGroupId, queue);
+      mediaGroupQueues.set(queueKey, queue);
+      const queueInstance = queue;
       setTimeout(() => {
-        processBatchUpload(client2, mediaGroupId);
-      }, MEDIA_GROUP_DELAY);
+        if (mediaGroupQueues.get(queueKey) === queueInstance && !queueInstance.processingStarted) {
+          mediaGroupDebouncer.flush(queueKey);
+        }
+      }, MEDIA_GROUP_MAX_WAIT_MS);
     }
     queue.files.push({
       fileName,
       mimeType,
+      generatedName,
       message,
       status: "pending"
     });
+    queue.lastAddedAt = Date.now();
+    mediaGroupDebouncer.bump(queueKey);
     if (message.chatId) {
       const chatIdStr = message.chatId.toString();
       const batchId = mediaGroupId;
@@ -5198,22 +6172,29 @@ async function handleFileUpload(client2, event) {
     }
   } else {
     let finalFileName = fileName;
-    const caption = message.message || "";
-    if (caption && caption.trim()) {
-      const ext = path10.extname(fileName);
-      const firstLine = caption.split(/\r?\n/)[0].trim();
-      const sanitizedCaption = sanitizeFilename(firstLine);
-      if (ext && !sanitizedCaption.toLowerCase().endsWith(ext.toLowerCase())) {
-        finalFileName = `${sanitizedCaption}${ext}`;
-      } else {
-        finalFileName = sanitizedCaption;
-      }
-    }
     const typeEmoji = getTypeEmoji(mimeType);
     const totalSize = getEstimatedFileSize(message);
     const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const chatId = message.chatId;
     const chatIdStr = chatId.toString();
+    const chatName = await getTelegramChatName(message);
+    const previewRules = await getStoragePathRules();
+    const previewFolder = resolveTelegramStorageFolder(chatIdStr, buildStorageFolderWithRules({
+      source: "telegram",
+      chatName,
+      mimeType,
+      fileName: finalFileName
+    }, previewRules));
+    const singleGroupId = ordinaryGroupId("s", chatIdStr, String(message.id));
+    downloadQueue.ensureGroup({
+      id: singleGroupId,
+      kind: "single",
+      title: finalFileName,
+      chatId: chatIdStr,
+      userId: senderId,
+      targetFolder: previewFolder,
+      expectedTotal: 1
+    });
     if (message.chatId) {
       await checkAndResetSession(client2, chatId);
     }
@@ -5281,12 +6262,17 @@ async function handleFileUpload(client2, event) {
     const maxRetries = 1;
     let lastLocalPath;
     let lastError;
-    const attemptSingleUpload = async (signal) => {
+    let storageCooldownUntil;
+    const attemptSingleUpload = async (signal, reportProgress = (downloaded, total) => {
+      void onProgress(downloaded, total);
+    }) => {
       let localFilePath;
       try {
         if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
+        await assertActiveStorageWritable();
         const activeAccountId = storageManager.getActiveAccountId();
-        const chatName = await getTelegramChatName(message);
+        finalFileName = await getCanonicalTelegramFileName(message, finalFileName, mimeType, void 0, void 0, generatedName);
+        updateUploadPhase(chatIdStr, uploadId, { fileName: finalFileName });
         const storageRules = await getStoragePathRules();
         const automaticFolder = buildStorageFolderWithRules({
           source: "telegram",
@@ -5295,9 +6281,18 @@ async function handleFileUpload(client2, event) {
           fileName: finalFileName
         }, storageRules);
         const storageFolder = resolveTelegramStorageFolder(chatIdStr, automaticFolder);
+        downloadQueue.ensureGroup({
+          id: singleGroupId,
+          kind: "single",
+          title: finalFileName,
+          chatId: chatIdStr,
+          userId: senderId,
+          targetFolder: storageFolder,
+          expectedTotal: 1
+        });
         const storedName = await getUniqueStoredName(finalFileName, storageFolder, activeAccountId);
         const downloadSource = await resolveDownloadSource(client2, message);
-        const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, fileName, void 0, onProgress, signal);
+        const result = await downloadAndSaveFile(downloadSource.client, downloadSource.message, fileName, void 0, reportProgress, signal);
         if (!result) {
           lastError = "\u4E0B\u8F7D\u5931\u8D25";
           return false;
@@ -5342,6 +6337,7 @@ async function handleFileUpload(client2, event) {
             });
           });
         }
+        if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         const provider = storageManager.getProvider();
         let thumbnailPath = null;
         let dimensions = {};
@@ -5354,6 +6350,7 @@ async function handleFileUpload(client2, event) {
         }
         let finalPath = localFilePath;
         let sourceRef = provider.name;
+        if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         try {
           finalPath = await provider.saveFile(localFilePath, storedName, mimeType, storageFolder);
           if (fs7.existsSync(localFilePath)) {
@@ -5364,6 +6361,10 @@ async function handleFileUpload(client2, event) {
         } catch (err) {
           lastError = err.message;
           throw err;
+        }
+        if (signal?.aborted) {
+          await provider.deleteFile(finalPath).catch((error) => console.error(`\u{1F916} \u53D6\u6D88\u4EFB\u52A1\u65F6\u56DE\u6EDA\u5DF2\u4FDD\u5B58\u6587\u4EF6\u5931\u8D25: ${finalPath}`, error));
+          throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         }
         await query(`
                     INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
@@ -5385,7 +6386,13 @@ async function handleFileUpload(client2, event) {
         }
         return true;
       } catch (error) {
-        lastError = error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF";
+        if (isStorageQuotaCooldownError(error)) {
+          await markStorageAccountCooldown(error.storageAccountId || storageManager.getActiveAccountId(), error.provider, error.reason, error.cooldownUntil, error.message);
+          storageCooldownUntil = error.cooldownUntil;
+          lastError = formatStorageCooldownNotice(error.cooldownUntil);
+        } else {
+          lastError = error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF";
+        }
         if (localFilePath && fs7.existsSync(localFilePath)) {
           try {
             fs7.unlinkSync(localFilePath);
@@ -5396,9 +6403,13 @@ async function handleFileUpload(client2, event) {
         return false;
       }
     };
-    const singleUploadTask = async (signal) => {
-      let success = await attemptSingleUpload(signal);
-      if (!success && !signal.aborted && retryCount < maxRetries) {
+    const singleUploadTask = async (signal, taskId) => {
+      const reportQueueProgress = (downloaded, total) => {
+        if (taskId) downloadQueue.updateProgress(taskId, downloaded, total);
+        void onProgress(downloaded, total);
+      };
+      let success = await attemptSingleUpload(signal, reportQueueProgress);
+      if (!success && !signal.aborted && !storageCooldownUntil && retryCount < maxRetries) {
         retryCount++;
         if (lastLocalPath && fs7.existsSync(lastLocalPath)) {
           try {
@@ -5424,7 +6435,26 @@ async function handleFileUpload(client2, event) {
             });
           });
         }
-        success = await attemptSingleUpload(signal);
+        success = await attemptSingleUpload(signal, reportQueueProgress);
+      }
+      if (storageCooldownUntil) {
+        updateUploadPhase(chatIdStr, uploadId, { phase: "queued" });
+        const retryResult = await waitForStorageCooldownRetry(
+          storageCooldownUntil,
+          signal,
+          async () => {
+            storageCooldownUntil = void 0;
+            lastError = void 0;
+            success = await attemptSingleUpload(signal, reportQueueProgress);
+            return storageCooldownUntil;
+          },
+          async (retryAt) => {
+            if (statusMsg && !silentSessionMap.has(chatIdStr)) {
+              await safeEditMessage(client2, chatId, { message: statusMsg.id, text: lastError || formatStorageCooldownNotice(retryAt) });
+            }
+          }
+        );
+        if (retryResult === "cancelled") return { status: "success" };
       }
       if (signal.aborted) {
         lastError = "\u7528\u6237\u5F3A\u5236\u505C\u6B62\u4E0B\u8F7D\u4EFB\u52A1";
@@ -5475,8 +6505,28 @@ async function handleFileUpload(client2, event) {
       setTimeout(() => {
         removeUpload(chatIdStr, uploadId);
       }, 8e3);
+      return success ? { status: "success" } : { status: "failed", error: lastError || "\u672A\u77E5\u9519\u8BEF" };
     };
-    downloadQueue.add(finalFileName, singleUploadTask).catch((err) => {
+    const onSinglePendingCancelled = async () => {
+      const error = "\u7528\u6237\u53D6\u6D88\u4EFB\u52A1";
+      updateUploadPhase(chatIdStr, uploadId, { phase: "failed", error });
+      if (silentSessionMap.has(chatIdStr)) {
+        const sess = getSilentSession(chatIdStr);
+        sess.completed += 1;
+        sess.failed += 1;
+        await refreshSilentProgress(client2, chatId);
+        await finalizeSilentSessionIfDone(client2, chatId);
+      } else if (useConsolidated()) {
+        await runStatusAction(chatId, async () => refreshConsolidatedMessage(client2, chatId));
+      } else if (statusMsg) {
+        await safeEditMessage(client2, chatId, {
+          message: statusMsg.id,
+          text: buildUploadFail(finalFileName, error)
+        });
+      }
+      setTimeout(() => removeUpload(chatIdStr, uploadId), 8e3);
+    };
+    downloadQueue.add(singleGroupId, finalFileName, singleUploadTask, totalSize, onSinglePendingCancelled).catch((err) => {
       console.error(`\u{1F916} \u5355\u6587\u4EF6\u4E0B\u8F7D\u4EFB\u52A1\u5F02\u5E38: ${finalFileName}`, err);
       removeUpload(chatIdStr, uploadId);
     });
@@ -5651,13 +6701,19 @@ async function persistDownloadRefs(jobId, source, refs, folderOverride) {
     await query(
       `INSERT INTO telegram_download_items (
                 job_id, source, source_peer, origin, message_id, grouped_id, channel_post_id,
-                file_name, mime_type, total_size, folder_override, status, error, last_error, locked_at, completed_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', NULL, NULL, NULL, NULL)
+                file_name, mime_type, generated_name, total_size, folder_override, shared_caption, group_index, group_size,
+                status, error, last_error, locked_at, completed_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', NULL, NULL, NULL, NULL)
              ON CONFLICT (job_id, source_peer, message_id)
              DO UPDATE SET
                 file_name = COALESCE(EXCLUDED.file_name, telegram_download_items.file_name),
                 mime_type = COALESCE(EXCLUDED.mime_type, telegram_download_items.mime_type),
+                generated_name = COALESCE(EXCLUDED.generated_name, telegram_download_items.generated_name),
                 total_size = COALESCE(EXCLUDED.total_size, telegram_download_items.total_size),
+                grouped_id = COALESCE(EXCLUDED.grouped_id, telegram_download_items.grouped_id),
+                shared_caption = COALESCE(EXCLUDED.shared_caption, telegram_download_items.shared_caption),
+                group_index = COALESCE(EXCLUDED.group_index, telegram_download_items.group_index),
+                group_size = COALESCE(EXCLUDED.group_size, telegram_download_items.group_size),
                 folder_override = EXCLUDED.folder_override,
                 updated_at = NOW()`,
       [
@@ -5666,12 +6722,16 @@ async function persistDownloadRefs(jobId, source, refs, folderOverride) {
         sourcePeerKey(ref.source, source),
         ref.origin || "channel",
         ref.id,
-        null,
+        ref.groupedId || null,
         ref.channelPostId || null,
         ref.fileInfo?.fileName || null,
         ref.fileInfo?.mimeType || null,
+        ref.fileInfo?.generatedName || false,
         ref.totalSize || 0,
-        folderOverride || null
+        folderOverride || null,
+        ref.sharedCaption || null,
+        ref.groupIndex || null,
+        ref.groupSize || null
       ]
     );
   }
@@ -5721,7 +6781,8 @@ async function getDiscussionMediaRefs(userClient2, source, postMessages, options
           channelPostId: post.id,
           fileInfo,
           totalSize: getEstimatedFileSize(comment),
-          message: comment
+          message: comment,
+          groupedId: messageGroupId(comment)
         };
         refs.push(ref);
         await options.onRefDiscovered?.(ref);
@@ -5739,16 +6800,43 @@ function toChannelDownloadRef(source, message) {
     source,
     origin: "channel",
     fileInfo,
-    totalSize: getEstimatedFileSize(message)
+    totalSize: getEstimatedFileSize(message),
+    message,
+    groupedId: messageGroupId(message)
   };
+}
+function propagateTelegramDownloadGroupContext(refs) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const ref of refs) {
+    if (!ref.groupedId) continue;
+    const group = groups.get(ref.groupedId) || [];
+    group.push(ref);
+    groups.set(ref.groupedId, group);
+  }
+  for (const group of groups.values()) {
+    const withMessages = group.filter((ref) => Boolean(ref.message));
+    if (withMessages.length === group.length) {
+      annotateTelegramMediaGroup(withMessages);
+      continue;
+    }
+    const ordered = [...group].sort((a, b) => a.id - b.id);
+    const sharedCaption = ordered.find((ref) => ref.sharedCaption)?.sharedCaption || null;
+    ordered.forEach((ref, index) => {
+      ref.sharedCaption = ref.sharedCaption || sharedCaption;
+      ref.groupIndex = ref.groupIndex || index + 1;
+      ref.groupSize = ref.groupSize || ordered.length;
+    });
+  }
+  return refs;
 }
 async function buildDownloadScanResult(userClient2, source, messages, options = {}) {
   const refs = messages.map((message) => toChannelDownloadRef(source, message)).filter((ref) => Boolean(ref));
+  const commentScan = await getDiscussionMediaRefs(userClient2, source, messages, options);
+  refs.push(...commentScan.refs);
+  propagateTelegramDownloadGroupContext(refs);
   for (const ref of refs) {
     await options.onRefDiscovered?.(ref);
   }
-  const commentScan = await getDiscussionMediaRefs(userClient2, source, messages, options);
-  refs.push(...commentScan.refs);
   return {
     messages,
     refs,
@@ -5780,12 +6868,20 @@ async function markDownloadRefStatus(jobId, ref, status, error) {
              completed_at = CASE WHEN $3::text IN ('success', 'skipped') THEN NOW() ELSE completed_at END,
              locked_at = NULL,
              updated_at = NOW()
-         WHERE job_id = $1 AND source_peer = $2 AND message_id = $5`,
+         WHERE job_id = $1 AND source_peer = $2 AND message_id = $5
+           AND EXISTS (
+               SELECT 1 FROM telegram_background_jobs j
+               WHERE j.id = $1
+                 AND j.cancelled_at IS NULL
+                 AND j.paused_at IS NULL
+                 AND j.status NOT IN ('cancelled', 'paused', 'cooling')
+           )`,
     [jobId, sourcePeer, status, error || null, ref.id]
   );
 }
 async function persistDownloadMessages(jobId, source, messages, folderOverride) {
   const refs = messages.map((message) => toChannelDownloadRef(source, message)).filter((ref) => Boolean(ref));
+  propagateTelegramDownloadGroupContext(refs);
   await persistDownloadRefs(jobId, source, refs, folderOverride);
 }
 function parseDateOnly(value, endOfDay = false) {
@@ -5820,9 +6916,12 @@ async function getJob(jobId) {
 }
 async function updateJob(jobId, updates) {
   const entries = Object.entries(updates);
-  if (entries.length === 0) return;
+  if (entries.length === 0) return 0;
   const setSql = entries.map(([key], index) => `${key} = $${index + 2}`).join(", ");
-  await query(`UPDATE telegram_background_jobs SET ${setSql}, updated_at = NOW() WHERE id = $1`, [jobId, ...entries.map(([, value]) => value)]);
+  const writesTerminalOrRunningState = entries.some(([key, value]) => key === "status" && ["running", "completed", "completed_with_errors", "failed"].includes(String(value)));
+  const terminalGuard = writesTerminalOrRunningState ? ` AND cancelled_at IS NULL AND paused_at IS NULL AND status NOT IN ('cancelled', 'paused', 'cooling')` : "";
+  const result = await query(`UPDATE telegram_background_jobs SET ${setSql}, updated_at = NOW() WHERE id = $1${terminalGuard}`, [jobId, ...entries.map(([, value]) => value)]);
+  return result.rowCount || 0;
 }
 async function hydratePendingDownloadRefs(userClient2, jobId) {
   const result = await query(
@@ -5861,9 +6960,17 @@ async function hydratePendingDownloadRefs(userClient2, jobId) {
       }
       await query(
         `UPDATE telegram_download_items
-                 SET file_name = $2, mime_type = $3, total_size = $4, updated_at = NOW()
+                 SET file_name = $2, mime_type = $3, total_size = $4,
+                     generated_name = $5, grouped_id = $6, updated_at = NOW()
                  WHERE id = $1`,
-        [row.id, fileInfo.fileName, fileInfo.mimeType, getEstimatedFileSize(message)]
+        [
+          row.id,
+          fileInfo.fileName,
+          fileInfo.mimeType,
+          getEstimatedFileSize(message),
+          fileInfo.generatedName,
+          messageGroupId(message) || null
+        ]
       );
       hydrated += 1;
     } catch (error) {
@@ -6004,7 +7111,8 @@ async function putJobIntoStorageCooldown(jobId, cooldownUntil, reasonText) {
     `UPDATE telegram_download_items
          SET status = 'pending', locked_at = NULL, last_error = $2, updated_at = NOW()
          WHERE job_id = $1
-           AND status = 'downloading'`,
+           AND status IN ('downloading', 'failed')
+           AND (status = 'downloading' OR last_error IS NULL OR last_error ILIKE '%upload%limit%' OR last_error ILIKE '%\u4E0A\u4F20\u989D\u5EA6%')`,
     [jobId, reasonText]
   );
 }
@@ -6027,7 +7135,7 @@ async function notifyStorageCooldownOnce(botClient, job, cooldownUntil) {
     message: [
       formatStorageCooldownNotice(cooldownUntil),
       "",
-      `\u4EFB\u52A1\uFF1A${String(job.id).slice(0, 8)}`
+      `\u4EFB\u52A1\uFF1A${String(job.id).slice(0, 12)}`
     ].join("\n")
   }).catch(() => void 0);
 }
@@ -6040,13 +7148,17 @@ async function handleStorageQuotaCooldownError(botClient, jobId, error) {
   if (job) await notifyStorageCooldownOnce(botClient, job, cooldownUntil);
   return true;
 }
-async function ensureJobCanRun(jobId) {
-  const job = await getJob(jobId);
+async function ensureJobCanRunForTest(job, now = Date.now()) {
   if (!job) return "cancelled";
   if (job.cancelled_at || job.status === "cancelled") return "cancelled";
   if (job.paused_at || job.status === "paused") return "paused";
-  if (job.cooldown_until && new Date(job.cooldown_until).getTime() > Date.now()) return "cooldown";
-  if (job.status === "cooling" && (!job.cooldown_until || new Date(job.cooldown_until).getTime() <= Date.now())) return "run";
+  if (job.cooldown_until && new Date(job.cooldown_until).getTime() > now) return "cooldown";
+  return "run";
+}
+async function ensureJobCanRun(jobId) {
+  const job = await getJob(jobId);
+  const persistedState = await ensureJobCanRunForTest(job);
+  if (persistedState !== "run") return persistedState;
   const storageCooldown = await applyStorageCooldownIfNeeded(jobId);
   if (storageCooldown) return "cooldown";
   return "run";
@@ -6060,21 +7172,38 @@ async function waitUntilRunnable(jobId, options) {
     await new Promise((resolve) => setTimeout(resolve, state === "cooldown" ? 5e3 : 2e3));
   }
 }
+function persistedTelegramFileInfo(row) {
+  return {
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    generatedName: row.generated_name === true
+  };
+}
 async function claimPendingDownloadRefs(jobId, limit = TG_JOB_DOWNLOAD_BATCH_SIZE) {
   const result = await query(
-    `UPDATE telegram_download_items i
-         SET status = 'downloading', locked_at = NOW(), updated_at = NOW()
-         WHERE i.id IN (
-             SELECT id FROM telegram_download_items
-             WHERE job_id = $1
-               AND status = 'pending'
-               AND attempts < $2
-               AND file_name IS NOT NULL
-               AND mime_type IS NOT NULL
-             ORDER BY created_at ASC
+    `WITH candidates AS (
+             SELECT i.id
+             FROM telegram_download_items i
+             JOIN telegram_background_jobs j ON j.id = i.job_id
+             WHERE i.job_id = $1
+               AND i.status = 'pending'
+               AND i.attempts < $2
+               AND i.file_name IS NOT NULL
+               AND i.mime_type IS NOT NULL
+               AND j.cancelled_at IS NULL
+               AND j.finished_at IS NULL
+               AND j.status NOT IN ('cancelled', 'paused', 'cooling')
+             ORDER BY i.created_at ASC
+             FOR UPDATE OF i SKIP LOCKED
              LIMIT $3
          )
-         RETURNING source, source_peer, origin, message_id, channel_post_id, file_name, mime_type, total_size, folder_override`,
+         UPDATE telegram_download_items i
+         SET status = 'downloading', locked_at = NOW(), updated_at = NOW()
+         FROM candidates c
+         WHERE i.id = c.id AND i.status = 'pending'
+         RETURNING i.source, i.source_peer, i.origin, i.message_id, i.grouped_id, i.channel_post_id,
+                   i.file_name, i.mime_type, i.generated_name, i.total_size, i.folder_override,
+                   i.shared_caption, i.group_index, i.group_size`,
     [jobId, TG_JOB_MAX_ATTEMPTS, limit]
   );
   return result.rows.filter((row) => row.file_name && row.mime_type).map((row) => ({
@@ -6082,28 +7211,89 @@ async function claimPendingDownloadRefs(jobId, limit = TG_JOB_DOWNLOAD_BATCH_SIZ
     source: row.source_peer || row.source,
     origin: row.origin === "comment" ? "comment" : "channel",
     channelPostId: row.channel_post_id || void 0,
-    fileInfo: { fileName: row.file_name, mimeType: row.mime_type },
-    totalSize: Number(row.total_size || 0)
+    fileInfo: persistedTelegramFileInfo(row),
+    totalSize: Number(row.total_size || 0),
+    groupedId: row.grouped_id || void 0,
+    sharedCaption: row.shared_caption || null,
+    groupIndex: row.group_index ? Number(row.group_index) : void 0,
+    groupSize: row.group_size ? Number(row.group_size) : void 0
   }));
+}
+async function restoreClaimedRefs(jobId, refs, status) {
+  if (refs.length === 0) return;
+  await Promise.all(refs.map((ref) => query(
+    `UPDATE telegram_download_items
+         SET status = $4::varchar,
+             error = CASE WHEN $4::text = 'skipped' THEN COALESCE(error, '\u4EFB\u52A1\u5DF2\u53D6\u6D88') ELSE error END,
+             last_error = CASE WHEN $4::text = 'skipped' THEN COALESCE(last_error, '\u4EFB\u52A1\u5DF2\u53D6\u6D88') ELSE last_error END,
+             locked_at = NULL,
+             completed_at = CASE WHEN $4::text = 'skipped' THEN NOW() ELSE completed_at END,
+             updated_at = NOW()
+         WHERE job_id = $1 AND source_peer = $2 AND message_id = $3 AND status = 'downloading'`,
+    [jobId, sourcePeerKey(ref.source, ""), ref.id, status]
+  )));
+}
+async function restoreUnfinishedClaimedRefs(jobId, refs, reason) {
+  if (refs.length === 0) return;
+  const messageIds = refs.map((ref) => ref.id);
+  await query(
+    `UPDATE telegram_download_items
+         SET status = 'pending', locked_at = NULL, last_error = $3, updated_at = NOW()
+         WHERE job_id = $1
+           AND message_id = ANY($2::bigint[])
+           AND status IN ('downloading', 'failed')`,
+    [jobId, messageIds, reason]
+  );
 }
 async function downloadClaimedRefs(botClient, requestMessage, jobId, source, refs, folderOverride, options) {
   if (refs.length === 0) return { found: 0, skipped: 0, failed: 0, successful: 0 };
-  await updateJob(jobId, { status: "running", download_status: "active", error: null });
+  const controlState = await ensureJobCanRun(jobId);
+  if (controlState !== "run") {
+    await restoreClaimedRefs(jobId, refs, controlState === "cancelled" ? "skipped" : "pending");
+    return { found: 0, skipped: controlState === "cancelled" ? refs.length : 0, failed: 0, successful: 0 };
+  }
+  const started = await query(
+    `UPDATE telegram_background_jobs
+         SET status = 'running', download_status = 'active', error = NULL, updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND finished_at IS NULL
+           AND status NOT IN ('cancelled', 'paused', 'cooling')
+           AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+         RETURNING id`,
+    [jobId]
+  );
+  if ((started.rowCount || 0) === 0) {
+    const latestState = await ensureJobCanRun(jobId);
+    await restoreClaimedRefs(jobId, refs, latestState === "cancelled" ? "skipped" : "pending");
+    return { found: 0, skipped: latestState === "cancelled" ? refs.length : 0, failed: 0, successful: 0 };
+  }
   try {
     const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, refs.length, "older", refs.map((ref) => ref.id), folderOverride, refs, async (ref, status, error) => {
       await markDownloadRefStatus(jobId, ref, status, error);
       await notifyProgress(jobId, options);
-    });
+    }, jobId, () => ensureJobCanRun(jobId));
+    const latestState = await ensureJobCanRun(jobId);
+    if (latestState !== "run") {
+      await restoreUnfinishedClaimedRefs(jobId, refs, latestState === "cancelled" ? "\u4EFB\u52A1\u5DF2\u53D6\u6D88" : "\u4EFB\u52A1\u5DF2\u6682\u505C");
+    }
     return result;
   } catch (error) {
     const flood = isFloodWait(error);
     if (flood) {
       const cooldownUntil = new Date(Date.now() + flood.seconds * 1e3);
-      await updateJob(jobId, { status: "running", cooldown_until: cooldownUntil, error: `Telegram FloodWait\uFF0C\u51B7\u5374\u5230 ${cooldownUntil.toISOString()}` });
-      for (const ref of refs) await markDownloadRefStatus(jobId, ref, "failed", `FloodWait ${flood.seconds}s`);
-      return { found: 0, skipped: 0, failed: refs.length, successful: 0 };
+      await updateJob(jobId, {
+        status: "cooling",
+        download_status: "cooling",
+        cooldown_until: cooldownUntil,
+        error: `Telegram FloodWait\uFF0C\u51B7\u5374\u5230 ${cooldownUntil.toISOString()}`
+      });
+      await restoreUnfinishedClaimedRefs(jobId, refs, `FloodWait ${flood.seconds}s`);
+      return { found: 0, skipped: 0, failed: 0, successful: 0 };
     }
     if (await handleStorageQuotaCooldownError(botClient, jobId, error)) {
+      await restoreUnfinishedClaimedRefs(jobId, refs, error instanceof Error ? error.message : String(error));
       return { found: 0, skipped: 0, failed: 0, successful: 0 };
     }
     for (const ref of refs) await markDownloadRefStatus(jobId, ref, "failed", error instanceof Error ? error.message : String(error));
@@ -6129,19 +7319,41 @@ async function downloadPendingForJob(botClient, requestMessage, jobId, source, f
   return aggregate;
 }
 async function finalizeTelegramJob(jobId, options) {
+  const job = await getJob(jobId);
+  if (!job || job.cancelled_at || job.status === "cancelled") return;
+  if (job.paused_at || job.status === "paused") {
+    await notifyProgress(jobId, options);
+    return;
+  }
   const stats = await getJobItemStats(jobId);
   const pending = Number(stats.pending || 0) + Number(stats.downloading || 0);
   const failed = Number(stats.failed || 0);
   const status = pending > 0 ? "running" : failed > 0 ? "completed_with_errors" : "completed";
-  await updateJob(jobId, {
-    status,
-    download_status: pending > 0 ? "active" : "done",
-    enqueued_count: Number(stats.success || 0),
-    skipped_count: Number(stats.skipped || 0),
-    error: failed > 0 ? `${failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null,
-    finished_at: pending > 0 ? null : /* @__PURE__ */ new Date()
-  });
-  await notifyProgress(jobId, options);
+  const result = await query(
+    `UPDATE telegram_background_jobs
+         SET status = $2,
+             download_status = $3,
+             enqueued_count = $4,
+             skipped_count = $5,
+             error = $6,
+             finished_at = $7,
+             updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND status NOT IN ('cancelled', 'paused')
+         RETURNING id`,
+    [
+      jobId,
+      status,
+      pending > 0 ? "active" : "done",
+      Number(stats.success || 0),
+      Number(stats.skipped || 0),
+      failed > 0 ? `${failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null,
+      pending > 0 ? null : /* @__PURE__ */ new Date()
+    ]
+  );
+  if ((result.rowCount || 0) > 0) await notifyProgress(jobId, options);
 }
 async function scanChannelSegment(userClient2, jobId, source, params, cursor, options) {
   const mode = params.mode;
@@ -6181,7 +7393,36 @@ async function runSegmentedTelegramJob(botClient, requestMessage, jobId, source,
   let cursor = job?.scan_cursor || {};
   const discoveredRefKeys = /* @__PURE__ */ new Set();
   let totals = { found: 0, skipped: 0, failed: 0, successful: 0 };
-  await updateJob(jobId, { status: "running", scan_status: "scanning", download_status: "active", started_at: job?.started_at || /* @__PURE__ */ new Date(), error: null });
+  const initialState = await ensureJobCanRun(jobId);
+  if (initialState === "cancelled") {
+    return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+  }
+  if (initialState !== "run") {
+    const runnable2 = await waitUntilRunnable(jobId, options);
+    if (!runnable2) return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+  }
+  const started = await query(
+    `UPDATE telegram_background_jobs
+         SET status = 'running', scan_status = 'scanning', download_status = 'active',
+             started_at = COALESCE(started_at, NOW()), error = NULL, updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND finished_at IS NULL
+           AND status NOT IN ('cancelled', 'paused', 'cooling')
+           AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+         RETURNING id`,
+    [jobId]
+  );
+  if ((started.rowCount || 0) === 0) {
+    const state = await ensureJobCanRun(jobId);
+    if (state === "cancelled") return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+    if (state !== "run") {
+      const runnable2 = await waitUntilRunnable(jobId, options);
+      if (!runnable2) return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+    }
+    return { jobId, deferred: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+  }
   while (await waitUntilRunnable(jobId, options)) {
     const current = await getJob(jobId);
     cursor = current?.scan_cursor || cursor || {};
@@ -6226,7 +7467,7 @@ async function runSegmentedTelegramJob(botClient, requestMessage, jobId, source,
   const runnable = await waitUntilRunnable(jobId, options);
   if (!runnable) {
     await updateJob(jobId, { status: "cancelled", scan_status: "cancelled", download_status: "cancelled", finished_at: /* @__PURE__ */ new Date() });
-    return { jobId, ...totals, requested: 0, commentMessagesScanned: Number(cursor.commentMessagesScanned || 0), commentMediaFound: Number(cursor.commentMediaFound || 0) };
+    return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: Number(cursor.commentMessagesScanned || 0), commentMediaFound: Number(cursor.commentMediaFound || 0) };
   }
   await updateJob(jobId, { scan_status: "done" });
   const drained = await downloadPendingForJob(botClient, requestMessage, jobId, source, folderOverride, options, true);
@@ -6287,8 +7528,8 @@ async function listTelegramActiveTaskQueues(userId, limit = 10) {
              GROUP BY job_id
          )
          SELECT
-             j.id, j.kind, j.source, j.status, j.scan_status, j.download_status,
-             j.scan_cursor, j.cooldown_until, j.paused_at, j.cancelled_at,
+             j.id, j.user_id, j.chat_id, j.kind, j.source, j.status, j.scan_status, j.download_status,
+             j.scan_cursor, j.cooldown_until, j.paused_at, j.cancelled_at, j.params,
              j.total_count, j.enqueued_count, j.skipped_count, j.duplicate_count,
              j.error, j.started_at, j.finished_at, j.created_at, j.updated_at,
              COALESCE(s.item_count, 0)::int AS item_count,
@@ -6299,6 +7540,16 @@ async function listTelegramActiveTaskQueues(userId, limit = 10) {
              COALESCE(s.skipped_count_items, 0)::int AS skipped_count_items,
              COALESCE(s.missing_metadata_count, 0)::int AS missing_metadata_count,
              s.queue_updated_at,
+             (SELECT i.file_name
+                FROM telegram_download_items i
+               WHERE i.job_id = j.id AND i.status = 'downloading'
+               ORDER BY i.locked_at DESC NULLS LAST, i.updated_at DESC
+               LIMIT 1) AS current_file_name,
+             (SELECT i.folder_override
+                FROM telegram_download_items i
+               WHERE i.job_id = j.id AND i.folder_override IS NOT NULL
+               ORDER BY i.updated_at DESC
+               LIMIT 1) AS folder_override,
              (
                  j.status = 'running'
                  AND (
@@ -6314,6 +7565,10 @@ async function listTelegramActiveTaskQueues(userId, limit = 10) {
            AND j.finished_at IS NULL
            AND (
                (
+                   j.status IN ('queued', 'pending')
+                   AND j.finished_at IS NULL
+               )
+               OR (
                    j.status = 'running'
                    AND (
                        COALESCE(s.downloading_count, 0) > 0
@@ -6334,76 +7589,88 @@ async function listTelegramActiveTaskQueues(userId, limit = 10) {
   );
   return result.rows;
 }
-async function pauseTelegramBackgroundJob(userId, selector) {
+async function resolveUniqueTelegramBackgroundJobId(userId, selector, chatId) {
+  const normalized = selector.trim().toLowerCase();
+  if (!/^[0-9a-f-]{4,36}$/.test(normalized)) return null;
+  const result = await query(
+    `SELECT id
+         FROM telegram_background_jobs
+         WHERE user_id = $1
+           AND id::text LIKE $2
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+         ORDER BY created_at DESC
+         LIMIT 2`,
+    [userId, `${normalized}%`, chatId || null]
+  );
+  return result.rows.length === 1 ? String(result.rows[0].id) : null;
+}
+async function pauseTelegramBackgroundJob(userId, selector, chatId) {
+  const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+  if (!jobId) return null;
   const result = await query(
     `UPDATE telegram_background_jobs
          SET status = 'paused', paused_at = NOW(), updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $2 AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
+         WHERE user_id = $1 AND id = $2::uuid
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
          RETURNING id, source, status`,
-    [userId, `${selector}%`]
+    [userId, jobId, chatId || null]
   );
   return result.rows[0] || null;
 }
-async function resumeTelegramBackgroundJob(userId, selector) {
+async function resumeTelegramBackgroundJob(userId, selector, chatId) {
+  const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+  if (!jobId) return null;
   const result = await query(
     `UPDATE telegram_background_jobs
          SET status = 'running', paused_at = NULL, finished_at = NULL, error = NULL, download_status = 'active', updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $2 AND cancelled_at IS NULL AND status = 'paused'
+         WHERE user_id = $1 AND id = $2::uuid
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND cancelled_at IS NULL AND status = 'paused'
          RETURNING id, source, status`,
-    [userId, `${selector}%`]
+    [userId, jobId, chatId || null]
   );
   return result.rows[0] || null;
 }
-async function cancelTelegramBackgroundJob(userId, selector) {
+async function cancelTelegramBackgroundJob(userId, selector, chatId) {
+  const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+  if (!jobId) return null;
   const result = await query(
     `UPDATE telegram_background_jobs
          SET status = 'cancelled', scan_status = 'cancelled', download_status = 'cancelled', cancelled_at = NOW(), finished_at = NOW(), updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $2 AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
+         WHERE user_id = $1 AND id = $2::uuid
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
          RETURNING id, source, status`,
-    [userId, `${selector}%`]
+    [userId, jobId, chatId || null]
   );
   if (result.rows[0]) {
     await query(`UPDATE telegram_download_items SET status = 'skipped', locked_at = NULL, updated_at = NOW() WHERE job_id = $1 AND status IN ('pending', 'downloading')`, [result.rows[0].id]);
   }
   return result.rows[0] || null;
 }
-async function cancelAllTelegramBackgroundJobs(userId) {
-  const result = await query(
+async function retryTelegramBackgroundJob(userId, selector, chatId) {
+  const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+  if (!jobId) return null;
+  const jobResult = await query(
     `UPDATE telegram_background_jobs
-         SET status = 'cancelled', scan_status = 'cancelled', download_status = 'cancelled', cancelled_at = NOW(), finished_at = NOW(), updated_at = NOW()
-         WHERE user_id = $1
-           AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
-         RETURNING id, source, status`,
-    [userId]
+         SET status = 'running', download_status = 'active', error = NULL, finished_at = NULL, updated_at = NOW()
+         WHERE id = $1
+           AND user_id = $2
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND cancelled_at IS NULL
+         RETURNING id`,
+    [jobId, userId, chatId || null]
   );
-  const ids = result.rows.map((row) => row.id);
-  if (ids.length > 0) {
-    await query(
-      `UPDATE telegram_download_items
-             SET status = 'skipped', locked_at = NULL, updated_at = NOW()
-             WHERE job_id = ANY($1::uuid[])
-               AND status IN ('pending', 'downloading')`,
-      [ids]
-    );
-  }
-  return result.rows;
-}
-async function retryTelegramBackgroundJob(userId, selector) {
-  const result = await query(
-    `SELECT id FROM telegram_background_jobs WHERE user_id = $1 AND id::text LIKE $2 LIMIT 1`,
-    [userId, `${selector}%`]
-  );
-  const row = result.rows[0];
-  if (!row) return null;
-  const retry = await query(
+  if ((jobResult.rowCount || 0) === 0) return null;
+  const retryResult = await query(
     `UPDATE telegram_download_items
          SET status = 'pending', locked_at = NULL, last_error = NULL, error = NULL, updated_at = NOW()
          WHERE job_id = $1 AND status = 'failed'
          RETURNING id`,
-    [row.id]
+    [jobId]
   );
-  await updateJob(row.id, { status: "running", download_status: "active", error: null, finished_at: null });
-  return { id: row.id, retried: retry.rowCount || 0 };
+  return { id: jobResult.rows[0].id, retried: retryResult.rowCount || 0 };
 }
 async function runSubscriptionScan(botClient) {
   const userClient2 = getTelegramUserClient();
@@ -6429,13 +7696,19 @@ async function runSubscriptionScan(botClient) {
       const targetChat = row.chat_id || row.user_id;
       const requestMessage = { chatId: targetChat, id: latestMessageId };
       const subscriptionRefs = candidateMessages.map((message) => toChannelDownloadRef(row.source, message)).filter((ref) => Boolean(ref));
+      propagateTelegramDownloadGroupContext(subscriptionRefs);
       await markDownloadRefsDownloading(jobId, subscriptionRefs);
-      const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, "newer", ids, row.folder_override || null, subscriptionRefs, (ref, status, error) => markDownloadRefStatus(jobId, ref, status, error));
+      const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, "newer", ids, row.folder_override || null, subscriptionRefs, (ref, status, error) => markDownloadRefStatus(jobId, ref, status, error), jobId, () => ensureJobCanRun(jobId));
       const cooledJob = await getJob(jobId);
       if (cooledJob?.status === "cooling") {
         await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
         continue;
       }
+      const latestJob = await getJob(jobId);
+      if (latestJob?.cancelled_at || latestJob?.status === "cancelled") continue;
+      if (latestJob?.paused_at || latestJob?.status === "paused") continue;
+      const remainingStats = await getJobItemStats(jobId);
+      if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) continue;
       await updateJob(jobId, {
         status: downloadResult.failed > 0 ? "completed_with_errors" : "completed",
         enqueued_count: downloadResult.found,
@@ -6467,7 +7740,7 @@ ${reason}
 }
 async function recoverTelegramJob(botClient, job) {
   const itemResult = await query(
-    `SELECT id, source, source_peer, origin, message_id, channel_post_id, file_name, mime_type, total_size, folder_override
+    `SELECT id, source, source_peer, origin, message_id, grouped_id, channel_post_id, file_name, mime_type, generated_name, total_size, folder_override, shared_caption, group_index, group_size
          FROM telegram_download_items
          WHERE job_id = $1 AND status = 'pending'
          ORDER BY created_at ASC`,
@@ -6484,20 +7757,27 @@ async function recoverTelegramJob(botClient, job) {
     await updateJob(job.id, { status: "failed", error: `${missingMetadata} \u4E2A\u5F85\u4E0B\u8F7D\u6761\u76EE\u7F3A\u5C11\u6587\u4EF6\u5143\u6570\u636E\uFF0C\u65E0\u6CD5\u6062\u590D`, finished_at: /* @__PURE__ */ new Date() });
     return;
   }
-  const refs = itemResult.rows.filter((row) => row.file_name && row.mime_type).map((row) => ({
+  const refs = propagateTelegramDownloadGroupContext(itemResult.rows.filter((row) => row.file_name && row.mime_type).map((row) => ({
     id: Number(row.message_id),
     source: row.source_peer || row.source,
     origin: row.origin === "comment" ? "comment" : "channel",
     channelPostId: row.channel_post_id || void 0,
-    fileInfo: { fileName: row.file_name, mimeType: row.mime_type },
-    totalSize: Number(row.total_size || 0)
-  }));
+    fileInfo: persistedTelegramFileInfo(row),
+    totalSize: Number(row.total_size || 0),
+    groupedId: row.grouped_id || void 0,
+    sharedCaption: row.shared_caption || null,
+    groupIndex: row.group_index ? Number(row.group_index) : void 0,
+    groupSize: row.group_size ? Number(row.group_size) : void 0
+  })));
   if (refs.length === 0) return;
   const targetChat = job.chat_id || job.user_id;
   const requestMessage = { chatId: targetChat, id: 0 };
-  console.log(`\u267B\uFE0F \u6062\u590D Telegram \u4E0B\u8F7D\u4EFB\u52A1 ${String(job.id).slice(0, 8)}\uFF0C\u5F85\u5904\u7406 ${refs.length} \u4E2A\u6587\u4EF6`);
-  await updateJob(job.id, { status: "running", started_at: job.started_at || /* @__PURE__ */ new Date(), error: null });
   try {
+    const latest = await getJob(job.id);
+    if (!latest || latest.cancelled_at || latest.status === "cancelled") return;
+    if (latest.paused_at || latest.status === "paused") return;
+    console.log(`\u267B\uFE0F \u6062\u590D Telegram \u4E0B\u8F7D\u4EFB\u52A1 ${String(job.id).slice(0, 12)}\uFF0C\u5F85\u5904\u7406 ${refs.length} \u4E2A\u6587\u4EF6`);
+    await updateJob(job.id, { status: "running", started_at: job.started_at || /* @__PURE__ */ new Date(), error: null });
     const result = await downloadTelegramChannelRange(
       botClient,
       requestMessage,
@@ -6508,22 +7788,42 @@ async function recoverTelegramJob(botClient, job) {
       refs.map((ref) => ref.id),
       itemResult.rows[0]?.folder_override || null,
       refs,
-      (ref, status, error) => markDownloadRefStatus(job.id, ref, status, error)
+      (ref, status, error) => markDownloadRefStatus(job.id, ref, status, error),
+      job.id,
+      () => ensureJobCanRun(job.id)
     );
     const cooledJob = await getJob(job.id);
     if (cooledJob?.status === "cooling") {
       await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
       return;
     }
+    const latestJob = await getJob(job.id);
+    if (latestJob?.cancelled_at || latestJob?.status === "cancelled") return;
+    if (latestJob?.paused_at || latestJob?.status === "paused") return;
+    const remainingStats = await getJobItemStats(job.id);
+    if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) return;
+    if (job.kind === "subscription_sync" && result.failed === 0) {
+      const targetMessageId = Number(job.params?.toId || 0);
+      if (targetMessageId > 0) {
+        await query(
+          `UPDATE telegram_channel_subscriptions
+                     SET last_message_id = GREATEST(last_message_id, $3), updated_at = NOW()
+                     WHERE user_id = $1 AND source = $2 AND enabled = true`,
+          [job.user_id, job.source, targetMessageId]
+        );
+      }
+    }
     await updateJob(job.id, {
       status: result.failed > 0 ? "completed_with_errors" : "completed",
+      download_status: result.failed > 0 ? "completed_with_errors" : "completed",
+      cooldown_until: null,
       enqueued_count: result.found,
       skipped_count: result.skipped,
       error: result.failed > 0 ? `${result.failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null,
       finished_at: /* @__PURE__ */ new Date()
     });
     await botClient.sendMessage(targetChat, {
-      message: `\u267B\uFE0F \u5DF2\u6062\u590D\u5E76\u5B8C\u6210\u4EFB\u52A1 ${String(job.id).slice(0, 8)}\uFF1A\u6210\u529F ${result.successful}\uFF0C\u8DF3\u8FC7 ${result.skipped}\uFF0C\u5931\u8D25 ${result.failed}`
+      message: `\u267B\uFE0F \u5DF2\u6062\u590D\u5E76\u5B8C\u6210\u4EFB\u52A1 ${String(job.id).slice(0, 12)}\uFF1A\u6210\u529F ${result.successful}\uFF0C\u8DF3\u8FC7 ${result.skipped}\uFF0C\u5931\u8D25 ${result.failed}`
     }).catch(() => void 0);
   } catch (error) {
     await updateJob(job.id, { status: "failed", error: error instanceof Error ? error.message : String(error), finished_at: /* @__PURE__ */ new Date() });
@@ -6541,6 +7841,7 @@ async function recoverInterruptedTelegramJobs(botClient) {
              WHERE status = 'cooling'
                AND cooldown_until IS NOT NULL
                AND cooldown_until <= NOW()
+               AND paused_at IS NULL
                AND cancelled_at IS NULL
                AND finished_at IS NULL`
     );
@@ -6548,13 +7849,21 @@ async function recoverInterruptedTelegramJobs(botClient) {
       `UPDATE telegram_download_items
              SET status = 'pending', locked_at = NULL, updated_at = NOW()
              WHERE status = 'downloading'
-               AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL '30 minutes')`
+               AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL '30 minutes')
+               AND NOT EXISTS (
+                   SELECT 1 FROM telegram_background_jobs j
+                   WHERE j.id = telegram_download_items.job_id
+                     AND j.status = 'running'
+                     AND j.finished_at IS NULL
+                     AND j.cancelled_at IS NULL
+                     AND j.paused_at IS NULL
+               )`
     );
     const jobs = await query(
       `SELECT DISTINCT j.*
              FROM telegram_background_jobs j
              JOIN telegram_download_items i ON i.job_id = j.id
-             WHERE j.kind IN ('date_range', 'tag_download')
+             WHERE j.kind IN ('date_range', 'tag_download', 'subscription_sync')
                AND j.finished_at IS NULL
                AND j.cancelled_at IS NULL
                AND j.status IN ('pending', 'running', 'failed', 'completed_with_errors', 'cooling')
@@ -6594,9 +7903,9 @@ function startTelegramSubscriptionWorker(botClient) {
 init_db();
 init_localPath();
 import fs8 from "fs";
-import path11 from "path";
-var UPLOAD_DIR2 = path11.resolve(process.env.UPLOAD_DIR || "./data/uploads");
-var THUMBNAIL_DIR2 = path11.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+import path12 from "path";
+var UPLOAD_DIR2 = path12.resolve(process.env.UPLOAD_DIR || "./data/uploads");
+var THUMBNAIL_DIR2 = path12.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
 var ORPHAN_MIN_AGE_MS = Math.max(6e4, parseInt(process.env.ORPHAN_CLEANUP_MIN_AGE_MS || "600000", 10) || 6e5);
 function isAutoCleanupEnabled() {
   return ["1", "true", "yes", "on"].includes((process.env.AUTO_CLEANUP_ORPHANS || "true").toLowerCase());
@@ -6615,7 +7924,7 @@ function getAllFiles(dirPath, arrayOfFiles = []) {
   try {
     const files = fs8.readdirSync(dirPath);
     for (const file of files) {
-      const fullPath = path11.join(dirPath, file);
+      const fullPath = path12.join(dirPath, file);
       try {
         const stat = fs8.statSync(fullPath);
         if (stat.isDirectory()) {
@@ -6641,7 +7950,7 @@ function removeEmptyDirectories(dirPath) {
   try {
     const files = fs8.readdirSync(dirPath);
     for (const file of files) {
-      const fullPath = path11.join(dirPath, file);
+      const fullPath = path12.join(dirPath, file);
       try {
         if (fs8.statSync(fullPath).isDirectory()) {
           removeEmptyDirectories(fullPath);
@@ -6752,11 +8061,11 @@ init_localPath();
 // src/utils/fileScope.ts
 init_db();
 init_localPath();
-import path12 from "path";
+import path13 from "path";
 var CLOUD_SOURCES = /* @__PURE__ */ new Set(["onedrive", "aliyun_oss", "s3", "webdav", "google_drive"]);
-var UPLOAD_DIR3 = path12.resolve(process.env.UPLOAD_DIR || "./data/uploads");
-var THUMBNAIL_DIR3 = path12.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
-var PREVIEW_DIR2 = path12.resolve(process.env.PREVIEW_DIR || "./data/previews");
+var UPLOAD_DIR3 = path13.resolve(process.env.UPLOAD_DIR || "./data/uploads");
+var THUMBNAIL_DIR3 = path13.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var PREVIEW_DIR2 = path13.resolve(process.env.PREVIEW_DIR || "./data/previews");
 async function getCurrentStorageScope() {
   const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
   const provider = storageManager2.getProvider();
@@ -6782,15 +8091,15 @@ async function removePhysicalFile(file) {
     const provider = storageManager2.getProvider(`${file.source}:${file.storage_account_id}`);
     await provider.deleteFile(file.path);
   } else {
-    const filePath = file.path || path12.join(UPLOAD_DIR3, file.stored_name);
+    const filePath = file.path || path13.join(UPLOAD_DIR3, file.stored_name);
     await safeUnlink(filePath, UPLOAD_DIR3);
   }
   if (file.thumbnail_path) {
-    const thumbPath = path12.join(THUMBNAIL_DIR3, path12.basename(file.thumbnail_path));
+    const thumbPath = path13.join(THUMBNAIL_DIR3, path13.basename(file.thumbnail_path));
     await safeUnlink(thumbPath, THUMBNAIL_DIR3);
   }
   if (file.preview_path) {
-    const previewPath = path12.join(PREVIEW_DIR2, path12.basename(file.preview_path));
+    const previewPath = path13.join(PREVIEW_DIR2, path13.basename(file.preview_path));
     await safeUnlink(previewPath, PREVIEW_DIR2);
   }
 }
@@ -6802,6 +8111,307 @@ async function updateScopedFileById(id, setSql, values) {
     [...scope.params, ...values, id]
   );
   return result.rowCount || 0;
+}
+
+// src/services/telegramTaskCenter.ts
+var PAGE_SIZE = 6;
+var VALID_ID = /^[A-Za-z0-9-]{1,24}$/;
+var ACTION_CODES = {
+  start: "s",
+  pause: "p",
+  resume: "r",
+  cancel_prompt: "x",
+  cancel_confirm: "k"
+};
+var CODE_ACTIONS = Object.fromEntries(Object.entries(ACTION_CODES).map(([action, code]) => [code, action]));
+var SOURCE_CODES = { memory: "m", channel: "c" };
+var CODE_SOURCES = { m: "memory", c: "channel" };
+function safeNumber(value) {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+}
+function safeTime(value, fallback = Date.now()) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = value ? new Date(value).getTime() : NaN;
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+function markdownText(value) {
+  return String(value ?? "").replace(/([\\`*_{}\[\]()#+!|>~])/g, "\\$1");
+}
+function shortText(value, max = 32) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(1, max - 1))}\u2026`;
+}
+function kindLabel(kind) {
+  return { single: "\u5355\u6587\u4EF6", album: "\u76F8\u518C", channel: "\u9891\u9053\u4EFB\u52A1" }[kind];
+}
+function stateMeta(state) {
+  switch (state) {
+    case "running":
+      return { icon: "\u{1F7E2}", label: "\u6B63\u5728\u8FD0\u884C", bucket: "running" };
+    case "waiting":
+      return { icon: "\u23F3", label: "\u7B49\u5F85\u5F00\u59CB", bucket: "waiting" };
+    case "pausing":
+      return { icon: "\u23F8", label: "\u6B63\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6", bucket: "paused" };
+    case "paused":
+      return { icon: "\u23F8", label: "\u5DF2\u6682\u505C", bucket: "paused" };
+    case "cooling":
+      return { icon: "\u{1F9CA}", label: "\u7CFB\u7EDF\u7B49\u5F85", bucket: "cooling" };
+  }
+}
+function stateOrder(state) {
+  return { running: 0, waiting: 1, pausing: 2, paused: 3, cooling: 4 }[state];
+}
+function sourceCode(sourceType) {
+  return SOURCE_CODES[sourceType];
+}
+function callbackList(page) {
+  return `tc_l_${Math.max(0, Math.floor(page))}`;
+}
+function callbackDetail(item, page) {
+  return `tc_d_${sourceCode(item.sourceType)}_${item.id}_${Math.max(0, Math.floor(page))}`;
+}
+function callbackAction(action, item, page) {
+  return `tc_a_${ACTION_CODES[action]}_${sourceCode(item.sourceType)}_${item.id}_${Math.max(0, Math.floor(page))}`;
+}
+function formatAge(timestamp, now) {
+  const seconds = Math.max(0, Math.floor((now - timestamp) / 1e3));
+  if (seconds < 60) return "\u521A\u521A";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} \u5206\u949F\u524D`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} \u5C0F\u65F6\u524D`;
+  return `${Math.floor(hours / 24)} \u5929\u524D`;
+}
+function progressLine(item) {
+  const finished = Math.min(item.total, item.completed + item.failed + item.skipped);
+  const parts = [`${finished}/${item.total}`];
+  if (item.active > 0) parts.push(`\u4E0B\u8F7D\u4E2D ${item.active}`);
+  if (item.pending > 0) parts.push(`\u5F85\u5904\u7406 ${item.pending}`);
+  if (item.failed > 0) parts.push(`\u5931\u8D25 ${item.failed}`);
+  if (item.skipped > 0) parts.push(`\u8DF3\u8FC7 ${item.skipped}`);
+  return parts.join(" \xB7 ");
+}
+function sortTaskCenterItems(items) {
+  return items.filter((item) => ["running", "waiting", "pausing", "paused", "cooling"].includes(item.state)).sort((a, b) => stateOrder(a.state) - stateOrder(b.state) || b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+}
+function buildTaskCenterPage(sourceItems, requestedPage = 0, options = {}) {
+  const now = options.now || Date.now();
+  const pageSize = Math.max(1, Math.floor(options.pageSize || PAGE_SIZE));
+  const items = sortTaskCenterItems(sourceItems);
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const page = Math.min(Math.max(0, Math.floor(requestedPage || 0)), totalPages - 1);
+  const visibleItems = items.slice(page * pageSize, page * pageSize + pageSize);
+  const counts = { running: 0, waiting: 0, paused: 0, cooling: 0 };
+  for (const item of items) counts[stateMeta(item.state).bucket] += 1;
+  const lines = [
+    "\u{1F4E5} **\u4E0B\u8F7D\u4EFB\u52A1**",
+    "",
+    `\u{1F7E2} \u8FD0\u884C\u4E2D ${counts.running}\u3000\u23F3 \u7B49\u5F85 ${counts.waiting}\u3000\u23F8 \u5DF2\u6682\u505C ${counts.paused}`,
+    ...counts.cooling > 0 ? [`\u{1F9CA} \u7CFB\u7EDF\u7B49\u5F85 ${counts.cooling}`] : [],
+    `\u5171 ${items.length} \u4E2A\u8FDB\u884C\u4E2D\u7684\u4EFB\u52A1${totalPages > 1 ? ` \xB7 \u7B2C ${page + 1}/${totalPages} \u9875` : ""}`
+  ];
+  if (visibleItems.length === 0) {
+    lines.push("", "\u{1F4EE} \u5F53\u524D\u6CA1\u6709\u8FDB\u884C\u4E2D\u7684\u4EFB\u52A1");
+  }
+  visibleItems.forEach((item, index) => {
+    const meta = stateMeta(item.state);
+    const secondary = item.currentFileName ? `${kindLabel(item.kind)} \xB7 ${progressLine(item)} \xB7 \u5F53\u524D\uFF1A${shortText(item.currentFileName, 24)}` : `${kindLabel(item.kind)} \xB7 ${progressLine(item)} \xB7 ${meta.label}`;
+    lines.push("", `${page * pageSize + index + 1}. ${meta.icon} **${markdownText(shortText(item.title, 42))}**`, `   ${markdownText(secondary)}`);
+  });
+  if (items.length > 0) lines.push("", "\u70B9\u51FB\u7F16\u53F7\u67E5\u770B\u8BE6\u60C5\u5E76\u63A7\u5236\u9009\u4E2D\u7684\u4EFB\u52A1\u3002");
+  const rows = visibleItems.map((item, index) => [{
+    text: `${page * pageSize + index + 1}. ${stateMeta(item.state).icon} ${shortText(item.title, 22)}`,
+    data: callbackDetail(item, page)
+  }]);
+  const navigation = [];
+  if (page > 0) navigation.push({ text: "\u25C0\uFE0F \u4E0A\u4E00\u9875", data: callbackList(page - 1) });
+  navigation.push({ text: "\u{1F504} \u5237\u65B0", data: callbackList(page) });
+  if (page + 1 < totalPages) navigation.push({ text: "\u4E0B\u4E00\u9875 \u25B6\uFE0F", data: callbackList(page + 1) });
+  if (navigation.length > 0) rows.push(navigation);
+  return { text: lines.join("\n"), rows, page, totalPages, visibleItems };
+}
+function buildTaskCenterDetail(item, page = 0, options = {}) {
+  const now = options.now || Date.now();
+  const meta = stateMeta(item.state);
+  const title = item.title.replace(/[\u0000-\u001F\u007F]/g, " ").trim() || "\u672A\u547D\u540D\u4EFB\u52A1";
+  const source = item.source?.replace(/[\u0000-\u001F\u007F]/g, " ").trim();
+  const currentFileName = item.currentFileName?.replace(/[\u0000-\u001F\u007F]/g, " ").trim();
+  const targetFolder = item.targetFolder?.replace(/[\u0000-\u001F\u007F]/g, " ").trim();
+  const reason = item.reason?.replace(/[\u0000-\u001F\u007F]/g, " ").trim();
+  const lines = [
+    `${meta.icon} **${meta.label}**`,
+    "",
+    `\u{1F4CC} ${markdownText(title)}`,
+    `\u7C7B\u578B\uFF1A${kindLabel(item.kind)}`,
+    ...source ? [`\u6765\u6E90\uFF1A${markdownText(source)}`] : [],
+    `\u8FDB\u5EA6\uFF1A${markdownText(progressLine(item))}`,
+    ...currentFileName ? [`\u5F53\u524D\u6587\u4EF6\uFF1A${markdownText(currentFileName)}`] : [],
+    ...targetFolder ? [`\u4FDD\u5B58\u4F4D\u7F6E\uFF1A${markdownText(targetFolder)}`] : [],
+    ...reason ? [`\u539F\u56E0\uFF1A${markdownText(reason)}`] : [],
+    `\u521B\u5EFA\uFF1A${formatAge(item.createdAt, now)}`,
+    `\u6700\u8FD1\u6D3B\u52A8\uFF1A${formatAge(item.updatedAt, now)}`,
+    `\u4EFB\u52A1 ID\uFF1A${item.id}`
+  ];
+  const systemBlocked = Boolean(item.protection);
+  if (systemBlocked) {
+    const protection = item.protection;
+    const recovery = protection.autoResume ? protection.retryAt ? `\u7CFB\u7EDF\u4F1A\u5728 ${protection.retryAt} \u540E\u91CD\u65B0\u68C0\u67E5\u5E76\u81EA\u52A8\u6062\u590D\u3002` : protection.recheckMs ? `\u7CFB\u7EDF\u6BCF ${Math.max(1, Math.round(protection.recheckMs / 1e3))} \u79D2\u91CD\u65B0\u68C0\u67E5\uFF0C\u6761\u4EF6\u6EE1\u8DB3\u540E\u81EA\u52A8\u6062\u590D\u3002` : "\u7CFB\u7EDF\u4F1A\u6301\u7EED\u68C0\u67E5\uFF0C\u6761\u4EF6\u6EE1\u8DB3\u540E\u81EA\u52A8\u6062\u590D\u3002" : "\u6B64\u72B6\u6001\u4E0D\u4F1A\u81EA\u52A8\u6062\u590D\uFF0C\u8BF7\u6309\u539F\u56E0\u5904\u7406\u540E\u91CD\u8BD5\u3002";
+    lines.push("", `\u8BE5\u4EFB\u52A1\u7531\u7CFB\u7EDF\u4FDD\u62A4\u6682\u505C\uFF1B${recovery}`);
+  }
+  if (item.state === "pausing") lines.push("", "\u5F53\u524D\u6587\u4EF6\u5B8C\u6210\u540E\u4F1A\u81EA\u52A8\u8FDB\u5165\u5DF2\u6682\u505C\u72B6\u6001\u3002");
+  if (item.state === "waiting") lines.push("", "\u201C\u4F18\u5148\u5F00\u59CB\u201D\u4F1A\u628A\u8BE5\u4EFB\u52A1\u79FB\u5230\u7B49\u5F85\u961F\u5217\u524D\u9762\uFF0C\u4E0D\u4F1A\u4E2D\u65AD\u6B63\u5728\u4E0B\u8F7D\u7684\u6587\u4EF6\u3002");
+  if (item.state === "running") lines.push("", "\u6682\u505C\u4F1A\u5148\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\uFF0C\u518D\u505C\u6B62\u8FD9\u4E2A\u4EFB\u52A1\u7684\u540E\u7EED\u6587\u4EF6\u3002");
+  const actionRow = [];
+  if (item.state === "waiting" && (item.sourceType === "memory" || item.active + item.pending > 0)) actionRow.push({ text: "\u25B6\uFE0F \u4F18\u5148\u5F00\u59CB", data: callbackAction("start", item, page) });
+  if (item.state === "running") actionRow.push({ text: "\u23F8 \u6682\u505C\u4EFB\u52A1", data: callbackAction("pause", item, page) });
+  if (item.state === "paused" && !systemBlocked) actionRow.push({ text: "\u25B6\uFE0F \u7EE7\u7EED", data: callbackAction("resume", item, page) });
+  if (item.state === "pausing") actionRow.push({ text: "\u25B6\uFE0F \u64A4\u9500\u6682\u505C", data: callbackAction("resume", item, page) });
+  actionRow.push({ text: "\u{1F6D1} \u53D6\u6D88", data: callbackAction("cancel_prompt", item, page) });
+  return {
+    text: lines.join("\n"),
+    rows: [
+      actionRow,
+      [
+        { text: "\u21A9\uFE0F \u8FD4\u56DE\u4EFB\u52A1\u5217\u8868", data: callbackList(page) },
+        { text: "\u{1F504} \u5237\u65B0", data: callbackDetail(item, page) }
+      ]
+    ]
+  };
+}
+function buildTaskCancelConfirm(item, page = 0) {
+  const title = item.title.replace(/[\u0000-\u001F\u007F]/g, " ").trim() || "\u672A\u547D\u540D\u4EFB\u52A1";
+  return {
+    text: [
+      "\u26A0\uFE0F **\u786E\u8BA4\u53D6\u6D88\u8FD9\u4E2A\u4EFB\u52A1\uFF1F**",
+      "",
+      `\u{1F4CC} ${markdownText(title)}`,
+      `\u7C7B\u578B\uFF1A${kindLabel(item.kind)}`,
+      `\u8FDB\u5EA6\uFF1A${markdownText(progressLine(item))}`,
+      "",
+      item.active > 0 ? "\u6B63\u5728\u4E0B\u8F7D\u7684\u6587\u4EF6\u4F1A\u88AB\u4E2D\u6B62\u5E76\u6E05\u7406\u4E34\u65F6\u6587\u4EF6\uFF0C\u7B49\u5F85\u4E2D\u7684\u6587\u4EF6\u4F1A\u7ACB\u5373\u79FB\u51FA\u961F\u5217\u3002" : "\u7B49\u5F85\u4E2D\u7684\u6587\u4EF6\u4F1A\u7ACB\u5373\u79FB\u51FA\u961F\u5217\u3002",
+      "\u5176\u5B83\u4EFB\u52A1\u4E0D\u4F1A\u53D7\u5230\u5F71\u54CD\u3002"
+    ].join("\n"),
+    rows: [
+      [
+        { text: "\u26A0\uFE0F \u786E\u8BA4\u53D6\u6D88", data: callbackAction("cancel_confirm", item, page) },
+        { text: "\u8FD4\u56DE\u8BE6\u60C5", data: callbackDetail(item, page) }
+      ]
+    ]
+  };
+}
+function parseTaskCenterCallback(data) {
+  let match = data.match(/^tc_l_(\d{1,6})$/);
+  if (match) return { view: "list", page: Number(match[1]) };
+  match = data.match(/^tc_d_([mc])_([A-Za-z0-9-]{1,24})_(\d{1,6})$/);
+  if (match) {
+    const sourceType2 = CODE_SOURCES[match[1]];
+    if (!sourceType2 || !VALID_ID.test(match[2])) return null;
+    return { view: "detail", sourceType: sourceType2, id: match[2], page: Number(match[3]) };
+  }
+  match = data.match(/^tc_a_([sprxk])_([mc])_([A-Za-z0-9-]{1,24})_(\d{1,6})$/);
+  if (!match) return null;
+  const action = CODE_ACTIONS[match[1]];
+  const sourceType = CODE_SOURCES[match[2]];
+  if (!action || !sourceType || !VALID_ID.test(match[3])) return null;
+  return { view: "action", action, sourceType, id: match[3], page: Number(match[4]) };
+}
+function ordinaryTaskCenterItem(group) {
+  if (group.hidden || group.kind === "channel" || group.state === "completed" || group.state === "cancelled" || group.state === "cancelling") return null;
+  const state = group.systemPause ? "cooling" : group.state;
+  if (!["running", "waiting", "pausing", "paused", "cooling"].includes(state)) return null;
+  return {
+    sourceType: "memory",
+    id: group.id,
+    kind: group.kind,
+    title: group.title,
+    state,
+    total: group.total,
+    active: group.active,
+    pending: group.pending,
+    completed: group.completed,
+    failed: group.failed,
+    skipped: group.cancelled,
+    currentFileName: group.currentFileName,
+    chatId: group.chatId,
+    userId: group.userId,
+    source: group.source,
+    targetFolder: group.targetFolder,
+    reason: group.reason,
+    protection: group.systemPause,
+    createdAt: group.createdAt,
+    updatedAt: group.updatedAt
+  };
+}
+function isChannelSystemPause(row, inCooldown) {
+  return inCooldown || row?.status === "cooling";
+}
+function channelSystemPauseReason(row) {
+  if (!isChannelSystemPause(row, Boolean(row?.cooldown_until && safeTime(row.cooldown_until, 0) > Date.now()))) return void 0;
+  const until = row?.cooldown_until ? new Date(row.cooldown_until) : void 0;
+  const providerLimit = /Google Drive|上传额度|daily_upload_limit/i.test(String(row?.error || ""));
+  const cause = providerLimit ? "Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650" : "Telegram \u8BF7\u6C42\u9891\u7387\u53D7\u9650\uFF08FloodWait\uFF09";
+  if (!until || Number.isNaN(until.getTime())) return `${cause}\uFF1B\u7CFB\u7EDF\u4F1A\u6301\u7EED\u68C0\u67E5\u5E76\u81EA\u52A8\u6062\u590D`;
+  return `${cause}\uFF1B\u9884\u8BA1 ${until.toLocaleString("zh-CN", { hour12: false })} \u540E\u81EA\u52A8\u6062\u590D`;
+}
+function channelTaskCenterItem(row) {
+  const rawId = String(row?.id || "").replace(/[^A-Za-z0-9-]/g, "");
+  if (!rawId) return null;
+  const id = rawId.slice(0, 12);
+  const total = Math.max(safeNumber(row.total_count), safeNumber(row.item_count));
+  const active = safeNumber(row.downloading_count);
+  const pending = safeNumber(row.pending_count);
+  const completed = safeNumber(row.success_count);
+  const failed = safeNumber(row.failed_count);
+  const skipped = safeNumber(row.skipped_count_items ?? row.skipped_count);
+  const cooldownUntil = row.cooldown_until ? new Date(row.cooldown_until) : void 0;
+  const inCooldown = Boolean(row.cooldown_until && safeTime(row.cooldown_until, 0) > Date.now()) || row.status === "cooling" && (!row.cooldown_until || safeTime(row.cooldown_until, 0) > Date.now());
+  const protection = inCooldown ? {
+    kind: /Google Drive|上传额度|daily_upload_limit/i.test(String(row.error || "")) ? "storage_cooldown" : "telegram_flood_wait",
+    reason: channelSystemPauseReason(row) || "\u7CFB\u7EDF\u51B7\u5374\u4E2D",
+    autoResume: true,
+    retryAt: cooldownUntil && !Number.isNaN(cooldownUntil.getTime()) ? cooldownUntil.toLocaleString("zh-CN", { hour12: false }) : void 0
+  } : void 0;
+  const state = inCooldown ? "cooling" : row.status === "paused" ? active > 0 ? "pausing" : "paused" : row.status === "queued" || row.status === "pending" ? "waiting" : active > 0 || row.scan_status === "scanning" || row.is_actively_running ? "running" : "waiting";
+  const optionsSource = row.options ?? row.params ?? {};
+  let options;
+  if (typeof optionsSource === "string") {
+    try {
+      const parsed = JSON.parse(optionsSource);
+      options = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      options = {};
+    }
+  } else {
+    options = optionsSource && typeof optionsSource === "object" && !Array.isArray(optionsSource) ? optionsSource : {};
+  }
+  const qualifier = options.tag || (options.startDate && options.endDate ? `${options.startDate} \u2192 ${options.endDate}` : "");
+  const source = String(row.source || "\u9891\u9053\u4EFB\u52A1");
+  const chatId = row.chat_id !== void 0 && row.chat_id !== null ? String(row.chat_id) : void 0;
+  const userId = row.user_id !== void 0 && row.user_id !== null ? safeNumber(row.user_id) : void 0;
+  return {
+    sourceType: "channel",
+    id,
+    kind: "channel",
+    title: qualifier ? `${source} \xB7 ${qualifier}` : source,
+    state,
+    total,
+    active,
+    pending,
+    completed,
+    failed,
+    skipped,
+    currentFileName: row.current_file_name || void 0,
+    chatId,
+    userId,
+    source,
+    targetFolder: row.folder_override || options.folderOverride || null,
+    reason: protection?.reason ?? (row.status === "paused" ? "\u7528\u6237\u8BF7\u6C42\u6682\u505C" : row.error || void 0),
+    protection,
+    createdAt: safeTime(row.created_at),
+    updatedAt: safeTime(row.queue_updated_at || row.updated_at)
+  };
 }
 
 // src/services/telegramCommands.ts
@@ -6964,14 +8574,14 @@ async function editStorageSwitchMessage(client2, update, toast) {
   await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast }));
 }
 async function scanLocalDownloadFiles() {
-  const baseDir = path13.resolve(UPLOAD_DIR4);
+  const baseDir = path14.resolve(UPLOAD_DIR4);
   const paths = [];
   let totalSize = 0;
   if (!fs9.existsSync(baseDir)) return { count: 0, totalSize: 0, paths };
   async function walk(dir) {
     const entries = await fs9.promises.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
-      const fullPath = path13.join(dir, entry.name);
+      const fullPath = path14.join(dir, entry.name);
       if (entry.isDirectory()) {
         await walk(fullPath);
       } else if (entry.isFile()) {
@@ -6984,12 +8594,12 @@ async function scanLocalDownloadFiles() {
   await walk(baseDir);
   return { count: paths.length, totalSize, paths };
 }
-async function pruneEmptyDirs(dir, baseDir = path13.resolve(UPLOAD_DIR4)) {
-  if (!fs9.existsSync(dir) || path13.resolve(dir) === baseDir) return;
+async function pruneEmptyDirs(dir, baseDir = path14.resolve(UPLOAD_DIR4)) {
+  if (!fs9.existsSync(dir) || path14.resolve(dir) === baseDir) return;
   const entries = await fs9.promises.readdir(dir);
   if (entries.length === 0) {
     await fs9.promises.rmdir(dir);
-    await pruneEmptyDirs(path13.dirname(dir), baseDir);
+    await pruneEmptyDirs(path14.dirname(dir), baseDir);
   }
 }
 function buildDownloadWorkersText(current) {
@@ -7124,12 +8734,23 @@ function buildCleanupSettingsText(enabled) {
     "\u8BF4\u660E\uFF1A\u53EA\u5F71\u54CD\u672C\u5730 uploads \u5B64\u513F\u6587\u4EF6\uFF0C\u4E0D\u4F1A\u4E3B\u52A8\u6E05\u7406\u7B2C\u4E09\u65B9\u4E91\u5B58\u50A8\u3002"
   ].join("\n");
 }
+function canonicalTelegramChatKey(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return text;
+  if (/^-100\d+$/.test(text)) return text.slice(4);
+  if (/^-\d+$/.test(text)) return text.slice(1);
+  return text;
+}
 function getCallbackChatKey(update) {
-  const peer = update.peer;
-  const value = peer?.userId || peer?.chatId || peer?.channelId || update.userId;
-  if (value && typeof value.toJSNumber === "function") return String(value.toJSNumber());
-  if (value !== void 0 && value !== null) return String(value);
-  return String(update.userId.toJSNumber());
+  try {
+    return canonicalTelegramChatKey(getPeerId2(update.peer, true));
+  } catch {
+    const peer = update.peer;
+    const value = peer?.userId || peer?.chatId || peer?.channelId || update.userId;
+    if (value && typeof value.toJSNumber === "function") return canonicalTelegramChatKey(value.toJSNumber());
+    if (value !== void 0 && value !== null) return canonicalTelegramChatKey(value);
+    return canonicalTelegramChatKey(update.userId.toJSNumber());
+  }
 }
 async function handleStart(message, senderId) {
   if (await isAuthenticatedAsync(senderId)) {
@@ -7269,7 +8890,7 @@ async function handleStorageCleanupCallback(client2, update, data) {
         if (await safeUnlink(filePath, UPLOAD_DIR4)) {
           deletedCount += 1;
           deletedBytes += size;
-          await pruneEmptyDirs(path13.dirname(filePath));
+          await pruneEmptyDirs(path14.dirname(filePath));
         }
       }
       const after = await scanLocalDownloadFiles();
@@ -7390,121 +9011,254 @@ async function handleDeleteConfirmCallback(client2, update, data) {
     await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u5220\u9664\u5931\u8D25: ${error.message}`, alert: true }));
   }
 }
-function formatTaskAge(value) {
-  if (!value) return null;
-  const ms = new Date(value).getTime();
-  if (!Number.isFinite(ms) || ms <= 0) return null;
-  const diffSeconds = Math.max(0, Math.floor((Date.now() - ms) / 1e3));
-  if (diffSeconds < 60) return "\u521A\u521A";
-  const diffMinutes = Math.floor(diffSeconds / 60);
-  if (diffMinutes < 60) return `${diffMinutes} \u5206\u949F\u524D`;
-  const diffHours = Math.floor(diffMinutes / 60);
-  if (diffHours < 24) return `${diffHours} \u5C0F\u65F6\u524D`;
-  return `${Math.floor(diffHours / 24)} \u5929\u524D`;
-}
-function buildChannelTaskQueueReport(jobs) {
-  const labelStatus = (value) => ({
-    pending: "\u7B49\u5F85",
-    queued: "\u6392\u961F",
-    scanning: "\u626B\u63CF\u4E2D",
-    active: "\u4F20\u8F93\u4E2D",
-    done: "\u5B8C\u6210",
-    running: "\u8FD0\u884C\u4E2D",
-    paused: "\u5DF2\u6682\u505C",
-    failed: "\u5931\u8D25",
-    cancelled: "\u5DF2\u53D6\u6D88",
-    completed: "\u5B8C\u6210",
-    completed_with_errors: "\u90E8\u5206\u5B8C\u6210"
-  })[value || ""] || (value || "\u672A\u77E5");
-  const lines = ["\u{1F4E1} **\u9891\u9053\u4EFB\u52A1\u961F\u5217**"];
-  jobs.forEach((job, index) => {
-    const total = Number(job.total_count || job.item_count || 0);
-    const pending = Number(job.pending_count || 0);
-    const downloading = Number(job.downloading_count || 0);
-    const success = Number(job.success_count || 0);
-    const failed = Number(job.failed_count || 0);
-    const skipped = Number(job.skipped_count_items || job.skipped_count || 0);
-    const done = success + failed + skipped;
-    const missing = Number(job.missing_metadata_count || 0);
-    const activeNow = Boolean(job.is_actively_running);
-    const paused = job.status === "paused";
-    const cooldownUntilMs = job.cooldown_until ? new Date(job.cooldown_until).getTime() : 0;
-    const inCooldown = cooldownUntilMs > Date.now();
-    const statusText = paused ? "\u5DF2\u6682\u505C" : inCooldown ? "\u51B7\u5374\u7B49\u5F85\u4E2D" : activeNow ? "\u6B63\u5728\u8FD0\u884C" : "\u7B49\u5F85\u63A5\u624B";
-    const icon = paused ? "\u23F8\uFE0F" : inCooldown ? "\u{1F9CA}" : activeNow ? "\u{1F7E2}" : "\u23F3";
-    const updatedText = formatTaskAge(job.updated_at);
-    const id = String(job.id).slice(0, 8);
-    lines.push([
-      "",
-      `${index + 1}. ${icon} **${statusText}** \xB7 ${job.kind}`,
-      `   \u6765\u6E90\uFF1A${job.source}`,
-      `   \u9636\u6BB5\uFF1A\u626B\u63CF ${labelStatus(job.scan_status)} \xB7 \u4E0B\u8F7D ${labelStatus(job.download_status)}`,
-      `   \u961F\u5217\uFF1A\u4E0B\u8F7D\u4E2D ${downloading} \xB7 \u5F85\u5904\u7406 ${pending} \xB7 \u5DF2\u5B8C\u6210 ${done}/${total}`,
-      failed > 0 ? `   \u5F02\u5E38\uFF1A\u5931\u8D25 ${failed} \xB7 \u8DF3\u8FC7 ${skipped}` : skipped > 0 ? `   \u8DF3\u8FC7\uFF1A${skipped}` : "",
-      missing > 0 ? `   \u63D0\u793A\uFF1A${missing} \u4E2A\u5F85\u5904\u7406\u6761\u76EE\u6B63\u5728\u8865\u5168\u6587\u4EF6\u4FE1\u606F` : "",
-      inCooldown ? `   \u51B7\u5374\u5230\uFF1A${new Date(job.cooldown_until).toLocaleString("zh-CN", { hour12: false })}` : "",
-      updatedText ? `   \u6700\u8FD1\u6D3B\u52A8\uFF1A${updatedText}` : "",
-      `   ID\uFF1A${id}`
-    ].filter(Boolean).join("\n"));
+function buildTaskCenterMarkup(rows) {
+  return new Api6.ReplyInlineMarkup({
+    rows: rows.map((row) => new Api6.KeyboardButtonRow({
+      buttons: row.map((button) => new Api6.KeyboardButtonCallback({
+        text: button.text,
+        data: Buffer.from(button.data)
+      }))
+    }))
   });
-  return lines.join("\n");
 }
-function buildTasksKeyboard(jobs) {
-  if (jobs.length === 0) return void 0;
-  const rows = [];
-  for (const job of jobs.slice(0, 8)) {
-    const id = String(job.id).slice(0, 8);
-    const paused = job.status === "paused";
-    rows.push(new Api6.KeyboardButtonRow({
-      buttons: [
-        new Api6.KeyboardButtonCallback({
-          text: `${paused ? "\u25B6\uFE0F \u7EE7\u7EED" : "\u23F8 \u6682\u505C"} ${id}`,
-          data: Buffer.from(`ctq_${paused ? "resume" : "pause"}_${id}`)
-        }),
-        new Api6.KeyboardButtonCallback({
-          text: `\u{1F6D1} \u53D6\u6D88 ${id}`,
-          data: Buffer.from(`ctq_cancel_${id}`)
-        })
-      ]
-    }));
+function mergeChannelExecutionState(item, row) {
+  if (!item) return null;
+  const executionGroup = getChannelExecutionGroup(String(row.id));
+  if (!executionGroup) return item;
+  item.active = executionGroup.active;
+  item.pending = executionGroup.pending;
+  item.currentFileName = executionGroup.currentFileName || item.currentFileName;
+  if (row.status === "paused") item.state = executionGroup.active > 0 ? "pausing" : "paused";
+  return item;
+}
+async function loadTaskCenterItems(chatId, userId) {
+  const ordinaryItems = listDownloadTaskGroups(chatId, userId).map(ordinaryTaskCenterItem).filter((item) => Boolean(item));
+  const channelRows = await listTelegramActiveTaskQueues(userId, 1e3);
+  const channelItems = channelRows.filter((row) => String(row.chat_id || "") === chatId).map((row) => {
+    const paramsSource = row.params;
+    const params = typeof paramsSource === "string" ? (() => {
+      try {
+        const parsed = JSON.parse(paramsSource);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+      } catch {
+        return {};
+      }
+    })() : paramsSource && typeof paramsSource === "object" && !Array.isArray(paramsSource) ? paramsSource : {};
+    const folder = row.folder_override || params.folderOverride || null;
+    return mergeChannelExecutionState(channelTaskCenterItem({ ...row, folder_override: folder }), row);
+  }).filter((item) => Boolean(item));
+  return [...ordinaryItems, ...channelItems];
+}
+async function findTaskCenterItem(sourceType, id, chatId, userId) {
+  if (sourceType === "memory") {
+    const group = getDownloadTaskGroup(id, chatId, userId);
+    return group ? ordinaryTaskCenterItem(group) : null;
   }
-  if (jobs.length > 1) {
-    rows.push(new Api6.KeyboardButtonRow({
-      buttons: [new Api6.KeyboardButtonCallback({ text: "\u{1F6D1} \u53D6\u6D88\u5168\u90E8\u9891\u9053\u4EFB\u52A1", data: Buffer.from("ctq_cancel_all") })]
-    }));
+  const rows = await listTelegramActiveTaskQueues(userId, 1e3);
+  const matches = rows.filter((job) => String(job.chat_id || "") === chatId && String(job.id).toLowerCase().startsWith(id.toLowerCase()));
+  if (matches.length !== 1) return null;
+  const row = matches[0];
+  if (String(row.chat_id || "") !== chatId) return null;
+  const paramsSource = row.params;
+  const params = typeof paramsSource === "string" ? (() => {
+    try {
+      const parsed = JSON.parse(paramsSource);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  })() : paramsSource && typeof paramsSource === "object" && !Array.isArray(paramsSource) ? paramsSource : {};
+  if (!row.folder_override && params.folderOverride) row.folder_override = params.folderOverride;
+  return mergeChannelExecutionState(channelTaskCenterItem(row), row);
+}
+async function editTaskCenterView(client2, update, view) {
+  try {
+    await client2.editMessage(update.peer, {
+      message: Number(update.msgId),
+      text: view.text,
+      buttons: buildTaskCenterMarkup(view.rows)
+    });
+  } catch (error) {
+    if (!isTelegramMessageNotModified(error)) throw error;
   }
-  return new Api6.ReplyInlineMarkup({ rows });
+}
+async function renderTaskCenterList(client2, update, userId, chatId, page) {
+  const items = await loadTaskCenterItems(chatId, userId);
+  await editTaskCenterView(client2, update, buildTaskCenterPage(items, page));
 }
 async function handleTasks(message) {
   try {
-    const status = getTaskStatus();
-    const activeCount = status.active.length;
-    const pendingCount = status.pending.length;
     const senderId = message.senderId?.toJSNumber();
-    const jobs = senderId ? await listTelegramActiveTaskQueues(senderId, 10) : [];
-    if (activeCount === 0 && pendingCount === 0 && jobs.length === 0) {
-      await message.reply({ message: MSG.EMPTY_TASKS });
+    const chatId = message.chatId?.toString();
+    if (!senderId || !chatId) {
+      await message.reply({ message: MSG.ERR_TASKS });
       return;
     }
-    const sections = [];
-    if (activeCount > 0 || pendingCount > 0) {
-      sections.push(buildTasksReport(status.active, status.pending));
-    }
-    if (jobs.length > 0) {
-      sections.push(buildChannelTaskQueueReport(jobs));
-    }
-    await message.reply({
-      message: sections.filter(Boolean).join("\n\n"),
-      buttons: buildTasksKeyboard(jobs)
-    });
+    const items = await loadTaskCenterItems(chatId, senderId);
+    const view = buildTaskCenterPage(items, 0);
+    const sent = await message.reply({ message: view.text, buttons: buildTaskCenterMarkup(view.rows) });
+    if (sent?.id) taskCenterCardOwners.set(taskCenterCardKey(chatId, sent.id), { userId: senderId, expiresAt: Date.now() + TASK_CENTER_CARD_TTL_MS });
   } catch (error) {
-    console.error("\u{1F916} \u83B7\u53D6\u4EFB\u52A1\u5217\u8868\u5931\u8D25:", error);
+    console.error("\u{1F916} \u83B7\u53D6\u4EFB\u52A1\u4E2D\u5FC3\u5931\u8D25:", error);
     await message.reply({ message: MSG.ERR_TASKS });
+  }
+}
+async function operateChannelTaskCenterItem(action, userId, chatId, id) {
+  const rows = await listTelegramActiveTaskQueues(userId, 1e3);
+  const matches = rows.filter((job2) => String(job2.chat_id || "") === chatId && String(job2.id).toLowerCase().startsWith(id.toLowerCase()));
+  if (matches.length !== 1) return { ok: false, toast: matches.length > 1 ? "\u4EFB\u52A1 ID \u524D\u7F00\u4E0D\u552F\u4E00\uFF0C\u8BF7\u5237\u65B0\u4EFB\u52A1\u5217\u8868" : "\u4EFB\u52A1\u5DF2\u7ED3\u675F\u6216\u5DF2\u5931\u6548" };
+  const row = matches[0];
+  const fullId = String(row.id);
+  if (action === "pause") {
+    if (row.status !== "running") return { ok: false, toast: "\u4EFB\u52A1\u5F53\u524D\u4E0D\u5728\u8FD0\u884C\u72B6\u6001" };
+    const job2 = await pauseTelegramBackgroundJob(userId, fullId, chatId);
+    if (!job2) return { ok: false, toast: "\u4EFB\u52A1\u5DF2\u7ED3\u675F\u6216\u65E0\u6CD5\u6682\u505C" };
+    const executionGroup = getChannelExecutionGroup(fullId);
+    if (executionGroup) pauseChannelExecutionGroup(fullId);
+    return { ok: true, toast: executionGroup?.active ? "\u5C06\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\u540E\u6682\u505C" : "\u4EFB\u52A1\u5DF2\u6682\u505C" };
+  }
+  if (action === "resume" || action === "start") {
+    if (action === "start" && row.status === "running") {
+      const prioritized = prioritizeChannelExecutionGroup(fullId);
+      return prioritized.status === "ok" ? { ok: true, toast: "\u5DF2\u63D0\u5347\u5230\u7B49\u5F85\u961F\u5217\u524D\u9762" } : { ok: false, toast: "\u4EFB\u52A1\u5F53\u524D\u6CA1\u6709\u53EF\u4F18\u5148\u7684\u7B49\u5F85\u6587\u4EF6" };
+    }
+    const job2 = await resumeTelegramBackgroundJob(userId, fullId, chatId);
+    if (!job2) return { ok: false, toast: "\u4EFB\u52A1\u4E0D\u5728\u53EF\u7EE7\u7EED\u72B6\u6001" };
+    resumeChannelExecutionGroup(fullId);
+    return { ok: true, toast: "\u4EFB\u52A1\u5DF2\u7EE7\u7EED" };
+  }
+  const job = await cancelTelegramBackgroundJob(userId, fullId, chatId);
+  if (!job) return { ok: false, toast: "\u4EFB\u52A1\u5DF2\u7ED3\u675F\u6216\u65E0\u6CD5\u53D6\u6D88" };
+  cancelChannelExecutionGroup(fullId);
+  return { ok: true, toast: "\u4EFB\u52A1\u5DF2\u53D6\u6D88" };
+}
+var pendingTaskCenterCancels = /* @__PURE__ */ new Map();
+var taskCenterCardOwners = /* @__PURE__ */ new Map();
+var TASK_CENTER_CONFIRM_TTL_MS = 2 * 60 * 1e3;
+var TASK_CENTER_CARD_TTL_MS = 24 * 60 * 60 * 1e3;
+function taskCenterCardKey(chatId, messageId) {
+  return `${chatId}:${messageId}`;
+}
+function taskCenterCancelKey(userId, chatId, messageId) {
+  return `${userId}:${chatId}:${messageId}`;
+}
+async function handleTaskCenterCallback(client2, update, data) {
+  const userId = update.userId.toJSNumber();
+  if (!await isAuthenticatedAsync(userId)) {
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+    return;
+  }
+  const parsed = parseTaskCenterCallback(data);
+  if (!parsed) {
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u4EFB\u52A1\u6309\u94AE\u65E0\u6548\u6216\u5DF2\u8FC7\u671F", alert: true }));
+    return;
+  }
+  const chatId = getCallbackChatKey(update);
+  const ownerKey = taskCenterCardKey(chatId, Number(update.msgId));
+  const owner = taskCenterCardOwners.get(ownerKey);
+  if (!owner) {
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u65E7\u4EFB\u52A1\u5361\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001 /tasks", alert: true }));
+    return;
+  }
+  if (owner.expiresAt < Date.now() || owner.userId !== userId) {
+    if (owner.expiresAt < Date.now()) taskCenterCardOwners.delete(ownerKey);
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u8BE5\u4EFB\u52A1\u5361\u4E0D\u5C5E\u4E8E\u4F60\u6216\u5DF2\u8FC7\u671F", alert: true }));
+    return;
+  }
+  owner.expiresAt = Date.now() + TASK_CENTER_CARD_TTL_MS;
+  try {
+    if (parsed.view === "list") {
+      await renderTaskCenterList(client2, update, userId, chatId, parsed.page);
+      await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u4EFB\u52A1\u5217\u8868\u5DF2\u5237\u65B0" }));
+      return;
+    }
+    const item = await findTaskCenterItem(parsed.sourceType, parsed.id, chatId, userId);
+    if (!item) {
+      await renderTaskCenterList(client2, update, userId, chatId, parsed.page);
+      await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u4EFB\u52A1\u5DF2\u7ED3\u675F\u6216\u5DF2\u5931\u6548", alert: true }));
+      return;
+    }
+    if (parsed.view === "detail") {
+      await editTaskCenterView(client2, update, buildTaskCenterDetail(item, parsed.page));
+      await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId }));
+      return;
+    }
+    if (parsed.action === "cancel_prompt") {
+      pendingTaskCenterCancels.set(taskCenterCancelKey(userId, chatId, Number(update.msgId)), {
+        userId,
+        chatId,
+        messageId: Number(update.msgId),
+        sourceType: parsed.sourceType,
+        taskId: parsed.id,
+        expiresAt: Date.now() + TASK_CENTER_CONFIRM_TTL_MS
+      });
+      await editTaskCenterView(client2, update, buildTaskCancelConfirm(item, parsed.page));
+      await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u8BF7\u786E\u8BA4\u662F\u5426\u53D6\u6D88" }));
+      return;
+    }
+    if (parsed.action === "cancel_confirm") {
+      const confirmationKey = taskCenterCancelKey(userId, chatId, Number(update.msgId));
+      const pending = pendingTaskCenterCancels.get(confirmationKey);
+      pendingTaskCenterCancels.delete(confirmationKey);
+      if (!pending || pending.expiresAt < Date.now() || pending.sourceType !== parsed.sourceType || pending.taskId !== parsed.id) {
+        await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u53D6\u6D88\u786E\u8BA4\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u8FDB\u5165\u4EFB\u52A1\u8BE6\u60C5", alert: true }));
+        return;
+      }
+    }
+    let ok = false;
+    let toast = "";
+    if (parsed.sourceType === "memory") {
+      const result = parsed.action === "start" ? prioritizeDownloadTaskGroup(parsed.id, chatId, userId) : parsed.action === "pause" ? pauseDownloadTaskGroup(parsed.id, chatId, userId) : parsed.action === "resume" ? resumeDownloadTaskGroup(parsed.id, chatId, userId) : cancelDownloadTaskGroup(parsed.id, chatId, userId);
+      ok = result.status === "ok";
+      if (ok && (parsed.action === "pause" || parsed.action === "resume")) {
+        await refreshSilentProgress(client2, update.peer, userId, {
+          paused: result.group?.state === "paused",
+          pausing: result.group?.state === "pausing",
+          reason: parsed.action === "pause" ? result.group?.state === "pausing" ? "\u6B63\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\uFF0C\u968F\u540E\u6682\u505C" : "\u7528\u6237\u5DF2\u6682\u505C\u4EFB\u52A1" : void 0
+        });
+        if (parsed.action === "pause" && result.group?.state === "pausing") {
+          setTimeout(() => {
+            void refreshSilentProgress(client2, update.peer, userId).catch((error) => {
+              console.error("\u{1F916} \u6682\u505C\u72B6\u6001\u5EF6\u8FDF\u5237\u65B0\u5931\u8D25:", error);
+            });
+          }, 1500);
+        }
+      }
+      toast = ok ? parsed.action === "start" ? "\u5DF2\u63D0\u5347\u5230\u7B49\u5F85\u961F\u5217\u524D\u9762" : parsed.action === "pause" ? result.group?.state === "pausing" ? "\u5C06\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\u540E\u6682\u505C" : "\u4EFB\u52A1\u5DF2\u6682\u505C" : parsed.action === "resume" ? "\u4EFB\u52A1\u5DF2\u7EE7\u7EED" : "\u4EFB\u52A1\u5DF2\u53D6\u6D88" : result.status === "blocked" ? "\u4EFB\u52A1\u7531\u7CFB\u7EDF\u4FDD\u62A4\u6682\u505C\uFF0C\u9700\u7B49\u5F85\u7CFB\u7EDF\u6761\u4EF6\u6062\u590D" : result.status === "forbidden" ? "\u4EFB\u52A1\u4E0D\u5C5E\u4E8E\u5F53\u524D\u804A\u5929" : "\u4EFB\u52A1\u5DF2\u7ED3\u675F\u6216\u5DF2\u5931\u6548";
+    } else {
+      const result = await operateChannelTaskCenterItem(parsed.action, userId, chatId, parsed.id);
+      ok = result.ok;
+      toast = result.toast;
+    }
+    if (parsed.action === "cancel_confirm" || !ok) {
+      await renderTaskCenterList(client2, update, userId, chatId, parsed.page);
+    } else {
+      const refreshed = await findTaskCenterItem(parsed.sourceType, parsed.id, chatId, userId);
+      if (refreshed) {
+        await editTaskCenterView(client2, update, buildTaskCenterDetail(refreshed, parsed.page));
+      } else {
+        await renderTaskCenterList(client2, update, userId, chatId, parsed.page);
+      }
+    }
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast, alert: !ok }));
+  } catch (error) {
+    console.error("\u{1F916} \u4EFB\u52A1\u4E2D\u5FC3\u6309\u94AE\u64CD\u4F5C\u5931\u8D25:", error);
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({
+      queryId: update.queryId,
+      message: `\u64CD\u4F5C\u5931\u8D25: ${error.message}`,
+      alert: true
+    }));
   }
 }
 async function handleStopTasks(message) {
   try {
-    const result = forceStopDownloadTasks("\u7528\u6237\u901A\u8FC7 /stop_tasks \u5F3A\u5236\u505C\u6B62");
+    const senderId = message.senderId?.toJSNumber();
+    const chatId = message.chatId?.toString();
+    if (!senderId || !chatId) {
+      await message.reply({ message: "\u{1F4EE} \u65E0\u6CD5\u8BC6\u522B\u5F53\u524D\u804A\u5929\uFF0C\u672A\u505C\u6B62\u4EFB\u52A1" });
+      return;
+    }
+    const result = forceStopDownloadTasksForScope(chatId, senderId, "\u7528\u6237\u901A\u8FC7 /stop_tasks \u505C\u6B62\u5F53\u524D\u804A\u5929\u4EFB\u52A1");
     if (result.total === 0) {
       await message.reply({ message: "\u{1F4EE} \u5F53\u524D\u6CA1\u6709\u53EF\u505C\u6B62\u7684\u4E0B\u8F7D\u4EFB\u52A1" });
       return;
@@ -7525,17 +9279,39 @@ async function handleStopTasks(message) {
 async function handlePauseTasks(message, args = []) {
   const taskId = args[0];
   const senderId = message.senderId?.toJSNumber();
-  if (taskId && senderId) {
-    const job = await pauseTelegramBackgroundJob(senderId, taskId);
+  const chatId = message.chatId?.toString();
+  if (taskId && senderId && chatId) {
+    const ordinary = pauseDownloadTaskGroup(taskId, chatId, senderId);
+    if (ordinary.status === "ok") {
+      if (message.client && message.chatId) {
+        await refreshSilentProgress(message.client, message.chatId, senderId, {
+          paused: ordinary.group?.state === "paused",
+          pausing: ordinary.group?.state === "pausing",
+          reason: ordinary.group?.state === "pausing" ? "\u6B63\u5728\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\uFF0C\u968F\u540E\u6682\u505C" : "\u7528\u6237\u5DF2\u6682\u505C\u4EFB\u52A1"
+        }).catch((error) => console.error("\u{1F916} \u6682\u505C\u547D\u4EE4\u5237\u65B0\u4EFB\u52A1\u5361\u5931\u8D25:", error));
+      }
+      await message.reply({ message: ordinary.group?.state === "pausing" ? "\u23F8\uFE0F \u5DF2\u8BBE\u7F6E\uFF1A\u5B8C\u6210\u5F53\u524D\u6587\u4EF6\u540E\u6682\u505C\u8BE5\u4EFB\u52A1" : "\u23F8\uFE0F \u5DF2\u6682\u505C\u8BE5\u4EFB\u52A1" });
+      return;
+    }
+    const job = await pauseTelegramBackgroundJob(senderId, taskId, chatId);
     if (job) {
-      await message.reply({ message: `\u23F8\uFE0F \u5DF2\u6682\u505C\u9891\u9053\u4EFB\u52A1 ${String(job.id).slice(0, 8)}
+      const executionGroup = getChannelExecutionGroup(String(job.id));
+      if (executionGroup) pauseChannelExecutionGroup(String(job.id));
+      await message.reply({ message: `\u23F8\uFE0F \u5DF2\u6682\u505C\u9891\u9053\u4EFB\u52A1 ${String(job.id).slice(0, 12)}
 \u6765\u6E90\uFF1A${job.source}` });
       return;
     }
   }
-  const result = pauseDownloadTasks(taskId);
-  await message.reply({ message: `\u23F8\uFE0F \u5DF2\u6682\u505C\u5168\u5C40\u4E0B\u8F7D\u961F\u5217${taskId ? `
-\u4EFB\u52A1\u5361: ${taskId}` : ""}
+  const result = pauseDownloadTasks();
+  if (senderId && chatId && message.client) {
+    const scopeStatus = getDownloadTaskScopeStatus(chatId, senderId);
+    if (scopeStatus.paused || scopeStatus.pausing) {
+      await refreshSilentProgress(message.client, message.chatId, senderId).catch((error) => {
+        console.error("\u{1F916} \u6682\u505C\u547D\u4EE4\u5237\u65B0\u4EFB\u52A1\u5361\u5931\u8D25:", error);
+      });
+    }
+  }
+  await message.reply({ message: taskId ? `\u{1F4EE} \u6CA1\u6709\u627E\u5230\u4EFB\u52A1\uFF1A${taskId}\u3002\u672A\u6682\u505C\u5168\u5C40\u4E0B\u8F7D\u961F\u5217\u3002` : `\u23F8\uFE0F \u5DF2\u6682\u505C\u5168\u5C40\u4E0B\u8F7D\u961F\u5217
 
 \u8FDB\u884C\u4E2D: ${result.active}
 \u7B49\u5F85\u4E2D: ${result.pending}
@@ -7545,17 +9321,33 @@ async function handlePauseTasks(message, args = []) {
 async function handleResumeTasks(message, args = []) {
   const taskId = args[0];
   const senderId = message.senderId?.toJSNumber();
-  if (taskId && senderId) {
-    const job = await resumeTelegramBackgroundJob(senderId, taskId);
+  const chatId = message.chatId?.toString();
+  if (taskId && senderId && chatId) {
+    const ordinary = resumeDownloadTaskGroup(taskId, chatId, senderId);
+    if (ordinary.status === "ok") {
+      if (message.client && message.chatId) {
+        await refreshSilentProgress(message.client, message.chatId, senderId).catch((error) => {
+          console.error("\u{1F916} \u7EE7\u7EED\u547D\u4EE4\u5237\u65B0\u4EFB\u52A1\u5361\u5931\u8D25:", error);
+        });
+      }
+      await message.reply({ message: "\u25B6\uFE0F \u5DF2\u7EE7\u7EED\u8BE5\u4EFB\u52A1" });
+      return;
+    }
+    const job = await resumeTelegramBackgroundJob(senderId, taskId, chatId);
     if (job) {
-      await message.reply({ message: `\u25B6\uFE0F \u5DF2\u7EE7\u7EED\u9891\u9053\u4EFB\u52A1 ${String(job.id).slice(0, 8)}
+      resumeChannelExecutionGroup(String(job.id));
+      await message.reply({ message: `\u25B6\uFE0F \u5DF2\u7EE7\u7EED\u9891\u9053\u4EFB\u52A1 ${String(job.id).slice(0, 12)}
 \u6765\u6E90\uFF1A${job.source}` });
       return;
     }
   }
-  const result = resumeDownloadTasks(taskId);
-  await message.reply({ message: `\u25B6\uFE0F \u5DF2\u7EE7\u7EED\u5168\u5C40\u4E0B\u8F7D\u961F\u5217${taskId ? `
-\u4EFB\u52A1\u5361: ${taskId}` : ""}
+  const result = resumeDownloadTasks();
+  if (senderId && message.client && message.chatId) {
+    await refreshSilentProgress(message.client, message.chatId, senderId).catch((error) => {
+      console.error("\u{1F916} \u7EE7\u7EED\u547D\u4EE4\u5237\u65B0\u4EFB\u52A1\u5361\u5931\u8D25:", error);
+    });
+  }
+  await message.reply({ message: taskId ? `\u{1F4EE} \u6CA1\u6709\u627E\u5230\u4EFB\u52A1\uFF1A${taskId}\u3002\u672A\u7EE7\u7EED\u5168\u5C40\u4E0B\u8F7D\u961F\u5217\u3002` : `\u25B6\uFE0F \u5DF2\u7EE7\u7EED\u5168\u5C40\u4E0B\u8F7D\u961F\u5217
 
 \u8FDB\u884C\u4E2D: ${result.active}
 \u7B49\u5F85\u4E2D: ${result.pending}` });
@@ -7563,32 +9355,42 @@ async function handleResumeTasks(message, args = []) {
 async function handleCancelTask(message, args) {
   const selector = args.join(" ").trim() || "all";
   const senderId = message.senderId?.toJSNumber();
+  const chatId = message.chatId?.toString();
   if (senderId) {
     if (selector === "all") {
-      const jobs = await cancelAllTelegramBackgroundJobs(senderId);
-      const result2 = cancelDownloadTask(selector);
-      if (jobs.length > 0 || result2.total > 0) {
+      const currentChatJobs = (await listTelegramActiveTaskQueues(senderId, 1e3)).filter((job) => String(job.chat_id || "") === String(chatId || ""));
+      const jobs = [];
+      for (const row of currentChatJobs) {
+        const cancelled = await cancelTelegramBackgroundJob(senderId, String(row.id), chatId);
+        if (cancelled) jobs.push(cancelled);
+      }
+      for (const job of jobs) cancelChannelExecutionGroup(String(job.id));
+      const result = chatId ? forceStopDownloadTasksForScope(chatId, senderId, "\u7528\u6237\u901A\u8FC7 /task_cancel all \u53D6\u6D88\u5F53\u524D\u804A\u5929\u4EFB\u52A1") : { active: 0, pending: 0, total: 0 };
+      if (jobs.length > 0 || result.total > 0) {
         await message.reply({ message: `\u{1F6D1} \u5DF2\u53D6\u6D88\u4EFB\u52A1
 
 \u9891\u9053\u4EFB\u52A1: ${jobs.length}
-\u666E\u901A\u4E0B\u8F7D: \u5904\u7406\u4E2D ${result2.active} / \u7B49\u5F85 ${result2.pending}` });
+\u666E\u901A\u4E0B\u8F7D: \u5904\u7406\u4E2D ${result.active} / \u7B49\u5F85 ${result.pending}` });
         return;
       }
     } else {
-      const job = await cancelTelegramBackgroundJob(senderId, selector);
+      if (chatId) {
+        const ordinary = cancelDownloadTaskGroup(selector, chatId, senderId);
+        if (ordinary.status === "ok") {
+          await message.reply({ message: "\u{1F6D1} \u5DF2\u53D6\u6D88\u8BE5\u4E0B\u8F7D\u4EFB\u52A1" });
+          return;
+        }
+      }
+      const job = await cancelTelegramBackgroundJob(senderId, selector, chatId);
       if (job) {
-        await message.reply({ message: `\u{1F6D1} \u5DF2\u53D6\u6D88\u9891\u9053\u4EFB\u52A1 ${String(job.id).slice(0, 8)}
+        cancelChannelExecutionGroup(String(job.id));
+        await message.reply({ message: `\u{1F6D1} \u5DF2\u53D6\u6D88\u9891\u9053\u4EFB\u52A1 ${String(job.id).slice(0, 12)}
 \u6765\u6E90\uFF1A${job.source}` });
         return;
       }
     }
   }
-  const result = cancelDownloadTask(selector);
-  await message.reply({ message: result.total > 0 ? `\u{1F6D1} \u5DF2\u53D6\u6D88\u5339\u914D\u4EFB\u52A1
-
-\u5339\u914D: ${selector}
-\u5904\u7406\u4E2D: ${result.active}
-\u7B49\u5F85\u4E2D: ${result.pending}` : `\u{1F4EE} \u6CA1\u6709\u627E\u5230\u5339\u914D\u7684\u4EFB\u52A1\uFF0C\u672A\u6E05\u7A7A\u5168\u5C40\u961F\u5217\uFF1A${selector}` });
+  await message.reply({ message: `\u{1F4EE} \u6CA1\u6709\u627E\u5230\u5F53\u524D\u804A\u5929\u4E2D\u7684\u5339\u914D\u4EFB\u52A1\uFF1A${selector}` });
 }
 async function handleChannelTaskQueueCallback(client2, update, data) {
   const userId = update.userId.toJSNumber();
@@ -7596,55 +9398,62 @@ async function handleChannelTaskQueueCallback(client2, update, data) {
     await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
     return;
   }
+  const match = data.match(/^ctq_(pause|resume|cancel)_([0-9a-f]{4,}|all)$/i);
+  if (!match) return;
+  const [, action, selector] = match;
   try {
-    const match = data.match(/^ctq_(pause|resume|cancel)_([0-9a-f]{4,}|all)$/i);
-    if (!match) return;
-    const [, action, selector] = match;
-    let toast = "";
     if (selector === "all" && action === "cancel") {
-      const jobs2 = await cancelAllTelegramBackgroundJobs(userId);
-      toast = jobs2.length > 0 ? `\u5DF2\u53D6\u6D88 ${jobs2.length} \u4E2A\u9891\u9053\u4EFB\u52A1` : "\u6CA1\u6709\u53EF\u53D6\u6D88\u7684\u9891\u9053\u4EFB\u52A1";
-    } else if (action === "pause") {
-      const job = await pauseTelegramBackgroundJob(userId, selector);
-      toast = job ? `\u5DF2\u6682\u505C ${String(job.id).slice(0, 8)}` : "\u4EFB\u52A1\u4E0D\u5B58\u5728\u6216\u5DF2\u7ED3\u675F";
-    } else if (action === "resume") {
-      const job = await resumeTelegramBackgroundJob(userId, selector);
-      toast = job ? `\u5DF2\u7EE7\u7EED ${String(job.id).slice(0, 8)}` : "\u4EFB\u52A1\u4E0D\u5B58\u5728\u6216\u4E0D\u5728\u6682\u505C\u72B6\u6001";
-    } else {
-      const job = await cancelTelegramBackgroundJob(userId, selector);
-      toast = job ? `\u5DF2\u53D6\u6D88 ${String(job.id).slice(0, 8)}` : "\u4EFB\u52A1\u4E0D\u5B58\u5728\u6216\u5DF2\u7ED3\u675F";
+      await client2.invoke(new Api6.messages.SetBotCallbackAnswer({
+        queryId: update.queryId,
+        message: "\u65E7\u7248\u201C\u53D6\u6D88\u5168\u90E8\u201D\u6309\u94AE\u5DF2\u5931\u6548\uFF0C\u8BF7\u4F7F\u7528\u65B0\u7248 /tasks",
+        alert: true
+      }));
+      return;
     }
-    const jobs = await listTelegramActiveTaskQueues(userId, 10);
-    const status = getTaskStatus();
-    const sections = [];
-    if (status.active.length > 0 || status.pending.length > 0) sections.push(buildTasksReport(status.active, status.pending));
-    if (jobs.length > 0) sections.push(buildChannelTaskQueueReport(jobs));
-    await client2.editMessage(update.peer, {
-      message: Number(update.msgId),
-      text: sections.length > 0 ? sections.join("\\n\\n") : MSG.EMPTY_TASKS,
-      buttons: buildTasksKeyboard(jobs) || new Api6.ReplyInlineMarkup({ rows: [] })
-    });
-    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast }));
+    const rows = await listTelegramActiveTaskQueues(userId, 1e3);
+    const callbackChatId = getCallbackChatKey(update);
+    const matches = rows.filter((job) => String(job.chat_id || "") === callbackChatId && String(job.id).toLowerCase().startsWith(selector.toLowerCase()));
+    if (matches.length !== 1) {
+      await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: matches.length > 1 ? "\u4EFB\u52A1 ID \u524D\u7F00\u4E0D\u552F\u4E00\uFF0C\u8BF7\u4F7F\u7528\u65B0\u7248 /tasks \u5237\u65B0" : "\u4EFB\u52A1\u5DF2\u7ED3\u675F\u6216\u5DF2\u5931\u6548", alert: true }));
+      return;
+    }
+    const legacyAction = action === "cancel" ? "cancel_confirm" : action;
+    const result = await operateChannelTaskCenterItem(legacyAction, userId, callbackChatId, selector);
+    await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.toast, alert: !result.ok }));
   } catch (error) {
-    console.error("\u{1F916} \u9891\u9053\u4EFB\u52A1\u6309\u94AE\u64CD\u4F5C\u5931\u8D25:", error);
+    console.error("\u{1F916} \u517C\u5BB9\u9891\u9053\u4EFB\u52A1\u6309\u94AE\u64CD\u4F5C\u5931\u8D25:", error);
     await client2.invoke(new Api6.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `\u64CD\u4F5C\u5931\u8D25: ${error.message}`, alert: true }));
   }
 }
 async function handleRetryFailedTasks(message, args) {
   const senderId = message.senderId?.toJSNumber();
-  const jobSelector = args.find((arg) => /^[0-9a-f-]{4,}$/i.test(arg));
-  if (senderId && jobSelector) {
-    const jobRetry = await retryTelegramBackgroundJob(senderId, jobSelector);
-    if (jobRetry) {
-      await message.reply({ message: jobRetry.retried > 0 ? `\u{1F504} \u5DF2\u91CD\u65B0\u52A0\u5165\u9891\u9053\u4EFB\u52A1\u5931\u8D25\u9879 ${jobRetry.retried} \u4E2A
-\u4EFB\u52A1: ${String(jobRetry.id).slice(0, 8)}` : "\u{1F4EE} \u8BE5\u9891\u9053\u4EFB\u52A1\u6CA1\u6709\u53EF\u91CD\u8BD5\u5931\u8D25\u9879" });
+  const jobSelector = args.find((arg) => /^[0-9a-f-]{4,36}$/i.test(arg));
+  const chatId = message.chatId?.toString();
+  const jobRetry = senderId && jobSelector && chatId ? await retryTelegramBackgroundJob(senderId, jobSelector, chatId) : null;
+  if (jobSelector) {
+    if (!jobRetry) {
+      await message.reply({ message: "\u{1F4EE} \u6CA1\u6709\u627E\u5230\u552F\u4E00\u7684\u9891\u9053\u4EFB\u52A1\uFF0C\u672A\u91CD\u8BD5\u5176\u5B83\u4EFB\u52A1\u3002" });
+      return;
+    }
+    await message.reply({ message: jobRetry.retried > 0 ? `\u{1F504} \u5DF2\u91CD\u65B0\u52A0\u5165\u9891\u9053\u4EFB\u52A1\u5931\u8D25\u9879 ${jobRetry.retried} \u4E2A
+\u4EFB\u52A1: ${String(jobRetry.id).slice(0, 12)}` : "\u{1F4EE} \u8BE5\u9891\u9053\u4EFB\u52A1\u6CA1\u6709\u53EF\u91CD\u8BD5\u5931\u8D25\u9879" });
+    return;
+  }
+  const taskId = args.find((arg) => /^[sam][a-z0-9-]+$/i.test(arg));
+  const numericArg = args.find((arg) => /^\d+$/.test(arg));
+  const limit = Math.max(1, Math.min(50, parseInt(numericArg || "10", 10) || 10));
+  if (!senderId || !chatId) {
+    await message.reply({ message: "\u{1F4EE} \u65E0\u6CD5\u8BC6\u522B\u5F53\u524D\u804A\u5929\uFF0C\u672A\u6267\u884C\u5931\u8D25\u4EFB\u52A1\u91CD\u8BD5\u3002" });
+    return;
+  }
+  if (taskId) {
+    const group = getDownloadTaskGroup(taskId, chatId, senderId);
+    if (!group) {
+      await message.reply({ message: `\u{1F4EE} \u6CA1\u6709\u627E\u5230\u5F53\u524D\u804A\u5929\u4E2D\u7684\u5931\u8D25\u4EFB\u52A1\uFF1A${taskId}` });
       return;
     }
   }
-  const taskId = args.find((arg) => /^t[a-z0-9]+/i.test(arg));
-  const numericArg = args.find((arg) => /^\d+$/.test(arg));
-  const limit = Math.max(1, Math.min(50, parseInt(numericArg || "10", 10) || 10));
-  const result = await retryFailedDownloadTasks(limit, taskId);
+  const result = await retryFailedDownloadTasks(limit, taskId, chatId, senderId);
   await message.reply({ message: result.retried > 0 ? `\u{1F504} \u5DF2\u91CD\u65B0\u52A0\u5165 ${result.retried} \u4E2A\u5931\u8D25\u4EFB\u52A1${taskId ? `
 \u4EFB\u52A1: ${taskId}` : ""}` : "\u{1F4EE} \u6700\u8FD1\u6CA1\u6709\u53EF\u91CD\u8BD5\u7684\u5931\u8D25\u4EFB\u52A1" });
 }
@@ -7971,7 +9780,7 @@ async function handleFileConcurrencyCallback(client2, update, data) {
 init_db();
 init_storage();
 import fs10 from "fs";
-import path14 from "path";
+import path15 from "path";
 import { spawn } from "child_process";
 import os2 from "os";
 init_storageCooldown();
@@ -8018,7 +9827,7 @@ function selectPrimaryOutputFile(taskDir) {
   const entries = fs10.readdirSync(taskDir, { withFileTypes: true });
   const files = entries.filter((e) => e.isFile()).map((e) => ({
     name: e.name,
-    fullPath: path14.join(taskDir, e.name)
+    fullPath: path15.join(taskDir, e.name)
   })).filter((f) => !f.name.endsWith(".part") && !f.name.endsWith(".ytdl") && !f.name.endsWith(".json") && !f.name.endsWith(".tmp")).map((f) => ({
     ...f,
     size: fs10.existsSync(f.fullPath) ? fs10.statSync(f.fullPath).size : 0
@@ -8028,7 +9837,7 @@ function selectPrimaryOutputFile(taskDir) {
 }
 async function runYtDlpDownload(url, taskDir) {
   ensureDir(taskDir);
-  const outputTemplate = path14.join(taskDir, "%(title).200s-%(id)s.%(ext)s");
+  const outputTemplate = path15.join(taskDir, "%(title).200s-%(id)s.%(ext)s");
   const args = [
     "--no-playlist",
     "--newline",
@@ -8070,7 +9879,7 @@ async function uploadDownloadedFile(localFilePath, originalFileName) {
   const activeAccountId = storageManager.getActiveAccountId();
   await assertActiveStorageWritable();
   const safeName = sanitizeFilename(originalFileName);
-  const ext = path14.extname(safeName) || path14.extname(localFilePath) || "";
+  const ext = path15.extname(safeName) || path15.extname(localFilePath) || "";
   const mimeType = getMimeTypeFromFilename(safeName);
   const fileType = getFileType(mimeType);
   const storageRules = await getStoragePathRules();
@@ -8112,9 +9921,9 @@ async function handleYtDlpCommand(message, url) {
     status: "pending",
     createdAt: Date.now()
   };
-  const workBaseDir = path14.isAbsolute(YTDLP_WORK_DIR) ? YTDLP_WORK_DIR : path14.join(process.cwd(), YTDLP_WORK_DIR);
+  const workBaseDir = path15.isAbsolute(YTDLP_WORK_DIR) ? YTDLP_WORK_DIR : path15.join(process.cwd(), YTDLP_WORK_DIR);
   ensureDir(workBaseDir);
-  const taskDir = path14.join(workBaseDir, task.id);
+  const taskDir = path15.join(workBaseDir, task.id);
   await message.reply({ message: `\u23EC \u5F00\u59CB\u89E3\u6790\u5E76\u4E0B\u8F7D...
 Task: ${task.id}` });
   ytDlpQueue.add(async () => {
@@ -8426,7 +10235,7 @@ async function updateJobProgressMessage(statusMessage, summary) {
   const totalDone = summary.completed + summary.failed + summary.skipped;
   const lines = [
     summary.status === "paused" ? `\u23F8\uFE0F **\u9891\u9053\u4E0B\u8F7D\u5DF2\u6682\u505C**` : summary.status === "cooling" ? `\u23F8\uFE0F **Google Drive \u9650\u989D\u51B7\u5374\u4E2D**` : summary.status === "cancelled" ? `\u{1F6D1} **\u9891\u9053\u4E0B\u8F7D\u5DF2\u53D6\u6D88**` : totalDone >= summary.totalMediaFound && summary.scanStatus === "done" ? `\u2705 **\u9891\u9053\u4EFB\u52A1\u5B8C\u6210**` : `\u{1F50E} **\u9891\u9053\u4EFB\u52A1\u8FD0\u884C\u4E2D**`,
-    `\u{1F194} job: ${summary.jobId.slice(0, 8)}`,
+    `\u{1F194} job: ${summary.jobId.slice(0, 12)}`,
     `\u{1F4CD} \u9891\u9053\uFF1A${summary.source}`,
     ``,
     `\u{1F50E} \u626B\u63CF\uFF1A${summary.scanStatus}`,
@@ -8437,7 +10246,7 @@ async function updateJobProgressMessage(statusMessage, summary) {
     `\u2705 \u6210\u529F ${summary.completed}\u3000\u23F3 \u5F85\u4E0B\u8F7D ${summary.pending}\u3000\u{1F504} \u4E0B\u8F7D\u4E2D ${summary.downloading}\u3000\u274C \u5931\u8D25 ${summary.failed}\u3000\u23ED \u8DF3\u8FC7 ${summary.skipped}`,
     summary.cooldownUntil ? summary.status === "cooling" ? `\u23F8\uFE0F Google Drive \u9650\u989D\u51B7\u5374\u5230\uFF1A${summary.cooldownUntil}` : `\u23F3 FloodWait \u51B7\u5374\u5230\uFF1A${summary.cooldownUntil}` : "",
     ``,
-    `\u63A7\u5236\uFF1A/task_pause ${summary.jobId.slice(0, 8)} \xB7 /task_resume ${summary.jobId.slice(0, 8)} \xB7 /task_cancel ${summary.jobId.slice(0, 8)}`
+    `\u63A7\u5236\uFF1A/task_pause ${summary.jobId.slice(0, 12)} \xB7 /task_resume ${summary.jobId.slice(0, 12)} \xB7 /task_cancel ${summary.jobId.slice(0, 12)}`
   ].filter(Boolean);
   await statusMessage.edit({ text: lines.join("\n") }).catch(() => void 0);
 }
@@ -8456,15 +10265,19 @@ async function updateScanStatusMessage(statusMessage, summary) {
 }
 async function replyWithJobResult(statusMessage, fallbackMessage, promise, kind) {
   promise.then((result) => {
+    const cancelled = Boolean(result.cancelled);
     const commentLine = result.commentMediaFound || result.commentMessagesScanned ? `
 \u8BC4\u8BBA\u533A: \u626B\u63CF ${result.commentMessagesScanned || 0} \u6761\uFF0C\u53D1\u73B0 ${result.commentMediaFound || 0} \u4E2A\u6587\u4EF6` : "";
-    const text = kind === "tag" ? `\u2705 \u6807\u7B7E\u4E0B\u8F7D\u4EFB\u52A1\u5B8C\u6210
+    const text = cancelled ? `\u{1F6D1} ${kind === "tag" ? "\u6807\u7B7E" : "\u65E5\u671F"}\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u53D6\u6D88
+ID: ${String(result.jobId).slice(0, 12)}
+\u5DF2\u5B8C\u6210: ${result.successful || 0}
+\u8DF3\u8FC7: ${result.skipped || 0}${commentLine}` : kind === "tag" ? `\u2705 \u6807\u7B7E\u4E0B\u8F7D\u4EFB\u52A1\u5B8C\u6210
 \u6807\u7B7E: ${result.tag}
-ID: ${String(result.jobId).slice(0, 8)}
+ID: ${String(result.jobId).slice(0, 12)}
 \u5165\u961F: ${result.found}
 \u8DF3\u8FC7: ${result.skipped}
 \u5931\u8D25: ${result.failed}${commentLine}` : `\u2705 \u65E5\u671F\u8303\u56F4\u4EFB\u52A1\u5B8C\u6210
-ID: ${String(result.jobId).slice(0, 8)}
+ID: ${String(result.jobId).slice(0, 12)}
 \u5165\u961F: ${result.found}
 \u8DF3\u8FC7: ${result.skipped}
 \u5931\u8D25: ${result.failed}${commentLine}`;
@@ -8928,15 +10741,15 @@ async function handleTaskQueueCallback(update, data) {
   }
   try {
     if (action === "pause") {
-      pauseDownloadTasks(taskId);
-      await refreshSilentProgress(client, update.peer);
-      await client.invoke(new Api7.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u6682\u505C\u5168\u5C40\u4E0B\u8F7D\u961F\u5217" }));
+      const result = pauseDownloadTasks(taskId);
+      await refreshSilentProgress(client, update.peer, userId);
+      await client.invoke(new Api7.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.total > 0 ? "\u5DF2\u6682\u505C\u4E0B\u8F7D\u961F\u5217" : "\u5F53\u524D\u6CA1\u6709\u53EF\u6682\u505C\u7684\u4E0B\u8F7D\u4EFB\u52A1" }));
       return;
     }
     if (action === "resume") {
-      resumeDownloadTasks(taskId);
-      await refreshSilentProgress(client, update.peer);
-      await client.invoke(new Api7.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: "\u5DF2\u7EE7\u7EED\u5168\u5C40\u4E0B\u8F7D\u961F\u5217" }));
+      const result = resumeDownloadTasks(taskId);
+      await refreshSilentProgress(client, update.peer, userId);
+      await client.invoke(new Api7.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.total > 0 ? "\u5DF2\u7EE7\u7EED\u4E0B\u8F7D\u961F\u5217" : "\u5F53\u524D\u6CA1\u6709\u7B49\u5F85\u4E2D\u7684\u4E0B\u8F7D\u4EFB\u52A1" }));
       return;
     }
     await cancelSilentTask(client, update.peer, taskId, update.msgId, userId);
@@ -9070,7 +10883,7 @@ async function initTelegramBot() {
     console.error("\u{1F916} Telegram Bot \u540C\u6B65\u5B58\u50A8\u914D\u7F6E\u5931\u8D25:", e);
   }
   try {
-    const sessionDir = path15.dirname(SESSION_FILE);
+    const sessionDir = path16.dirname(SESSION_FILE);
     if (!fs11.existsSync(sessionDir)) {
       fs11.mkdirSync(sessionDir, { recursive: true, mode: 448 });
     }
@@ -9214,7 +11027,7 @@ async function initTelegramBot() {
             const qrDataUrl = await generateOTPAuthUrl();
             const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, "");
             const buffer = Buffer.from(base64Data, "base64");
-            const tempPath = path15.join(process.cwd(), `temp_qr_${senderId}_${Date.now()}_${Math.random().toString(36).slice(2)}.png`);
+            const tempPath = path16.join(process.cwd(), `temp_qr_${senderId}_${Date.now()}_${Math.random().toString(36).slice(2)}.png`);
             fs11.writeFileSync(tempPath, buffer);
             const qrMessage = await client.sendFile(chatId, {
               file: tempPath,
@@ -9687,6 +11500,10 @@ ${buildPathPreviewLine(appliedPath.folder)}
           await handleTelegramSubscriptionCallback(callbackUpdate, data);
           return;
         }
+        if (data.startsWith("tc_")) {
+          await handleTaskCenterCallback(activeClient, callbackUpdate, data);
+          return;
+        }
         if (data.startsWith("ctq_")) {
           await handleChannelTaskQueueCallback(activeClient, callbackUpdate, data);
           return;
@@ -9793,7 +11610,7 @@ setInterval(() => {
   });
 }, 60 * 60 * 1e3);
 function generateToken() {
-  return crypto7.randomBytes(32).toString("hex");
+  return crypto8.randomBytes(32).toString("hex");
 }
 function issueSession(req, res) {
   const token = generateToken();
@@ -10011,7 +11828,7 @@ function generateSignature(fileId, typeOrExpires, expires) {
     throw new Error("Missing signed URL expiration timestamp");
   }
   const data = `${fileId}:${type}:${expiresTimestamp}`;
-  return crypto8.createHmac("sha256", SESSION_SECRET).update(data).digest("hex");
+  return crypto9.createHmac("sha256", SESSION_SECRET).update(data).digest("hex");
 }
 function getSignedUrl(fileId, type, expiresIn = 24 * 60 * 60) {
   const expires = Date.now() + expiresIn * 1e3;
@@ -10039,7 +11856,7 @@ function verifySignedUrl(req) {
   try {
     const received = Buffer.from(sign, "hex");
     const expected = Buffer.from(expectedSign, "hex");
-    if (received.length !== expected.length || !crypto8.timingSafeEqual(received, expected)) {
+    if (received.length !== expected.length || !crypto9.timingSafeEqual(received, expected)) {
       console.log("[SignedURL] Signature mismatch:", { id, type });
       return false;
     }
@@ -10060,12 +11877,12 @@ function requireAuthOrSignedUrl(req, res, next) {
 // src/routes/files.ts
 init_localPath();
 var router2 = Router2();
-var UPLOAD_DIR5 = path16.resolve(process.env.UPLOAD_DIR || "./data/uploads");
-var THUMBNAIL_DIR5 = path16.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
-var PREVIEW_DIR3 = path16.resolve(process.env.PREVIEW_DIR || "./data/previews");
+var UPLOAD_DIR5 = path17.resolve(process.env.UPLOAD_DIR || "./data/uploads");
+var THUMBNAIL_DIR5 = path17.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var PREVIEW_DIR3 = path17.resolve(process.env.PREVIEW_DIR || "./data/previews");
 async function getSafeLocalFilePath(file) {
-  const candidate = file.path || path16.join(UPLOAD_DIR5, file.stored_name);
-  const resolved = path16.resolve(candidate);
+  const candidate = file.path || path17.join(UPLOAD_DIR5, file.stored_name);
+  const resolved = path17.resolve(candidate);
   if (!isPathInside(UPLOAD_DIR5, resolved)) {
     throw new Error("Unsafe local file path");
   }
@@ -10366,13 +12183,13 @@ router2.get("/:id([0-9a-fA-F-]{36})/preview", async (req, res) => {
       return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728\u4E8E\u670D\u52A1\u5668" });
     }
     let previewPath = file.preview_path;
-    let preferredPreviewPath = previewPath && (file.type === "image" || file.type === "video") ? path16.join(PREVIEW_DIR3, path16.basename(previewPath)) : null;
+    let preferredPreviewPath = previewPath && (file.type === "image" || file.type === "video") ? path17.join(PREVIEW_DIR3, path17.basename(previewPath)) : null;
     if (file.type === "image" && (!preferredPreviewPath || !fs12.existsSync(preferredPreviewPath))) {
       try {
         const generatedPreview = await generateMediaPreview(filePath, file.stored_name || file.name, file.mime_type || "application/octet-stream");
         if (generatedPreview) {
-          previewPath = path16.basename(generatedPreview);
-          preferredPreviewPath = path16.join(PREVIEW_DIR3, previewPath);
+          previewPath = path17.basename(generatedPreview);
+          preferredPreviewPath = path17.join(PREVIEW_DIR3, previewPath);
           await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [previewPath, file.id]);
         }
       } catch (previewError) {
@@ -10381,7 +12198,7 @@ router2.get("/:id([0-9a-fA-F-]{36})/preview", async (req, res) => {
     } else if (file.type === "video" && (!preferredPreviewPath || !fs12.existsSync(preferredPreviewPath))) {
       void generateMediaPreview(filePath, file.stored_name || file.name, file.mime_type || "application/octet-stream").then(async (generatedPreview) => {
         if (!generatedPreview) return;
-        const generatedPreviewName = path16.basename(generatedPreview);
+        const generatedPreviewName = path17.basename(generatedPreview);
         await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [generatedPreviewName, file.id]);
         console.log(`[Preview] \u{1F39E}\uFE0F Lazy video preview cached for ${file.id}: ${generatedPreviewName}`);
       }).catch((previewError) => console.error("\u61D2\u751F\u6210\u89C6\u9891\u9884\u89C8\u5931\u8D25:", previewError));
@@ -10513,7 +12330,7 @@ router2.get("/:id([0-9a-fA-F-]{36})/thumbnail", async (req, res) => {
     if (!file.thumbnail_path) {
       return res.status(404).json({ error: "\u65E0\u7F29\u7565\u56FE" });
     }
-    const thumbPath = path16.join(THUMBNAIL_DIR5, path16.basename(file.thumbnail_path));
+    const thumbPath = path17.join(THUMBNAIL_DIR5, path17.basename(file.thumbnail_path));
     if (!fs12.existsSync(thumbPath)) {
       return res.status(404).json({ error: "\u7F29\u7565\u56FE\u6587\u4EF6\u4E0D\u5B58\u5728" });
     }
@@ -10681,10 +12498,10 @@ var files_default = router2;
 init_db();
 init_localPath();
 import { Router as Router3 } from "express";
-import path17 from "path";
+import path18 from "path";
 var router3 = Router3({ strict: true });
-var UPLOAD_DIR6 = path17.resolve(process.env.UPLOAD_DIR || "./data/uploads");
-var THUMBNAIL_DIR6 = path17.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
+var UPLOAD_DIR6 = path18.resolve(process.env.UPLOAD_DIR || "./data/uploads");
+var THUMBNAIL_DIR6 = path18.resolve(process.env.THUMBNAIL_DIR || "./data/thumbnails");
 var CLOUD_SOURCES2 = /* @__PURE__ */ new Set(["onedrive", "aliyun_oss", "s3", "webdav", "google_drive"]);
 async function getCurrentStorageScope2() {
   const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
@@ -10703,11 +12520,11 @@ async function removePhysicalFile2(file) {
     const provider = storageManager2.getProvider(`${file.source}:${file.storage_account_id}`);
     await provider.deleteFile(file.path);
   } else {
-    const filePath = file.path || path17.join(UPLOAD_DIR6, file.stored_name);
+    const filePath = file.path || path18.join(UPLOAD_DIR6, file.stored_name);
     await safeUnlink(filePath, UPLOAD_DIR6);
   }
   if (file.thumbnail_path) {
-    const thumbPath = path17.join(THUMBNAIL_DIR6, path17.basename(file.thumbnail_path));
+    const thumbPath = path18.join(THUMBNAIL_DIR6, path18.basename(file.thumbnail_path));
     await safeUnlink(thumbPath, THUMBNAIL_DIR6);
   }
 }
@@ -10834,7 +12651,7 @@ init_db();
 import { Router as Router4 } from "express";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
-import path18 from "path";
+import path19 from "path";
 import fs13 from "fs";
 
 // src/middleware/apiKey.ts
@@ -10920,7 +12737,7 @@ function decodeFilename(filename) {
   }
   return filename;
 }
-var TEMP_DIR = path18.join(process.cwd(), "data", "temp");
+var TEMP_DIR = path19.join(process.cwd(), "data", "temp");
 if (!fs13.existsSync(TEMP_DIR)) {
   fs13.mkdirSync(TEMP_DIR, { recursive: true });
 }
@@ -10929,7 +12746,7 @@ var storage = multer.diskStorage({
     cb(null, TEMP_DIR);
   },
   filename: (_req, file, cb) => {
-    const ext = path18.extname(file.originalname);
+    const ext = path19.extname(file.originalname);
     const storedName = `${uuidv4()}${ext}`;
     cb(null, storedName);
   }
@@ -10950,7 +12767,7 @@ var handleUpload = async (req, res, source = "web") => {
   const originalName = decodeFilename(file.originalname);
   const mimeType = file.mimetype;
   const size = file.size;
-  const tempPath = path18.resolve(file.path);
+  const tempPath = path19.resolve(file.path);
   const activeAccountId = storageManager.getActiveAccountId();
   const storageRules = await getStoragePathRules();
   const storageFolder = buildStorageFolderWithRules({ source, folder: folder || null, mimeType, fileName: originalName }, storageRules);
@@ -10988,7 +12805,7 @@ var handleUpload = async (req, res, source = "web") => {
       try {
         const thumbResult = await generateThumbnail(tempPath, storedName, mimeType);
         if (thumbResult) {
-          thumbnailPath = path18.basename(thumbResult);
+          thumbnailPath = path19.basename(thumbResult);
           console.log(`[Upload] \u2728 Thumbnail generated: ${thumbnailPath}`);
           const dims = await getImageDimensions(tempPath, mimeType);
           width = dims.width;
@@ -11004,7 +12821,7 @@ var handleUpload = async (req, res, source = "web") => {
       try {
         const previewResult = await generateMediaPreview(tempPath, storedName, mimeType);
         if (previewResult) {
-          previewPath = path18.basename(previewResult);
+          previewPath = path19.basename(previewResult);
           console.log(`[Upload] \u{1F39E}\uFE0F Image preview generated: ${previewPath}`);
         }
       } catch (error) {
@@ -11041,7 +12858,7 @@ var handleUpload = async (req, res, source = "web") => {
     if (provider.name === "local" && type === "video") {
       void generateMediaPreview(storedPath, storedName, mimeType).then(async (previewResult) => {
         if (!previewResult) return;
-        const generatedPreviewName = path18.basename(previewResult);
+        const generatedPreviewName = path19.basename(previewResult);
         await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [generatedPreviewName, newFile.id]);
         console.log(`[Upload] \u{1F39E}\uFE0F Video preview generated async: ${generatedPreviewName}`);
       }).catch((error) => console.error("\u5F02\u6B65\u751F\u6210\u89C6\u9891\u9884\u89C8\u5931\u8D25:", error));
@@ -11081,15 +12898,15 @@ init_db();
 import { Router as Router5 } from "express";
 import checkDiskSpaceModule2 from "check-disk-space";
 import os3 from "os";
-import path19 from "path";
+import path20 from "path";
 import fs14 from "fs";
 import axios3 from "axios";
-import crypto9 from "crypto";
+import crypto10 from "crypto";
 var checkDiskSpace2 = checkDiskSpaceModule2.default || checkDiskSpaceModule2;
 var router5 = Router5();
 var UPLOAD_DIR7 = process.env.UPLOAD_DIR || "./data/uploads";
 function sendOAuthSuccessPage(res, providerName, messageType) {
-  const nonce = crypto9.randomBytes(16).toString("base64");
+  const nonce = crypto10.randomBytes(16).toString("base64");
   res.setHeader("Content-Security-Policy", [
     "default-src 'self'",
     "style-src 'unsafe-inline'",
@@ -11151,7 +12968,7 @@ function getGoogleDriveRedirectUri(req) {
 }
 router5.get("/stats", requireAuth, async (_req, res) => {
   try {
-    const diskPath = os3.platform() === "win32" ? "C:" : path19.resolve(UPLOAD_DIR7);
+    const diskPath = os3.platform() === "win32" ? "C:" : path20.resolve(UPLOAD_DIR7);
     const diskSpace = await checkDiskSpace2(diskPath);
     const scope = await getCurrentStorageScope();
     const result = await query(`
@@ -11279,7 +13096,7 @@ router5.post("/config/onedrive/auth-url", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "\u7F3A\u5C11 Client ID \u6216 Redirect URI" });
     }
     const { OneDriveStorageProvider: OneDriveStorageProvider2, StorageManager: StorageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
-    const oauthState = crypto9.randomBytes(24).toString("base64url");
+    const oauthState = crypto10.randomBytes(24).toString("base64url");
     const authUrl = OneDriveStorageProvider2.generateAuthUrl(clientId, tenantId || "common", redirectUri, oauthState);
     if (clientSecret) {
       await StorageManager2.updateSetting("onedrive_client_secret", clientSecret);
@@ -11372,7 +13189,7 @@ router5.post("/config/google-drive/auth-url", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "\u7F3A\u5C11\u5FC5\u8981\u53C2\u6570 (Client ID, Client Secret \u6216 Redirect URI)" });
     }
     const { GoogleDriveStorageProvider: GoogleDriveStorageProvider2, StorageManager: StorageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
-    const oauthState = crypto9.randomBytes(24).toString("base64url");
+    const oauthState = crypto10.randomBytes(24).toString("base64url");
     const authUrl = GoogleDriveStorageProvider2.generateAuthUrl(clientId, clientSecret, redirectUri, oauthState);
     await StorageManager2.updateSetting("google_drive_client_id", clientId);
     await StorageManager2.updateSetting("google_drive_client_secret", clientSecret);
@@ -11554,7 +13371,7 @@ var storage_default = router5;
 init_db();
 import { Router as Router6 } from "express";
 import { v4 as uuidv42 } from "uuid";
-import path20 from "path";
+import path21 from "path";
 import fs15 from "fs";
 import { pipeline } from "stream/promises";
 init_storage();
@@ -11584,7 +13401,7 @@ setInterval(() => {
   const now = /* @__PURE__ */ new Date();
   uploadSessions.forEach((session, uploadId) => {
     if (now.getTime() - session.createdAt.getTime() > 24 * 60 * 60 * 1e3) {
-      const chunkDir = path20.join(CHUNK_DIR, uploadId);
+      const chunkDir = path21.join(CHUNK_DIR, uploadId);
       if (fs15.existsSync(chunkDir)) {
         fs15.rmSync(chunkDir, { recursive: true });
       }
@@ -11625,7 +13442,7 @@ router6.post("/init", (req, res) => {
       return res.status(429).json({ error: "\u5F53\u524D\u4E0A\u4F20\u4F1A\u8BDD\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5" });
     }
     const uploadId = uuidv42();
-    const chunkDir = path20.join(CHUNK_DIR, uploadId);
+    const chunkDir = path21.join(CHUNK_DIR, uploadId);
     fs15.mkdirSync(chunkDir, { recursive: true });
     uploadSessions.set(uploadId, {
       uploadId,
@@ -11667,7 +13484,7 @@ router6.post("/chunk", async (req, res) => {
     if (declaredLength > MAX_CHUNK_BYTES) {
       return res.status(413).json({ error: "\u5355\u4E2A\u5206\u5757\u8FC7\u5927" });
     }
-    const chunkPath = path20.join(CHUNK_DIR, uploadId, `chunk_${chunkIndex}`);
+    const chunkPath = path21.join(CHUNK_DIR, uploadId, `chunk_${chunkIndex}`);
     const writeStream = fs15.createWriteStream(chunkPath);
     await new Promise((resolve, reject) => {
       let receivedBytes = 0;
@@ -11724,13 +13541,13 @@ router6.post("/complete", async (req, res) => {
       fileName: session.filename
     }, storageRules);
     const storedName = await getUniqueStoredName(session.filename, storageFolder, activeAccountId);
-    const tempMergedPath = path20.resolve(path20.join(UPLOAD_DIR8, `${uploadId}-${storedName}`));
+    const tempMergedPath = path21.resolve(path21.join(UPLOAD_DIR8, `${uploadId}-${storedName}`));
     const writeStream = fs15.createWriteStream(tempMergedPath);
     console.log(`[ChunkedComplete] \u{1F9E9} Merging ${session.totalChunks} chunks for: ${session.filename}`);
     console.log(`[ChunkedComplete] \u{1F3E0} Final temp path: ${tempMergedPath}`);
     try {
       for (let i = 0; i < session.totalChunks; i++) {
-        const chunkPath = path20.join(CHUNK_DIR, uploadId, `chunk_${i}`);
+        const chunkPath = path21.join(CHUNK_DIR, uploadId, `chunk_${i}`);
         if (!fs15.existsSync(chunkPath)) {
           throw new Error(`\u7F3A\u5C11\u5206\u5757 ${i}`);
         }
@@ -11748,7 +13565,7 @@ router6.post("/complete", async (req, res) => {
     } catch (mergeError) {
       writeStream.destroy();
       if (fs15.existsSync(tempMergedPath)) fs15.unlinkSync(tempMergedPath);
-      const chunkDir2 = path20.join(CHUNK_DIR, uploadId);
+      const chunkDir2 = path21.join(CHUNK_DIR, uploadId);
       if (fs15.existsSync(chunkDir2)) fs15.rmSync(chunkDir2, { recursive: true });
       uploadSessions.delete(uploadId);
       return res.status(400).json({ error: mergeError instanceof Error ? mergeError.message : "\u5408\u5E76\u5206\u5757\u5931\u8D25" });
@@ -11756,7 +13573,7 @@ router6.post("/complete", async (req, res) => {
     const mergedStat = fs15.statSync(tempMergedPath);
     if (mergedStat.size !== session.totalSize) {
       if (fs15.existsSync(tempMergedPath)) fs15.unlinkSync(tempMergedPath);
-      const chunkDir2 = path20.join(CHUNK_DIR, uploadId);
+      const chunkDir2 = path21.join(CHUNK_DIR, uploadId);
       if (fs15.existsSync(chunkDir2)) fs15.rmSync(chunkDir2, { recursive: true });
       uploadSessions.delete(uploadId);
       return res.status(400).json({
@@ -11765,7 +13582,7 @@ router6.post("/complete", async (req, res) => {
         actualSize: mergedStat.size
       });
     }
-    const chunkDir = path20.join(CHUNK_DIR, uploadId);
+    const chunkDir = path21.join(CHUNK_DIR, uploadId);
     fs15.rmSync(chunkDir, { recursive: true });
     uploadSessions.delete(uploadId);
     const duplicateMode = await getDuplicateMode();
@@ -11798,7 +13615,7 @@ router6.post("/complete", async (req, res) => {
         console.log(`[ChunkedComplete] \u{1F5BC}\uFE0F  MIME: ${session.mimeType}, starting generation...`);
         const thumbResult = await generateThumbnail(tempMergedPath, storedName, session.mimeType);
         if (thumbResult) {
-          thumbnailPath = path20.basename(thumbResult);
+          thumbnailPath = path21.basename(thumbResult);
           console.log(`[ChunkedComplete] \u2728 Thumbnail generated: ${thumbnailPath}`);
           const dims = await getImageDimensions(tempMergedPath, session.mimeType);
           width = dims.width;
@@ -11814,7 +13631,7 @@ router6.post("/complete", async (req, res) => {
       try {
         const previewResult = await generateMediaPreview(tempMergedPath, storedName, session.mimeType);
         if (previewResult) {
-          previewPath = path20.basename(previewResult);
+          previewPath = path21.basename(previewResult);
           console.log(`[ChunkedComplete] \u{1F39E}\uFE0F Image preview generated: ${previewPath}`);
         }
       } catch (error) {
@@ -11847,7 +13664,7 @@ router6.post("/complete", async (req, res) => {
     if (provider.name === "local" && type === "video") {
       void generateMediaPreview(storedPath, storedName, session.mimeType).then(async (previewResult) => {
         if (!previewResult) return;
-        const generatedPreviewName = path20.basename(previewResult);
+        const generatedPreviewName = path21.basename(previewResult);
         await query("UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2", [generatedPreviewName, newFile.id]);
         console.log(`[ChunkedComplete] \u{1F39E}\uFE0F Video preview generated async: ${generatedPreviewName}`);
       }).catch((error) => console.error("\u5F02\u6B65\u751F\u6210\u89C6\u9891\u9884\u89C8\u5931\u8D25:", error));
@@ -11878,7 +13695,7 @@ router6.delete("/:uploadId", (req, res) => {
     const uploadId = req.params.uploadId;
     const session = uploadSessions.get(uploadId);
     if (session) {
-      const chunkDir = path20.join(CHUNK_DIR, uploadId);
+      const chunkDir = path21.join(CHUNK_DIR, uploadId);
       if (fs15.existsSync(chunkDir)) {
         fs15.rmSync(chunkDir, { recursive: true });
       }
@@ -12014,9 +13831,9 @@ app.listen(PORT, async () => {
   console.log(`
 \u{1F680} TG Vault \u540E\u7AEF\u670D\u52A1\u5DF2\u542F\u52A8
 \u{1F4CD} \u7AEF\u53E3: ${PORT}
-\u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path21.resolve(UPLOAD_DIR9)}
-\u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path21.resolve(THUMBNAIL_DIR8)}
-\u{1F39E}\uFE0F  \u9884\u89C8\u76EE\u5F55: ${path21.resolve(PREVIEW_DIR4)}
+\u{1F4C1} \u4E0A\u4F20\u76EE\u5F55: ${path22.resolve(UPLOAD_DIR9)}
+\u{1F5BC}\uFE0F  \u7F29\u7565\u56FE\u76EE\u5F55: ${path22.resolve(THUMBNAIL_DIR8)}
+\u{1F39E}\uFE0F  \u9884\u89C8\u76EE\u5F55: ${path22.resolve(PREVIEW_DIR4)}
 \u{1F510} \u5BC6\u7801\u4FDD\u62A4: ${initialSetupRequired ? "\u5F85\u9996\u6B21\u521D\u59CB\u5316" : "\u5DF2\u542F\u7528"}
 \u{1F916} Telegram Bot: ${telegramEnabled ? "\u5DF2\u542F\u7528 (\u6700\u5927 2GB\uFF0C\u8D26\u53F7\u7EA7\u4E0B\u8F7D\u5668\u4E0D\u53D7\u6B64\u9650\u5236)" : "\u672A\u542F\u7528"}
 \u{1F464} Telegram User Download: ${isTelegramUserClientReady() ? "\u5DF2\u542F\u7528" : "\u672A\u542F\u7528"}

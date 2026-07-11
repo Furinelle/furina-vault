@@ -83,3 +83,7 @@ export async function clearExpiredStorageCooldowns(): Promise<number> {
     const result = await query(`DELETE FROM storage_account_cooldowns WHERE cooldown_until <= NOW()`);
     return result.rowCount || 0;
 }
+
+export function describeStorageCooldownRecovery(cooldownUntil: Date): string {
+    return `系统会在 ${cooldownUntil.toISOString()} 后重新检查；如果限制已解除，将自动继续，否则会更新冷却时间并继续等待。`;
+}

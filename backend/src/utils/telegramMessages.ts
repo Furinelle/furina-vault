@@ -22,36 +22,55 @@ export function getProviderDisplayName(providerName: string): string {
     return PROVIDER_DISPLAY_MAP[providerName] || `📦 ${providerName}`;
 }
 
-function buildTaskControlLines(taskId?: string, queuePaused = false, pauseReason?: string): string[] {
+interface TaskSystemPauseView {
+    kind: 'disk_pressure' | 'storage_cooldown' | 'telegram_flood_wait';
+    reason: string;
+    autoResume: boolean;
+    recheckMs?: number;
+    retryAt?: string;
+}
+
+function buildTaskControlLines(taskId?: string, queuePaused = false, pauseReason?: string, systemPause?: TaskSystemPauseView): string[] {
     if (!taskId) return [`💡 发送 /tasks 查看实时任务状态`];
     if (queuePaused) {
+        const systemPaused = Boolean(systemPause);
+        const pausing = !systemPause && /随后暂停|完成当前文件/.test(pauseReason || '');
+        const recoveryLine = systemPause
+            ? systemPause.autoResume
+                ? systemPause.retryAt
+                    ? `♻️ 预计在 ${systemPause.retryAt} 后自动恢复；无需手动操作`
+                    : systemPause.recheckMs
+                        ? `♻️ 系统每 ${Math.max(1, Math.round(systemPause.recheckMs / 1000))} 秒重新检查，条件满足后自动恢复`
+                        : `♻️ 系统会持续检查，条件满足后自动恢复`
+                : `⚠️ 此状态不会自动恢复，请按原因处理后重试`
+            : pausing
+                ? `▶️ 可点击“继续”撤销暂停请求`
+                : `▶️ 点击下方“继续”会恢复下载队列`;
         return [
-            `⏸️ **当前状态：全局下载队列已暂停**`,
+            `⏸️ **当前状态：${systemPaused ? '系统保护暂停' : pausing ? '正在暂停' : '用户暂停'}**`,
             pauseReason ? `📌 原因：${pauseReason}` : `📌 等待中的下载任务不会继续开始`,
-            `▶️ 点击下方“继续”会恢复全局下载队列`,
+            recoveryLine,
             `🛑 点击“取消”只会结束这张后台任务卡；不会再误清空其它任务`,
         ];
     }
     return [
         `💡 队列控制：按钮只对当前聊天的任务卡有效`,
-        `⏸ 暂停：暂停全局下载队列，已在处理的文件会尽快停住`,
-        `▶️ 继续：恢复全局下载队列`,
+        `⏸ 暂停：完成当前文件后暂停该任务`,
+        `▶️ 继续：继续该任务；若是用户暂停，也会解除用户暂停状态`,
         `🛑 取消：结束当前任务卡并移除按钮，不会误取消其它聊天任务`,
     ];
 }
 
-export function buildTaskControlButtons(taskId?: string): Api.ReplyInlineMarkup | undefined {
+export function buildTaskControlButtons(taskId?: string, queuePaused = false, systemPause?: TaskSystemPauseView, queuePausing = false, userPaused = queuePaused && !systemPause): Api.ReplyInlineMarkup | undefined {
     if (!taskId) return undefined;
+    const actionButtons: Api.TypeKeyboardButton[] = queuePaused || queuePausing
+        ? systemPause && !userPaused
+            ? []
+            : [new Api.KeyboardButtonCallback({ text: '▶️ 继续', data: Buffer.from(`tq_resume_${taskId}`) })]
+        : [new Api.KeyboardButtonCallback({ text: '⏸ 暂停', data: Buffer.from(`tq_pause_${taskId}`) })];
+    actionButtons.push(new Api.KeyboardButtonCallback({ text: '🛑 取消', data: Buffer.from(`tq_cancel_${taskId}`) }));
     return new Api.ReplyInlineMarkup({
-        rows: [
-            new Api.KeyboardButtonRow({
-                buttons: [
-                    new Api.KeyboardButtonCallback({ text: '⏸ 暂停', data: Buffer.from(`tq_pause_${taskId}`) }),
-                    new Api.KeyboardButtonCallback({ text: '▶️ 继续', data: Buffer.from(`tq_resume_${taskId}`) }),
-                    new Api.KeyboardButtonCallback({ text: '🛑 取消', data: Buffer.from(`tq_cancel_${taskId}`) }),
-                ],
-            }),
-        ],
+        rows: [new Api.KeyboardButtonRow({ buttons: actionButtons })],
     });
 }
 
@@ -502,14 +521,14 @@ export function buildDeleteSuccess(fileName: string, fileId: string): string {
 // ─── 多文件上传 ──────────────────────────────────────────────
 
 /** 静默模式通知 */
-export function buildSilentModeNotice(fileCount: number, taskId?: string, queuePaused = false, pauseReason?: string): string {
+export function buildSilentModeNotice(fileCount: number, taskId?: string, queuePaused = false, pauseReason?: string, systemPause?: TaskSystemPauseView): string {
     return [
-        queuePaused ? `⏸️ **后台下载已暂停**` : `🤐 **已切换到静默模式**`,
+        queuePaused ? (systemPause ? `⏸️ **已进入系统保护暂停**` : `⏸️ **后台下载已暂停**`) : `🤐 **已切换到静默模式**`,
         ...(taskId ? [`🆔 任务：\`${taskId}\``] : []),
         ``,
         queuePaused ? `等待任务已暂停，不会继续开始新的下载。` : `Bot 将在后台继续处理所有文件，请耐心等待。`,
         ``,
-        ...buildTaskControlLines(taskId, queuePaused, pauseReason),
+        ...buildTaskControlLines(taskId, queuePaused, pauseReason, systemPause),
     ].join('\n');
 }
 
@@ -523,6 +542,7 @@ interface SilentProgressBatch {
     providerName?: string;
     queuePending?: number;
     currentFileName?: string;
+    currentFileActive?: boolean;
 }
 
 interface SilentProgressFile {
@@ -543,6 +563,8 @@ export function buildSilentProgress(
     taskId?: string,
     queuePaused = false,
     pauseReason?: string,
+    queuePausing = false,
+    systemPause?: TaskSystemPauseView,
 ): string {
     const totalBatchFiles = batches.reduce((sum, batch) => sum + batch.totalFiles, 0);
     const completedBatchFiles = batches.reduce((sum, batch) => sum + batch.completed, 0);
@@ -558,14 +580,24 @@ export function buildSilentProgress(
     const isComplete = totalFiles > 0 && remainingFiles === 0;
     const activeBatch = batches.find(batch => batch.completed < batch.totalFiles);
     const activeSingle = singleFiles.find(file => !['success', 'failed'].includes(file.phase));
-    const currentFile = activeBatch?.currentFileName || activeSingle?.fileName;
+    const currentFile = queuePaused || queuePausing
+        ? undefined
+        : activeBatch?.currentFileActive
+            ? activeBatch.currentFileName
+            : activeSingle?.phase === 'downloading' || activeSingle?.phase === 'saving'
+                ? activeSingle.fileName
+                : undefined;
     const progress = generateProgressBar(completedFiles, Math.max(totalFiles, 1));
     if (isComplete) {
         return buildSilentAllTasksComplete(totalFiles, failedFiles, taskId, singleFiles, batches);
     }
 
     return [
-        queuePaused ? `⏸️ **后台下载已暂停**` : `🤐 **后台批量处理中**`,
+        queuePaused
+            ? (systemPause ? `⏸️ **系统保护暂停**` : `⏸️ **后台下载已暂停**`)
+            : queuePausing
+                ? `⏸️ **正在完成当前文件，随后暂停**`
+                : `🤐 **后台批量处理中**`,
         `${progress} (${completedFiles}/${totalFiles})`,
         ``,
         `✅ 成功: ${successfulFiles}　❌ 失败: ${failedFiles}　⏳ 剩余: ${remainingFiles}`,
@@ -573,7 +605,7 @@ export function buildSilentProgress(
         ...(activeBatch ? [`📁 批次: ${activeBatch.folderName}`] : []),
         ...(activeBatch?.queuePending ? [`🕒 队列等待: ${activeBatch.queuePending}`] : []),
         ``,
-        ...buildTaskControlLines(taskId, queuePaused, pauseReason),
+        ...buildTaskControlLines(taskId, queuePaused || queuePausing, pauseReason, systemPause),
         ...(taskId && failedFiles > 0 && remainingFiles === 0 ? [`🔄 检测到失败任务，可发送 /tg_retry ${taskId} 重试最近失败项`] : []),
     ].join('\n');
 }
@@ -649,6 +681,7 @@ export interface ConsolidatedBatchEntry {
     isSilent?: boolean;
     queuePending?: number;
     currentFileName?: string;
+    currentFileActive?: boolean;
 }
 
 /**
@@ -811,7 +844,7 @@ export async function buildConsolidatedStatus(
             if (!isDone) {
                 const progress = generateProgressBar(batch.completed, batch.totalFiles);
                 lines.push(`    ${progress} (${batch.completed}/${batch.totalFiles})`);
-                if (batch.currentFileName) {
+                if (batch.currentFileActive && batch.currentFileName) {
                     lines.push(`    📄 当前: ${batch.currentFileName}`);
                 }
             } else {

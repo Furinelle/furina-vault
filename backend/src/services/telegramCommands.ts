@@ -1,4 +1,5 @@
 import { Api, TelegramClient } from 'telegram';
+import { getPeerId } from 'telegram/Utils.js';
 import { query } from '../db/index.js';
 import checkDiskSpaceModule from 'check-disk-space';
 import os from 'os';
@@ -11,19 +12,19 @@ import {
     buildHelp,
     buildStorageReport,
     buildFileList,
-    buildTasksReport,
     buildDeleteSuccess,
     getProviderDisplayName,
 } from '../utils/telegramMessages.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync } from './telegramState.js';
-import { forceStopDownloadTasks, getDownloadQueueStats, getTaskStatus, pauseDownloadTasks, resumeDownloadTasks, cancelDownloadTask, retryFailedDownloadTasks, getFileDownloadConcurrency, setFileDownloadConcurrency } from './telegramUpload.js';
+import { forceStopDownloadTasksForScope, getDownloadQueueStats, getDownloadTaskScopeStatus, pauseDownloadTasks, resumeDownloadTasks, retryFailedDownloadTasks, getFileDownloadConcurrency, setFileDownloadConcurrency, listDownloadTaskGroups, getDownloadTaskGroup, prioritizeDownloadTaskGroup, pauseDownloadTaskGroup, resumeDownloadTaskGroup, cancelDownloadTaskGroup, getChannelExecutionGroup, prioritizeChannelExecutionGroup, pauseChannelExecutionGroup, resumeChannelExecutionGroup, cancelChannelExecutionGroup, refreshSilentProgress } from './telegramUpload.js';
 import { storageManager } from './storage.js';
-import { cancelAllTelegramBackgroundJobs, cancelTelegramBackgroundJob, listTelegramActiveTaskQueues, pauseTelegramBackgroundJob, resumeTelegramBackgroundJob, retryTelegramBackgroundJob } from './telegramChannelJobs.js';
+import { cancelTelegramBackgroundJob, listTelegramActiveTaskQueues, pauseTelegramBackgroundJob, resumeTelegramBackgroundJob, retryTelegramBackgroundJob } from './telegramChannelJobs.js';
 import { getSetting, setSetting } from '../utils/settings.js';
 import { DuplicateMode, getDuplicateMode } from '../utils/duplicatePolicy.js';
 import { startPeriodicCleanup, stopPeriodicCleanup } from './orphanCleanup.js';
 import { safeUnlink } from '../utils/localPath.js';
 import { getCurrentStorageScope, nextParam, removePhysicalFile } from '../utils/fileScope.js';
+import { buildTaskCancelConfirm, buildTaskCenterDetail, buildTaskCenterPage, channelTaskCenterItem, ordinaryTaskCenterItem, parseTaskCenterCallback, type TaskCenterButton, type TaskCenterItem, type TaskCenterSourceType, type TaskCenterView } from './telegramTaskCenter.js';
 import {
     buildPathSettingsKeyboard,
     buildPathSettingsText,
@@ -416,12 +417,24 @@ function buildCleanupSettingsText(enabled: boolean): string {
     ].join('\n');
 }
 
+function canonicalTelegramChatKey(value: unknown): string {
+    const text = String(value ?? '').trim();
+    if (!text) return text;
+    if (/^-100\d+$/.test(text)) return text.slice(4);
+    if (/^-\d+$/.test(text)) return text.slice(1);
+    return text;
+}
+
 function getCallbackChatKey(update: Api.UpdateBotCallbackQuery): string {
-    const peer: any = update.peer as any;
-    const value = peer?.userId || peer?.chatId || peer?.channelId || update.userId;
-    if (value && typeof value.toJSNumber === 'function') return String(value.toJSNumber());
-    if (value !== undefined && value !== null) return String(value);
-    return String(update.userId.toJSNumber());
+    try {
+        return canonicalTelegramChatKey(getPeerId(update.peer as any, true));
+    } catch {
+        const peer: any = update.peer as any;
+        const value = peer?.userId || peer?.chatId || peer?.channelId || update.userId;
+        if (value && typeof value.toJSNumber === 'function') return canonicalTelegramChatKey(value.toJSNumber());
+        if (value !== undefined && value !== null) return canonicalTelegramChatKey(value);
+        return canonicalTelegramChatKey(update.userId.toJSNumber());
+    }
 }
 
 export async function handleStart(message: Api.Message, senderId: number): Promise<void> {
@@ -744,129 +757,313 @@ export async function handleDeleteConfirmCallback(client: TelegramClient, update
     }
 }
 
-function formatTaskAge(value: unknown): string | null {
-    if (!value) return null;
-    const ms = new Date(value as string).getTime();
-    if (!Number.isFinite(ms) || ms <= 0) return null;
-    const diffSeconds = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-    if (diffSeconds < 60) return '刚刚';
-    const diffMinutes = Math.floor(diffSeconds / 60);
-    if (diffMinutes < 60) return `${diffMinutes} 分钟前`;
-    const diffHours = Math.floor(diffMinutes / 60);
-    if (diffHours < 24) return `${diffHours} 小时前`;
-    return `${Math.floor(diffHours / 24)} 天前`;
-}
-
-function buildChannelTaskQueueReport(jobs: any[]): string {
-    const labelStatus = (value: string | undefined) => ({
-        pending: '等待',
-        queued: '排队',
-        scanning: '扫描中',
-        active: '传输中',
-        done: '完成',
-        running: '运行中',
-        paused: '已暂停',
-        failed: '失败',
-        cancelled: '已取消',
-        completed: '完成',
-        completed_with_errors: '部分完成',
-    } as Record<string, string>)[value || ''] || (value || '未知');
-
-    const lines = ['📡 **频道任务队列**'];
-    jobs.forEach((job: any, index: number) => {
-        const total = Number(job.total_count || job.item_count || 0);
-        const pending = Number(job.pending_count || 0);
-        const downloading = Number(job.downloading_count || 0);
-        const success = Number(job.success_count || 0);
-        const failed = Number(job.failed_count || 0);
-        const skipped = Number(job.skipped_count_items || job.skipped_count || 0);
-        const done = success + failed + skipped;
-        const missing = Number(job.missing_metadata_count || 0);
-        const activeNow = Boolean(job.is_actively_running);
-        const paused = job.status === 'paused';
-        const cooldownUntilMs = job.cooldown_until ? new Date(job.cooldown_until).getTime() : 0;
-        const inCooldown = cooldownUntilMs > Date.now();
-        const statusText = paused ? '已暂停' : inCooldown ? '冷却等待中' : activeNow ? '正在运行' : '等待接手';
-        const icon = paused ? '⏸️' : inCooldown ? '🧊' : activeNow ? '🟢' : '⏳';
-        const updatedText = formatTaskAge(job.updated_at);
-        const id = String(job.id).slice(0, 8);
-        lines.push([
-            '',
-            `${index + 1}. ${icon} **${statusText}** · ${job.kind}`,
-            `   来源：${job.source}`,
-            `   阶段：扫描 ${labelStatus(job.scan_status)} · 下载 ${labelStatus(job.download_status)}`,
-            `   队列：下载中 ${downloading} · 待处理 ${pending} · 已完成 ${done}/${total}`,
-            failed > 0 ? `   异常：失败 ${failed} · 跳过 ${skipped}` : (skipped > 0 ? `   跳过：${skipped}` : ''),
-            missing > 0 ? `   提示：${missing} 个待处理条目正在补全文件信息` : '',
-            inCooldown ? `   冷却到：${new Date(job.cooldown_until).toLocaleString('zh-CN', { hour12: false })}` : '',
-            updatedText ? `   最近活动：${updatedText}` : '',
-            `   ID：${id}`,
-        ].filter(Boolean).join('\n'));
+function buildTaskCenterMarkup(rows: TaskCenterButton[][]): Api.ReplyInlineMarkup {
+    return new Api.ReplyInlineMarkup({
+        rows: rows.map(row => new Api.KeyboardButtonRow({
+            buttons: row.map(button => new Api.KeyboardButtonCallback({
+                text: button.text,
+                data: Buffer.from(button.data),
+            })),
+        })),
     });
-    return lines.join('\n');
 }
 
-function buildTasksKeyboard(jobs: any[]): Api.ReplyInlineMarkup | undefined {
-    if (jobs.length === 0) return undefined;
-    const rows: Api.KeyboardButtonRow[] = [];
-    for (const job of jobs.slice(0, 8)) {
-        const id = String(job.id).slice(0, 8);
-        const paused = job.status === 'paused';
-        rows.push(new Api.KeyboardButtonRow({
-            buttons: [
-                new Api.KeyboardButtonCallback({
-                    text: `${paused ? '▶️ 继续' : '⏸ 暂停'} ${id}`,
-                    data: Buffer.from(`ctq_${paused ? 'resume' : 'pause'}_${id}`),
-                }),
-                new Api.KeyboardButtonCallback({
-                    text: `🛑 取消 ${id}`,
-                    data: Buffer.from(`ctq_cancel_${id}`),
-                }),
-            ],
-        }));
+function mergeChannelExecutionState(item: TaskCenterItem | null, row: any): TaskCenterItem | null {
+    if (!item) return null;
+    const executionGroup = getChannelExecutionGroup(String(row.id));
+    if (!executionGroup) return item;
+    item.active = executionGroup.active;
+    item.pending = executionGroup.pending;
+    item.currentFileName = executionGroup.currentFileName || item.currentFileName;
+    if (row.status === 'paused') item.state = executionGroup.active > 0 ? 'pausing' : 'paused';
+    return item;
+}
+
+async function loadTaskCenterItems(chatId: string, userId: number): Promise<TaskCenterItem[]> {
+    const ordinaryItems = listDownloadTaskGroups(chatId, userId)
+        .map(ordinaryTaskCenterItem)
+        .filter((item): item is TaskCenterItem => Boolean(item));
+    const channelRows = await listTelegramActiveTaskQueues(userId, 1000);
+    const channelItems = channelRows
+        .filter(row => String(row.chat_id || '') === chatId)
+        .map(row => {
+            const paramsSource = row.params;
+            const params = typeof paramsSource === 'string'
+                ? (() => { try { const parsed = JSON.parse(paramsSource); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } })()
+                : (paramsSource && typeof paramsSource === 'object' && !Array.isArray(paramsSource) ? paramsSource : {});
+            const folder = row.folder_override || params.folderOverride || null;
+            return mergeChannelExecutionState(channelTaskCenterItem({ ...row, folder_override: folder }), row);
+        })
+        .filter((item): item is TaskCenterItem => Boolean(item));
+    return [...ordinaryItems, ...channelItems];
+}
+
+async function findTaskCenterItem(
+    sourceType: TaskCenterSourceType,
+    id: string,
+    chatId: string,
+    userId: number,
+): Promise<TaskCenterItem | null> {
+    if (sourceType === 'memory') {
+        const group = getDownloadTaskGroup(id, chatId, userId);
+        return group ? ordinaryTaskCenterItem(group) : null;
     }
-    if (jobs.length > 1) {
-        rows.push(new Api.KeyboardButtonRow({
-            buttons: [new Api.KeyboardButtonCallback({ text: '🛑 取消全部频道任务', data: Buffer.from('ctq_cancel_all') })],
-        }));
+    const rows = await listTelegramActiveTaskQueues(userId, 1000);
+    const matches = rows.filter(job => String(job.chat_id || '') === chatId && String(job.id).toLowerCase().startsWith(id.toLowerCase()));
+    if (matches.length !== 1) return null;
+    const row = matches[0];
+    if (String(row.chat_id || '') !== chatId) return null;
+    const paramsSource = row.params;
+    const params = typeof paramsSource === 'string'
+        ? (() => { try { const parsed = JSON.parse(paramsSource); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } })()
+        : (paramsSource && typeof paramsSource === 'object' && !Array.isArray(paramsSource) ? paramsSource : {});
+    if (!row.folder_override && params.folderOverride) row.folder_override = params.folderOverride;
+    return mergeChannelExecutionState(channelTaskCenterItem(row), row);
+}
+
+async function editTaskCenterView(
+    client: TelegramClient,
+    update: Api.UpdateBotCallbackQuery,
+    view: TaskCenterView,
+): Promise<void> {
+    try {
+        await client.editMessage(update.peer, {
+            message: Number(update.msgId),
+            text: view.text,
+            buttons: buildTaskCenterMarkup(view.rows),
+        });
+    } catch (error) {
+        if (!isTelegramMessageNotModified(error)) throw error;
     }
-    return new Api.ReplyInlineMarkup({ rows });
+}
+
+async function renderTaskCenterList(
+    client: TelegramClient,
+    update: Api.UpdateBotCallbackQuery,
+    userId: number,
+    chatId: string,
+    page: number,
+): Promise<void> {
+    const items = await loadTaskCenterItems(chatId, userId);
+    await editTaskCenterView(client, update, buildTaskCenterPage(items, page));
 }
 
 export async function handleTasks(message: Api.Message): Promise<void> {
     try {
-        const status = getTaskStatus();
-        const activeCount = status.active.length;
-        const pendingCount = status.pending.length;
         const senderId = message.senderId?.toJSNumber();
-        const jobs = senderId ? await listTelegramActiveTaskQueues(senderId, 10) : [];
+        const chatId = message.chatId?.toString();
+        if (!senderId || !chatId) {
+            await message.reply({ message: MSG.ERR_TASKS });
+            return;
+        }
+        const items = await loadTaskCenterItems(chatId, senderId);
+        const view = buildTaskCenterPage(items, 0);
+        const sent = await message.reply({ message: view.text, buttons: buildTaskCenterMarkup(view.rows) }) as Api.Message;
+        if (sent?.id) taskCenterCardOwners.set(taskCenterCardKey(chatId, sent.id), { userId: senderId, expiresAt: Date.now() + TASK_CENTER_CARD_TTL_MS });
+    } catch (error) {
+        console.error('🤖 获取任务中心失败:', error);
+        await message.reply({ message: MSG.ERR_TASKS });
+    }
+}
 
-        if (activeCount === 0 && pendingCount === 0 && jobs.length === 0) {
-            await message.reply({ message: MSG.EMPTY_TASKS });
+async function operateChannelTaskCenterItem(
+    action: 'start' | 'pause' | 'resume' | 'cancel_confirm',
+    userId: number,
+    chatId: string,
+    id: string,
+): Promise<{ ok: boolean; toast: string }> {
+    const rows = await listTelegramActiveTaskQueues(userId, 1000);
+    const matches = rows.filter(job => String(job.chat_id || '') === chatId && String(job.id).toLowerCase().startsWith(id.toLowerCase()));
+    if (matches.length !== 1) return { ok: false, toast: matches.length > 1 ? '任务 ID 前缀不唯一，请刷新任务列表' : '任务已结束或已失效' };
+    const row = matches[0];
+    const fullId = String(row.id);
+    if (action === 'pause') {
+        if (row.status !== 'running') return { ok: false, toast: '任务当前不在运行状态' };
+        const job = await pauseTelegramBackgroundJob(userId, fullId, chatId);
+        if (!job) return { ok: false, toast: '任务已结束或无法暂停' };
+        const executionGroup = getChannelExecutionGroup(fullId);
+        if (executionGroup) pauseChannelExecutionGroup(fullId);
+        return { ok: true, toast: executionGroup?.active ? '将在完成当前文件后暂停' : '任务已暂停' };
+    }
+    if (action === 'resume' || action === 'start') {
+        if (action === 'start' && row.status === 'running') {
+            const prioritized = prioritizeChannelExecutionGroup(fullId);
+            return prioritized.status === 'ok'
+                ? { ok: true, toast: '已提升到等待队列前面' }
+                : { ok: false, toast: '任务当前没有可优先的等待文件' };
+        }
+        const job = await resumeTelegramBackgroundJob(userId, fullId, chatId);
+        if (!job) return { ok: false, toast: '任务不在可继续状态' };
+        resumeChannelExecutionGroup(fullId);
+        return { ok: true, toast: '任务已继续' };
+    }
+    const job = await cancelTelegramBackgroundJob(userId, fullId, chatId);
+    if (!job) return { ok: false, toast: '任务已结束或无法取消' };
+    cancelChannelExecutionGroup(fullId);
+    return { ok: true, toast: '任务已取消' };
+}
+
+const pendingTaskCenterCancels = new Map<string, { userId: number; chatId: string; messageId: number; sourceType: TaskCenterSourceType; taskId: string; expiresAt: number }>();
+const taskCenterCardOwners = new Map<string, { userId: number; expiresAt: number }>();
+const TASK_CENTER_CONFIRM_TTL_MS = 2 * 60 * 1000;
+const TASK_CENTER_CARD_TTL_MS = 24 * 60 * 60 * 1000;
+
+function taskCenterCardKey(chatId: string, messageId: number): string {
+    return `${chatId}:${messageId}`;
+}
+
+function taskCenterCancelKey(userId: number, chatId: string, messageId: number): string {
+    return `${userId}:${chatId}:${messageId}`;
+}
+
+export async function handleTaskCenterCallback(
+    client: TelegramClient,
+    update: Api.UpdateBotCallbackQuery,
+    data: string,
+): Promise<void> {
+    const userId = update.userId.toJSNumber();
+    if (!(await isAuthenticatedAsync(userId))) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
+        return;
+    }
+    const parsed = parseTaskCenterCallback(data);
+    if (!parsed) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '任务按钮无效或已过期', alert: true }));
+        return;
+    }
+    const chatId = getCallbackChatKey(update);
+    const ownerKey = taskCenterCardKey(chatId, Number(update.msgId));
+    const owner = taskCenterCardOwners.get(ownerKey);
+    if (!owner) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '旧任务卡已失效，请重新发送 /tasks', alert: true }));
+        return;
+    }
+    if (owner.expiresAt < Date.now() || owner.userId !== userId) {
+        if (owner.expiresAt < Date.now()) taskCenterCardOwners.delete(ownerKey);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '该任务卡不属于你或已过期', alert: true }));
+        return;
+    }
+    owner.expiresAt = Date.now() + TASK_CENTER_CARD_TTL_MS;
+    try {
+        if (parsed.view === 'list') {
+            await renderTaskCenterList(client, update, userId, chatId, parsed.page);
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '任务列表已刷新' }));
             return;
         }
 
-        const sections: string[] = [];
-        if (activeCount > 0 || pendingCount > 0) {
-            sections.push(buildTasksReport(status.active, status.pending));
+        const item = await findTaskCenterItem(parsed.sourceType, parsed.id, chatId, userId);
+        if (!item) {
+            await renderTaskCenterList(client, update, userId, chatId, parsed.page);
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '任务已结束或已失效', alert: true }));
+            return;
         }
-        if (jobs.length > 0) {
-            sections.push(buildChannelTaskQueueReport(jobs));
-        }
-        await message.reply({
-            message: sections.filter(Boolean).join('\n\n'),
-            buttons: buildTasksKeyboard(jobs),
-        });
 
+        if (parsed.view === 'detail') {
+            await editTaskCenterView(client, update, buildTaskCenterDetail(item, parsed.page));
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId }));
+            return;
+        }
+        if (parsed.action === 'cancel_prompt') {
+            pendingTaskCenterCancels.set(taskCenterCancelKey(userId, chatId, Number(update.msgId)), {
+                userId,
+                chatId,
+                messageId: Number(update.msgId),
+                sourceType: parsed.sourceType,
+                taskId: parsed.id,
+                expiresAt: Date.now() + TASK_CENTER_CONFIRM_TTL_MS,
+            });
+            await editTaskCenterView(client, update, buildTaskCancelConfirm(item, parsed.page));
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '请确认是否取消' }));
+            return;
+        }
+        if (parsed.action === 'cancel_confirm') {
+            const confirmationKey = taskCenterCancelKey(userId, chatId, Number(update.msgId));
+            const pending = pendingTaskCenterCancels.get(confirmationKey);
+            pendingTaskCenterCancels.delete(confirmationKey);
+            if (!pending || pending.expiresAt < Date.now() || pending.sourceType !== parsed.sourceType || pending.taskId !== parsed.id) {
+                await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '取消确认已过期，请重新进入任务详情', alert: true }));
+                return;
+            }
+        }
+
+        let ok = false;
+        let toast = '';
+        if (parsed.sourceType === 'memory') {
+            const result = parsed.action === 'start'
+                ? prioritizeDownloadTaskGroup(parsed.id, chatId, userId)
+                : parsed.action === 'pause'
+                    ? pauseDownloadTaskGroup(parsed.id, chatId, userId)
+                    : parsed.action === 'resume'
+                        ? resumeDownloadTaskGroup(parsed.id, chatId, userId)
+                        : cancelDownloadTaskGroup(parsed.id, chatId, userId);
+            ok = result.status === 'ok';
+            if (ok && (parsed.action === 'pause' || parsed.action === 'resume')) {
+                await refreshSilentProgress(client, update.peer, userId, {
+                    paused: result.group?.state === 'paused',
+                    pausing: result.group?.state === 'pausing',
+                    reason: parsed.action === 'pause'
+                        ? result.group?.state === 'pausing'
+                            ? '正在完成当前文件，随后暂停'
+                            : '用户已暂停任务'
+                        : undefined,
+                });
+                if (parsed.action === 'pause' && result.group?.state === 'pausing') {
+                    setTimeout(() => {
+                        void refreshSilentProgress(client, update.peer, userId).catch(error => {
+                            console.error('🤖 暂停状态延迟刷新失败:', error);
+                        });
+                    }, 1500);
+                }
+            }
+            toast = ok
+                ? parsed.action === 'start'
+                    ? '已提升到等待队列前面'
+                    : parsed.action === 'pause'
+                        ? (result.group?.state === 'pausing' ? '将在完成当前文件后暂停' : '任务已暂停')
+                        : parsed.action === 'resume'
+                            ? '任务已继续'
+                            : '任务已取消'
+                : result.status === 'blocked'
+                    ? '任务由系统保护暂停，需等待系统条件恢复'
+                    : result.status === 'forbidden'
+                        ? '任务不属于当前聊天'
+                        : '任务已结束或已失效';
+        } else {
+            const result = await operateChannelTaskCenterItem(parsed.action, userId, chatId, parsed.id);
+            ok = result.ok;
+            toast = result.toast;
+        }
+
+        if (parsed.action === 'cancel_confirm' || !ok) {
+            await renderTaskCenterList(client, update, userId, chatId, parsed.page);
+        } else {
+            const refreshed = await findTaskCenterItem(parsed.sourceType, parsed.id, chatId, userId);
+            if (refreshed) {
+                await editTaskCenterView(client, update, buildTaskCenterDetail(refreshed, parsed.page));
+            } else {
+                await renderTaskCenterList(client, update, userId, chatId, parsed.page);
+            }
+        }
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast, alert: !ok }));
     } catch (error) {
-        console.error('🤖 获取任务列表失败:', error);
-        await message.reply({ message: MSG.ERR_TASKS });
+        console.error('🤖 任务中心按钮操作失败:', error);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({
+            queryId: update.queryId,
+            message: `操作失败: ${(error as Error).message}`,
+            alert: true,
+        }));
     }
 }
 
 export async function handleStopTasks(message: Api.Message): Promise<void> {
     try {
-        const result = forceStopDownloadTasks('用户通过 /stop_tasks 强制停止');
+        const senderId = message.senderId?.toJSNumber();
+        const chatId = message.chatId?.toString();
+        if (!senderId || !chatId) {
+            await message.reply({ message: '📮 无法识别当前聊天，未停止任务' });
+            return;
+        }
+        const result = forceStopDownloadTasksForScope(chatId, senderId, '用户通过 /stop_tasks 停止当前聊天任务');
         if (result.total === 0) {
             await message.reply({ message: '📮 当前没有可停止的下载任务' });
             return;
@@ -884,52 +1081,113 @@ export async function handleStopTasks(message: Api.Message): Promise<void> {
 export async function handlePauseTasks(message: Api.Message, args: string[] = []): Promise<void> {
     const taskId = args[0];
     const senderId = message.senderId?.toJSNumber();
-    if (taskId && senderId) {
-        const job = await pauseTelegramBackgroundJob(senderId, taskId);
+    const chatId = message.chatId?.toString();
+    if (taskId && senderId && chatId) {
+        const ordinary = pauseDownloadTaskGroup(taskId, chatId, senderId);
+        if (ordinary.status === 'ok') {
+            if (message.client && message.chatId) {
+                await refreshSilentProgress(message.client as TelegramClient, message.chatId, senderId, {
+                    paused: ordinary.group?.state === 'paused',
+                    pausing: ordinary.group?.state === 'pausing',
+                    reason: ordinary.group?.state === 'pausing' ? '正在完成当前文件，随后暂停' : '用户已暂停任务',
+                }).catch(error => console.error('🤖 暂停命令刷新任务卡失败:', error));
+            }
+            await message.reply({ message: ordinary.group?.state === 'pausing' ? '⏸️ 已设置：完成当前文件后暂停该任务' : '⏸️ 已暂停该任务' });
+            return;
+        }
+        const job = await pauseTelegramBackgroundJob(senderId, taskId, chatId);
         if (job) {
-            await message.reply({ message: `⏸️ 已暂停频道任务 ${String(job.id).slice(0, 8)}\n来源：${job.source}` });
+            const executionGroup = getChannelExecutionGroup(String(job.id));
+            if (executionGroup) pauseChannelExecutionGroup(String(job.id));
+            await message.reply({ message: `⏸️ 已暂停频道任务 ${String(job.id).slice(0, 12)}\n来源：${job.source}` });
             return;
         }
     }
-    const result = pauseDownloadTasks(taskId);
-    await message.reply({ message: `⏸️ 已暂停全局下载队列${taskId ? `\n任务卡: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}\n\n当前正在下载的文件会继续完成，新的等待任务暂不开始。` });
+    const result = pauseDownloadTasks();
+    if (senderId && chatId && message.client) {
+        const scopeStatus = getDownloadTaskScopeStatus(chatId, senderId);
+        if (scopeStatus.paused || scopeStatus.pausing) {
+            await refreshSilentProgress(message.client as TelegramClient, message.chatId!, senderId).catch(error => {
+                console.error('🤖 暂停命令刷新任务卡失败:', error);
+            });
+        }
+    }
+    await message.reply({ message: taskId
+        ? `📮 没有找到任务：${taskId}。未暂停全局下载队列。`
+        : `⏸️ 已暂停全局下载队列\n\n进行中: ${result.active}\n等待中: ${result.pending}\n\n当前正在下载的文件会继续完成，新的等待任务暂不开始。` });
 }
 
 export async function handleResumeTasks(message: Api.Message, args: string[] = []): Promise<void> {
     const taskId = args[0];
     const senderId = message.senderId?.toJSNumber();
-    if (taskId && senderId) {
-        const job = await resumeTelegramBackgroundJob(senderId, taskId);
+    const chatId = message.chatId?.toString();
+    if (taskId && senderId && chatId) {
+        const ordinary = resumeDownloadTaskGroup(taskId, chatId, senderId);
+        if (ordinary.status === 'ok') {
+            if (message.client && message.chatId) {
+                await refreshSilentProgress(message.client as TelegramClient, message.chatId, senderId).catch(error => {
+                    console.error('🤖 继续命令刷新任务卡失败:', error);
+                });
+            }
+            await message.reply({ message: '▶️ 已继续该任务' });
+            return;
+        }
+        const job = await resumeTelegramBackgroundJob(senderId, taskId, chatId);
         if (job) {
-            await message.reply({ message: `▶️ 已继续频道任务 ${String(job.id).slice(0, 8)}\n来源：${job.source}` });
+            resumeChannelExecutionGroup(String(job.id));
+            await message.reply({ message: `▶️ 已继续频道任务 ${String(job.id).slice(0, 12)}\n来源：${job.source}` });
             return;
         }
     }
-    const result = resumeDownloadTasks(taskId);
-    await message.reply({ message: `▶️ 已继续全局下载队列${taskId ? `\n任务卡: ${taskId}` : ''}\n\n进行中: ${result.active}\n等待中: ${result.pending}` });
+    const result = resumeDownloadTasks();
+    if (senderId && message.client && message.chatId) {
+        await refreshSilentProgress(message.client as TelegramClient, message.chatId, senderId).catch(error => {
+            console.error('🤖 继续命令刷新任务卡失败:', error);
+        });
+    }
+    await message.reply({ message: taskId
+        ? `📮 没有找到任务：${taskId}。未继续全局下载队列。`
+        : `▶️ 已继续全局下载队列\n\n进行中: ${result.active}\n等待中: ${result.pending}` });
 }
 
 export async function handleCancelTask(message: Api.Message, args: string[]): Promise<void> {
     const selector = args.join(' ').trim() || 'all';
     const senderId = message.senderId?.toJSNumber();
+    const chatId = message.chatId?.toString();
     if (senderId) {
         if (selector === 'all') {
-            const jobs = await cancelAllTelegramBackgroundJobs(senderId);
-            const result = cancelDownloadTask(selector);
+            const currentChatJobs = (await listTelegramActiveTaskQueues(senderId, 1000))
+                .filter(job => String(job.chat_id || '') === String(chatId || ''));
+            const jobs: any[] = [];
+            for (const row of currentChatJobs) {
+                const cancelled = await cancelTelegramBackgroundJob(senderId, String(row.id), chatId);
+                if (cancelled) jobs.push(cancelled);
+            }
+            for (const job of jobs) cancelChannelExecutionGroup(String(job.id));
+            const result = chatId
+                ? forceStopDownloadTasksForScope(chatId, senderId, '用户通过 /task_cancel all 取消当前聊天任务')
+                : { active: 0, pending: 0, total: 0 };
             if (jobs.length > 0 || result.total > 0) {
                 await message.reply({ message: `🛑 已取消任务\n\n频道任务: ${jobs.length}\n普通下载: 处理中 ${result.active} / 等待 ${result.pending}` });
                 return;
             }
         } else {
-            const job = await cancelTelegramBackgroundJob(senderId, selector);
+            if (chatId) {
+                const ordinary = cancelDownloadTaskGroup(selector, chatId, senderId);
+                if (ordinary.status === 'ok') {
+                    await message.reply({ message: '🛑 已取消该下载任务' });
+                    return;
+                }
+            }
+            const job = await cancelTelegramBackgroundJob(senderId, selector, chatId);
             if (job) {
-                await message.reply({ message: `🛑 已取消频道任务 ${String(job.id).slice(0, 8)}\n来源：${job.source}` });
+                cancelChannelExecutionGroup(String(job.id));
+                await message.reply({ message: `🛑 已取消频道任务 ${String(job.id).slice(0, 12)}\n来源：${job.source}` });
                 return;
             }
         }
     }
-    const result = cancelDownloadTask(selector);
-    await message.reply({ message: result.total > 0 ? `🛑 已取消匹配任务\n\n匹配: ${selector}\n处理中: ${result.active}\n等待中: ${result.pending}` : `📮 没有找到匹配的任务，未清空全局队列：${selector}` });
+    await message.reply({ message: `📮 没有找到当前聊天中的匹配任务：${selector}` });
 }
 
 export async function handleChannelTaskQueueCallback(client: TelegramClient, update: Api.UpdateBotCallbackQuery, data: string): Promise<void> {
@@ -938,56 +1196,63 @@ export async function handleChannelTaskQueueCallback(client: TelegramClient, upd
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: MSG.AUTH_REQUIRED, alert: true }));
         return;
     }
+    const match = data.match(/^ctq_(pause|resume|cancel)_([0-9a-f]{4,}|all)$/i);
+    if (!match) return;
+    const [, action, selector] = match;
     try {
-        const match = data.match(/^ctq_(pause|resume|cancel)_([0-9a-f]{4,}|all)$/i);
-        if (!match) return;
-        const [, action, selector] = match;
-        let toast = '';
         if (selector === 'all' && action === 'cancel') {
-            const jobs = await cancelAllTelegramBackgroundJobs(userId);
-            toast = jobs.length > 0 ? `已取消 ${jobs.length} 个频道任务` : '没有可取消的频道任务';
-        } else if (action === 'pause') {
-            const job = await pauseTelegramBackgroundJob(userId, selector);
-            toast = job ? `已暂停 ${String(job.id).slice(0, 8)}` : '任务不存在或已结束';
-        } else if (action === 'resume') {
-            const job = await resumeTelegramBackgroundJob(userId, selector);
-            toast = job ? `已继续 ${String(job.id).slice(0, 8)}` : '任务不存在或不在暂停状态';
-        } else {
-            const job = await cancelTelegramBackgroundJob(userId, selector);
-            toast = job ? `已取消 ${String(job.id).slice(0, 8)}` : '任务不存在或已结束';
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({
+                queryId: update.queryId,
+                message: '旧版“取消全部”按钮已失效，请使用新版 /tasks',
+                alert: true,
+            }));
+            return;
         }
-
-        const jobs = await listTelegramActiveTaskQueues(userId, 10);
-        const status = getTaskStatus();
-        const sections: string[] = [];
-        if (status.active.length > 0 || status.pending.length > 0) sections.push(buildTasksReport(status.active, status.pending));
-        if (jobs.length > 0) sections.push(buildChannelTaskQueueReport(jobs));
-        await client.editMessage(update.peer, {
-            message: Number(update.msgId),
-            text: sections.length > 0 ? sections.join('\\n\\n') : MSG.EMPTY_TASKS,
-            buttons: buildTasksKeyboard(jobs) || new Api.ReplyInlineMarkup({ rows: [] }),
-        });
-        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: toast }));
+        const rows = await listTelegramActiveTaskQueues(userId, 1000);
+        const callbackChatId = getCallbackChatKey(update);
+        const matches = rows.filter(job => String(job.chat_id || '') === callbackChatId && String(job.id).toLowerCase().startsWith(selector.toLowerCase()));
+        if (matches.length !== 1) {
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: matches.length > 1 ? '任务 ID 前缀不唯一，请使用新版 /tasks 刷新' : '任务已结束或已失效', alert: true }));
+            return;
+        }
+        const legacyAction = (action === 'cancel' ? 'cancel_confirm' : action) as 'pause' | 'resume' | 'cancel_confirm';
+        const result = await operateChannelTaskCenterItem(legacyAction, userId, callbackChatId, selector);
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.toast, alert: !result.ok }));
     } catch (error) {
-        console.error('🤖 频道任务按钮操作失败:', error);
+        console.error('🤖 兼容频道任务按钮操作失败:', error);
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: `操作失败: ${(error as Error).message}`, alert: true }));
     }
 }
 
 export async function handleRetryFailedTasks(message: Api.Message, args: string[]): Promise<void> {
     const senderId = message.senderId?.toJSNumber();
-    const jobSelector = args.find(arg => /^[0-9a-f-]{4,}$/i.test(arg));
-    if (senderId && jobSelector) {
-        const jobRetry = await retryTelegramBackgroundJob(senderId, jobSelector);
-        if (jobRetry) {
-            await message.reply({ message: jobRetry.retried > 0 ? `🔄 已重新加入频道任务失败项 ${jobRetry.retried} 个\n任务: ${String(jobRetry.id).slice(0, 8)}` : '📮 该频道任务没有可重试失败项' });
+    const jobSelector = args.find(arg => /^[0-9a-f-]{4,36}$/i.test(arg));
+    const chatId = message.chatId?.toString();
+    const jobRetry = senderId && jobSelector && chatId ? await retryTelegramBackgroundJob(senderId, jobSelector, chatId) : null;
+    if (jobSelector) {
+        if (!jobRetry) {
+            await message.reply({ message: '📮 没有找到唯一的频道任务，未重试其它任务。' });
+            return;
+        }
+        await message.reply({ message: jobRetry.retried > 0 ? `🔄 已重新加入频道任务失败项 ${jobRetry.retried} 个\n任务: ${String(jobRetry.id).slice(0, 12)}` : '📮 该频道任务没有可重试失败项' });
+        return;
+    }
+
+    const taskId = args.find(arg => /^[sam][a-z0-9-]+$/i.test(arg));
+    const numericArg = args.find(arg => /^\d+$/.test(arg));
+    const limit = Math.max(1, Math.min(50, parseInt(numericArg || '10', 10) || 10));
+    if (!senderId || !chatId) {
+        await message.reply({ message: '📮 无法识别当前聊天，未执行失败任务重试。' });
+        return;
+    }
+    if (taskId) {
+        const group = getDownloadTaskGroup(taskId, chatId, senderId);
+        if (!group) {
+            await message.reply({ message: `📮 没有找到当前聊天中的失败任务：${taskId}` });
             return;
         }
     }
-    const taskId = args.find(arg => /^t[a-z0-9]+/i.test(arg));
-    const numericArg = args.find(arg => /^\d+$/.test(arg));
-    const limit = Math.max(1, Math.min(50, parseInt(numericArg || '10', 10) || 10));
-    const result = await retryFailedDownloadTasks(limit, taskId);
+    const result = await retryFailedDownloadTasks(limit, taskId, chatId, senderId);
     await message.reply({ message: result.retried > 0 ? `🔄 已重新加入 ${result.retried} 个失败任务${taskId ? `\n任务: ${taskId}` : ''}` : '📮 最近没有可重试的失败任务' });
 }
 

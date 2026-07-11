@@ -195,9 +195,13 @@ CREATE TABLE IF NOT EXISTS telegram_download_items (
     origin TEXT DEFAULT 'channel',
     message_id INT NOT NULL,
     grouped_id TEXT,
+    shared_caption TEXT,
+    group_index INT,
+    group_size INT,
     channel_post_id INT,
     file_name TEXT,
     mime_type TEXT,
+    generated_name BOOLEAN DEFAULT false,
     total_size BIGINT DEFAULT 0,
     folder_override TEXT,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
@@ -212,10 +216,15 @@ CREATE TABLE IF NOT EXISTS telegram_download_items (
 );
 
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS source_peer TEXT;
+ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS grouped_id TEXT;
+ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS shared_caption TEXT;
+ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS group_index INT;
+ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS group_size INT;
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'channel';
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS channel_post_id INT;
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS file_name TEXT;
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS mime_type TEXT;
+ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS generated_name BOOLEAN DEFAULT false;
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS total_size BIGINT DEFAULT 0;
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS folder_override TEXT;
 ALTER TABLE telegram_download_items ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0;
