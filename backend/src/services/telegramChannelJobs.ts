@@ -1,6 +1,8 @@
 import { Api, TelegramClient } from 'telegram';
+import crypto from 'node:crypto';
+import type { PoolClient } from 'pg';
 import { getPeerId } from 'telegram/Utils.js';
-import { query } from '../db/index.js';
+import { pool, query } from '../db/index.js';
 import { storageManager, isStorageQuotaCooldownError } from './storage.js';
 import { formatStorageCooldownNotice } from './storageCooldownGuard.js';
 import {
@@ -11,9 +13,12 @@ import {
     type StorageAccountCooldown,
 } from './storageCooldown.js';
 import { getTelegramUserClient, isTelegramUserClientReady } from './telegramUserClient.js';
-import { downloadTelegramChannelRange, getTelegramDownloadPreview, type TelegramDownloadMessageRef } from './telegramUpload.js';
+import { abortChannelExecutionForLeaseLoss, downloadTelegramChannelRange, getTelegramDownloadPreview, getChannelTaskAbortSignal, releaseChannelTaskAbortSignal, type TelegramDownloadMessageRef } from './telegramUpload.js';
 import { getSetting } from '../utils/settings.js';
-import { extractFileInfo, getEstimatedFileSize } from '../utils/telegramMedia.js';
+import { extractFileInfo, getEstimatedFileSize, type TelegramFileInfo } from '../utils/telegramMedia.js';
+import { annotateTelegramMediaGroup } from '../utils/telegramMediaGroup.js';
+import { lockStorageAccountForUse } from './storageAccountLifecycle.js';
+import { resolveTelegramWriteCommittedWithQuery, claimTelegramWriteReconciliations, resolveClaimedTelegramWrite } from './telegramWriteReconciliation.js';
 
 const SUBSCRIPTION_INTERVAL_MS = Math.max(60_000, parseInt(process.env.TELEGRAM_SUBSCRIPTION_INTERVAL_MS || '300000', 10) || 300_000);
 const SUBSCRIPTION_SCAN_LIMIT = Math.max(1, parseInt(process.env.TELEGRAM_SUBSCRIPTION_SCAN_LIMIT || '100', 10) || 100);
@@ -23,6 +28,7 @@ const TG_JOB_DOWNLOAD_BATCH_SIZE = Math.max(1, parseInt(process.env.TG_JOB_DOWNL
 const TG_JOB_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.TG_JOB_MAX_ATTEMPTS || '3', 10) || 3);
 export const TELEGRAM_COMMENTS_MAX_PER_POST = Math.max(1, parseInt(process.env.TELEGRAM_COMMENTS_MAX_PER_POST || '200', 10) || 200);
 let subscriptionTimer: NodeJS.Timeout | null = null;
+let subscriptionScanRunning = false;
 let recoveryStarted = false;
 let recoveryRunning = false;
 
@@ -58,8 +64,17 @@ async function assertTelegramSourceAllowed(source: string, extraSources: string[
     }
 }
 
-function maxProcessedMessageId(result: { successfulMessageIds: number[]; skippedMessageIds: number[] }): number {
-    return Math.max(0, ...result.successfulMessageIds, ...result.skippedMessageIds);
+export function contiguousProcessedMessageId(
+    startId: number,
+    successfulMessageIds: number[],
+    skippedMessageIds: number[],
+    failedMessageIds: number[],
+): number {
+    const processed = new Set([...successfulMessageIds, ...skippedMessageIds]);
+    const failed = new Set(failedMessageIds);
+    let cursor = startId;
+    while (!failed.has(cursor + 1) && processed.has(cursor + 1)) cursor += 1;
+    return cursor;
 }
 
 
@@ -238,13 +253,19 @@ async function persistDownloadRefs(jobId: string, source: string, refs: Telegram
         await query(
             `INSERT INTO telegram_download_items (
                 job_id, source, source_peer, origin, message_id, grouped_id, channel_post_id,
-                file_name, mime_type, total_size, folder_override, status, error, last_error, locked_at, completed_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', NULL, NULL, NULL, NULL)
+                file_name, mime_type, generated_name, total_size, folder_override, shared_caption, group_index, group_size,
+                status, error, last_error, locked_at, completed_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', NULL, NULL, NULL, NULL)
              ON CONFLICT (job_id, source_peer, message_id)
              DO UPDATE SET
                 file_name = COALESCE(EXCLUDED.file_name, telegram_download_items.file_name),
                 mime_type = COALESCE(EXCLUDED.mime_type, telegram_download_items.mime_type),
+                generated_name = COALESCE(EXCLUDED.generated_name, telegram_download_items.generated_name),
                 total_size = COALESCE(EXCLUDED.total_size, telegram_download_items.total_size),
+                grouped_id = COALESCE(EXCLUDED.grouped_id, telegram_download_items.grouped_id),
+                shared_caption = COALESCE(EXCLUDED.shared_caption, telegram_download_items.shared_caption),
+                group_index = COALESCE(EXCLUDED.group_index, telegram_download_items.group_index),
+                group_size = COALESCE(EXCLUDED.group_size, telegram_download_items.group_size),
                 folder_override = EXCLUDED.folder_override,
                 updated_at = NOW()`,
             [
@@ -253,12 +274,16 @@ async function persistDownloadRefs(jobId: string, source: string, refs: Telegram
                 sourcePeerKey(ref.source, source),
                 ref.origin || 'channel',
                 ref.id,
-                null,
+                ref.groupedId || null,
                 ref.channelPostId || null,
                 ref.fileInfo?.fileName || null,
                 ref.fileInfo?.mimeType || null,
+                ref.fileInfo?.generatedName || false,
                 ref.totalSize || 0,
                 folderOverride || null,
+                ref.sharedCaption || null,
+                ref.groupIndex || null,
+                ref.groupSize || null,
             ]
         );
     }
@@ -371,6 +396,7 @@ async function getDiscussionMediaRefs(
                     fileInfo,
                     totalSize: getEstimatedFileSize(comment),
                     message: comment,
+                    groupedId: messageGroupId(comment),
                 };
                 refs.push(ref);
                 await options.onRefDiscovered?.(ref);
@@ -392,7 +418,34 @@ function toChannelDownloadRef(source: string, message: Api.Message): TelegramDow
         origin: 'channel',
         fileInfo,
         totalSize: getEstimatedFileSize(message),
+        message,
+        groupedId: messageGroupId(message),
     };
+}
+
+export function propagateTelegramDownloadGroupContext(refs: TelegramDownloadMessageRef[]): TelegramDownloadMessageRef[] {
+    const groups = new Map<string, TelegramDownloadMessageRef[]>();
+    for (const ref of refs) {
+        if (!ref.groupedId) continue;
+        const group = groups.get(ref.groupedId) || [];
+        group.push(ref);
+        groups.set(ref.groupedId, group);
+    }
+    for (const group of groups.values()) {
+        const withMessages = group.filter((ref): ref is TelegramDownloadMessageRef & { message: Api.Message } => Boolean(ref.message));
+        if (withMessages.length === group.length) {
+            annotateTelegramMediaGroup(withMessages);
+            continue;
+        }
+        const ordered = [...group].sort((a, b) => a.id - b.id);
+        const sharedCaption = ordered.find(ref => ref.sharedCaption)?.sharedCaption || null;
+        ordered.forEach((ref, index) => {
+            ref.sharedCaption = ref.sharedCaption || sharedCaption;
+            ref.groupIndex = ref.groupIndex || index + 1;
+            ref.groupSize = ref.groupSize || ordered.length;
+        });
+    }
+    return refs;
 }
 
 async function buildDownloadScanResult(
@@ -404,11 +457,12 @@ async function buildDownloadScanResult(
     const refs = messages
         .map(message => toChannelDownloadRef(source, message))
         .filter((ref): ref is TelegramDownloadMessageRef => Boolean(ref));
+    const commentScan = await getDiscussionMediaRefs(userClient, source, messages, options);
+    refs.push(...commentScan.refs);
+    propagateTelegramDownloadGroupContext(refs);
     for (const ref of refs) {
         await options.onRefDiscovered?.(ref);
     }
-    const commentScan = await getDiscussionMediaRefs(userClient, source, messages, options);
-    refs.push(...commentScan.refs);
     return {
         messages,
         refs,
@@ -431,26 +485,111 @@ async function markDownloadRefsDownloading(jobId: string, refs: TelegramDownload
     }
 }
 
-async function markDownloadRefStatus(jobId: string, ref: TelegramDownloadMessageRef, status: 'success' | 'failed' | 'skipped', error?: string) {
+export type TelegramJobQuery = (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }>;
+export type TelegramDownloadSettlementResult = 'settled' | 'already-terminal' | 'lease-lost';
+
+export class TelegramDownloadLeaseLostError extends Error {
+    constructor(jobId: string, ref: TelegramDownloadMessageRef) {
+        super(`Telegram 下载 lease 已丢失: job=${jobId} message=${ref.id}`);
+        this.name = 'TelegramDownloadLeaseLostError';
+    }
+}
+
+interface TelegramTransactionClient {
+    query: TelegramJobQuery;
+    release(): void;
+}
+
+interface TelegramTransactionPool {
+    connect(): Promise<TelegramTransactionClient>;
+}
+
+const telegramLeaseFinalizing = new Set<string>();
+
+function telegramLeaseKey(jobId: string, ref: TelegramDownloadMessageRef): string {
+    return `${jobId}:${sourcePeerKey(ref.source, ref.origin === 'comment' ? 'comment' : 'channel')}:${ref.id}:${ref.leaseToken || ''}`;
+}
+
+export async function withTelegramDownloadRefLease<T>(
+    transactionPool: TelegramTransactionPool,
+    jobId: string,
+    ref: TelegramDownloadMessageRef,
+    operation: () => Promise<T>,
+): Promise<T> {
+    if (!ref.leaseToken) throw new TelegramDownloadLeaseLostError(jobId, ref);
+    const leaseKey = telegramLeaseKey(jobId, ref);
+    const client = await transactionPool.connect();
+    telegramLeaseFinalizing.add(leaseKey);
+    try {
+        await client.query('BEGIN');
+        const owned = await client.query(
+            `SELECT i.id
+             FROM telegram_download_items i
+             WHERE i.job_id = $1 AND i.source_peer = $2 AND i.message_id = $3
+               AND i.status = 'downloading' AND i.lease_token = $4::uuid
+             FOR UPDATE`,
+            [jobId, sourcePeerKey(ref.source, ref.origin === 'comment' ? 'comment' : 'channel'), ref.id, ref.leaseToken],
+        );
+        if ((owned.rowCount || 0) !== 1) throw new TelegramDownloadLeaseLostError(jobId, ref);
+        const result = await operation();
+        const settlement = await settleTelegramDownloadRefWithQuery(client.query.bind(client), jobId, ref, 'success');
+        if (settlement !== 'settled') throw new TelegramDownloadLeaseLostError(jobId, ref);
+        if (ref.writeOperationId) {
+            await resolveTelegramWriteCommittedWithQuery(client, ref.writeOperationId, ref.leaseToken);
+        }
+        await client.query('COMMIT');
+        return result;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+    } finally {
+        telegramLeaseFinalizing.delete(leaseKey);
+        client.release();
+    }
+}
+
+export async function settleTelegramDownloadRefWithQuery(
+    runQuery: TelegramJobQuery,
+    jobId: string,
+    ref: TelegramDownloadMessageRef,
+    status: 'success' | 'failed' | 'skipped',
+    error?: string,
+): Promise<TelegramDownloadSettlementResult> {
     const sourcePeer = sourcePeerKey(ref.source, ref.origin === 'comment' ? 'comment' : 'channel');
-    await query(
-        `UPDATE telegram_download_items
-         SET status = $3::varchar,
-             error = $4,
-             last_error = $4,
-             attempts = CASE WHEN $3::text = 'failed' THEN attempts + 1 ELSE attempts END,
-             completed_at = CASE WHEN $3::text IN ('success', 'skipped') THEN NOW() ELSE completed_at END,
-             locked_at = NULL,
-             updated_at = NOW()
-         WHERE job_id = $1 AND source_peer = $2 AND message_id = $5`,
-        [jobId, sourcePeer, status, error || null, ref.id]
+    const leaseToken = ref.leaseToken || null;
+    const result = await runQuery(
+        `UPDATE telegram_download_items i
+         SET status = CASE WHEN i.status = 'downloading' THEN $3::varchar ELSE i.status END,
+             error = CASE WHEN i.status = 'downloading' THEN $4 ELSE i.error END,
+             last_error = CASE WHEN i.status = 'downloading' THEN $4 ELSE i.last_error END,
+             attempts = CASE WHEN i.status = 'downloading' AND $3::text = 'failed' THEN i.attempts + 1 ELSE i.attempts END,
+             completed_at = CASE WHEN i.status = 'downloading' AND $3::text IN ('success', 'skipped') THEN NOW() ELSE i.completed_at END,
+             locked_at = CASE WHEN i.status = 'downloading' THEN NULL ELSE i.locked_at END,
+             lease_token = CASE WHEN i.status = 'downloading' THEN NULL ELSE i.lease_token END,
+             lease_expires_at = CASE WHEN i.status = 'downloading' THEN NULL ELSE i.lease_expires_at END,
+             updated_at = CASE WHEN i.status = 'downloading' THEN NOW() ELSE i.updated_at END
+         WHERE i.job_id = $1 AND i.source_peer = $2 AND i.message_id = $5
+           AND ($6::uuid IS NULL OR i.lease_token = $6::uuid)
+           AND i.status IN ('downloading', 'success', 'failed', 'skipped')
+         RETURNING i.status`,
+        [jobId, sourcePeer, status, error || null, ref.id, leaseToken],
     );
+    if ((result.rowCount || 0) === 0) {
+        if (leaseToken) return 'lease-lost';
+        throw new Error(`Telegram 下载条目结算影响 0 行: job=${jobId} peer=${sourcePeer} message=${ref.id}`);
+    }
+    return result.rows[0]?.status === status ? 'settled' : 'already-terminal';
+}
+
+async function markDownloadRefStatus(jobId: string, ref: TelegramDownloadMessageRef, status: 'success' | 'failed' | 'skipped', error?: string) {
+    return settleTelegramDownloadRefWithQuery(query, jobId, ref, status, error);
 }
 
 async function persistDownloadMessages(jobId: string, source: string, messages: Api.Message[], folderOverride?: string | null) {
     const refs = messages
         .map(message => toChannelDownloadRef(source, message))
         .filter((ref): ref is TelegramDownloadMessageRef => Boolean(ref));
+    propagateTelegramDownloadGroupContext(refs);
     await persistDownloadRefs(jobId, source, refs, folderOverride);
 }
 
@@ -487,13 +626,30 @@ export function parseDateOnly(value: string, endOfDay = false): Date {
 }
 
 async function createJob(userId: number, chatId: string | undefined, kind: string, source: string, params: Record<string, unknown>) {
-    const result = await query(
-        `INSERT INTO telegram_background_jobs (user_id, chat_id, kind, source, params, status, scan_status, download_status, scan_cursor)
-         VALUES ($1, $2, $3, $4, $5, 'queued', 'pending', 'pending', '{}'::jsonb)
-         RETURNING id`,
-        [userId, chatId || null, kind, source, JSON.stringify(params)]
-    );
-    return result.rows[0].id as string;
+    const target = storageManager.getActiveTarget();
+    const persistedParams = {
+        ...params,
+        storageProvider: target.provider.name,
+        storageAccountId: target.accountId,
+    };
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        if (target.accountId) await lockStorageAccountForUse(client, target.accountId);
+        const result = await client.query(
+            `INSERT INTO telegram_background_jobs (user_id, chat_id, kind, source, params, status, scan_status, download_status, scan_cursor)
+             VALUES ($1, $2, $3, $4, $5, 'queued', 'pending', 'pending', '{}'::jsonb)
+             RETURNING id`,
+            [userId, chatId || null, kind, source, JSON.stringify(persistedParams)]
+        );
+        await client.query('COMMIT');
+        return result.rows[0].id as string;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 async function getJob(jobId: string) {
@@ -501,11 +657,18 @@ async function getJob(jobId: string) {
     return result.rows[0] || null;
 }
 
-async function updateJob(jobId: string, updates: Record<string, unknown>) {
+async function updateJob(jobId: string, updates: Record<string, unknown>): Promise<number> {
     const entries = Object.entries(updates);
-    if (entries.length === 0) return;
+    if (entries.length === 0) return 0;
     const setSql = entries.map(([key], index) => `${key} = $${index + 2}`).join(', ');
-    await query(`UPDATE telegram_background_jobs SET ${setSql}, updated_at = NOW() WHERE id = $1`, [jobId, ...entries.map(([, value]) => value)]);
+    const writesTerminalOrRunningState = entries.some(([key, value]) => (
+        key === 'status' && ['running', 'completed', 'completed_with_errors', 'failed'].includes(String(value))
+    ));
+    const terminalGuard = writesTerminalOrRunningState
+        ? ` AND cancelled_at IS NULL AND paused_at IS NULL AND status NOT IN ('cancelled', 'paused', 'cooling')`
+        : '';
+    const result = await query(`UPDATE telegram_background_jobs SET ${setSql}, updated_at = NOW() WHERE id = $1${terminalGuard}`, [jobId, ...entries.map(([, value]) => value)]);
+    return result.rowCount || 0;
 }
 
 async function hydratePendingDownloadRefs(userClient: TelegramClient, jobId: string): Promise<number> {
@@ -545,9 +708,17 @@ async function hydratePendingDownloadRefs(userClient: TelegramClient, jobId: str
             }
             await query(
                 `UPDATE telegram_download_items
-                 SET file_name = $2, mime_type = $3, total_size = $4, updated_at = NOW()
+                 SET file_name = $2, mime_type = $3, total_size = $4,
+                     generated_name = $5, grouped_id = $6, updated_at = NOW()
                  WHERE id = $1`,
-                [row.id, fileInfo.fileName, fileInfo.mimeType, getEstimatedFileSize(message)]
+                [
+                    row.id,
+                    fileInfo.fileName,
+                    fileInfo.mimeType,
+                    getEstimatedFileSize(message),
+                    fileInfo.generatedName,
+                    messageGroupId(message) || null,
+                ]
             );
             hydrated += 1;
         } catch (error) {
@@ -587,29 +758,55 @@ export async function listTelegramSubscriptions(userId: number, includeDisabled 
     return result.rows;
 }
 
+async function resolveUniqueTelegramSubscriptionId(userId: number, selector: string): Promise<string | null> {
+    const normalized = selector.trim().toLowerCase();
+    if (!/^[0-9a-f-]{4,36}$/.test(normalized)) return null;
+    const result = await query(
+        `SELECT id FROM telegram_channel_subscriptions
+         WHERE user_id = $1 AND id::text LIKE $2
+         ORDER BY updated_at DESC
+         LIMIT 2`,
+        [userId, `${normalized}%`],
+    );
+    return result.rows.length === 1 ? String(result.rows[0].id) : null;
+}
+
 export async function updateTelegramSubscriptionFolder(userId: number, selector: string, folderOverride: string | null) {
-    const trimmed = selector.trim();
+    const subscriptionId = await resolveUniqueTelegramSubscriptionId(userId, selector);
+    if (!subscriptionId) return null;
     const result = await query(
         `UPDATE telegram_channel_subscriptions
-         SET folder_override = $2, updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $3
+         SET folder_override = $3, updated_at = NOW()
+         WHERE user_id = $1 AND id = $2::uuid
          RETURNING id, source, source_original, source_type, title, last_message_id, folder_override, enabled, disabled_reason, disabled_at`,
-        [userId, folderOverride || null, `${trimmed}%`]
+        [userId, subscriptionId, folderOverride || null]
     );
     return result.rows[0] || null;
 }
 
 export async function unsubscribeTelegramChannel(userId: number, selector: string) {
     const trimmed = selector.trim();
+    if (/^[0-9a-f-]{4,36}$/i.test(trimmed)) {
+        const subscriptionId = await resolveUniqueTelegramSubscriptionId(userId, trimmed);
+        if (!subscriptionId) return null;
+        const result = await query(
+            `UPDATE telegram_channel_subscriptions
+             SET enabled = false, disabled_reason = COALESCE(disabled_reason, '用户手动取消订阅'), disabled_at = COALESCE(disabled_at, NOW()), updated_at = NOW()
+             WHERE user_id = $1 AND id = $2::uuid
+             RETURNING source, source_original, title`,
+            [userId, subscriptionId],
+        );
+        return result.rows[0] || null;
+    }
     const normalizedSelector = /^@|^https?:\/\//i.test(trimmed) || /^-?\d+$/.test(trimmed)
         ? normalizeSource(trimmed)
         : trimmed;
     const result = await query(
         `UPDATE telegram_channel_subscriptions
          SET enabled = false, disabled_reason = COALESCE(disabled_reason, '用户手动取消订阅'), disabled_at = COALESCE(disabled_at, NOW()), updated_at = NOW()
-         WHERE user_id = $1 AND (source = $2 OR source_original = $2 OR id::text LIKE $3)
+         WHERE user_id = $1 AND (source = $2 OR source_original = $2)
          RETURNING source, source_original, title`,
-        [userId, normalizedSelector, `${trimmed}%`]
+        [userId, normalizedSelector]
     );
     return result.rows[0] || null;
 }
@@ -706,7 +903,8 @@ async function putJobIntoStorageCooldown(jobId: string, cooldownUntil: Date, rea
         `UPDATE telegram_download_items
          SET status = 'pending', locked_at = NULL, last_error = $2, updated_at = NOW()
          WHERE job_id = $1
-           AND status = 'downloading'`,
+           AND status IN ('downloading', 'failed')
+           AND (status = 'downloading' OR last_error IS NULL OR last_error ILIKE '%upload%limit%' OR last_error ILIKE '%上传额度%')`,
         [jobId, reasonText],
     );
 }
@@ -731,7 +929,7 @@ async function notifyStorageCooldownOnce(botClient: TelegramClient, job: any, co
         message: [
             formatStorageCooldownNotice(cooldownUntil),
             '',
-            `任务：${String(job.id).slice(0, 8)}`,
+            `任务：${String(job.id).slice(0, 12)}`,
         ].join('\n'),
     }).catch(() => undefined);
 }
@@ -746,13 +944,18 @@ async function handleStorageQuotaCooldownError(botClient: TelegramClient, jobId:
     return true;
 }
 
-async function ensureJobCanRun(jobId: string): Promise<TelegramJobControlState> {
-    const job = await getJob(jobId);
+export async function ensureJobCanRunForTest(job: any, now = Date.now()): Promise<TelegramJobControlState> {
     if (!job) return 'cancelled';
     if (job.cancelled_at || job.status === 'cancelled') return 'cancelled';
     if (job.paused_at || job.status === 'paused') return 'paused';
-    if (job.cooldown_until && new Date(job.cooldown_until).getTime() > Date.now()) return 'cooldown';
-    if (job.status === 'cooling' && (!job.cooldown_until || new Date(job.cooldown_until).getTime() <= Date.now())) return 'run';
+    if (job.cooldown_until && new Date(job.cooldown_until).getTime() > now) return 'cooldown';
+    return 'run';
+}
+
+async function ensureJobCanRun(jobId: string): Promise<TelegramJobControlState> {
+    const job = await getJob(jobId);
+    const persistedState = await ensureJobCanRunForTest(job);
+    if (persistedState !== 'run') return persistedState;
     const storageCooldown = await applyStorageCooldownIfNeeded(jobId);
     if (storageCooldown) return 'cooldown';
     return 'run';
@@ -768,62 +971,269 @@ async function waitUntilRunnable(jobId: string, options: TelegramCommentScanOpti
     }
 }
 
+function persistedTelegramFileInfo(row: any): TelegramFileInfo {
+    return {
+        fileName: row.file_name,
+        mimeType: row.mime_type,
+        generatedName: row.generated_name === true,
+    };
+}
+
 async function claimPendingDownloadRefs(jobId: string, limit = TG_JOB_DOWNLOAD_BATCH_SIZE): Promise<TelegramDownloadMessageRef[]> {
     const result = await query(
-        `UPDATE telegram_download_items i
-         SET status = 'downloading', locked_at = NOW(), updated_at = NOW()
-         WHERE i.id IN (
-             SELECT id FROM telegram_download_items
-             WHERE job_id = $1
-               AND status = 'pending'
-               AND attempts < $2
-               AND file_name IS NOT NULL
-               AND mime_type IS NOT NULL
-             ORDER BY created_at ASC
+        `WITH candidates AS (
+             SELECT i.id
+             FROM telegram_download_items i
+             JOIN telegram_background_jobs j ON j.id = i.job_id
+             WHERE i.job_id = $1
+               AND i.status = 'pending'
+               AND i.attempts < $2
+               AND i.file_name IS NOT NULL
+               AND i.mime_type IS NOT NULL
+               AND j.cancelled_at IS NULL
+               AND j.finished_at IS NULL
+               AND j.status NOT IN ('cancelled', 'paused', 'cooling')
+               AND NOT EXISTS (
+                   SELECT 1 FROM telegram_write_reconciliations r
+                   WHERE r.item_id = i.id AND r.status = 'pending'
+               )
+             ORDER BY i.created_at ASC
+             FOR UPDATE OF i SKIP LOCKED
              LIMIT $3
          )
-         RETURNING source, source_peer, origin, message_id, channel_post_id, file_name, mime_type, total_size, folder_override`,
+         UPDATE telegram_download_items i
+         SET status = 'downloading', locked_at = NOW(), lease_token = gen_random_uuid(),
+             lease_expires_at = NOW() + INTERVAL '10 minutes', updated_at = NOW()
+         FROM candidates c
+         WHERE i.id = c.id AND i.status = 'pending'
+         RETURNING i.id, i.source, i.source_peer, i.origin, i.message_id, i.grouped_id, i.channel_post_id,
+                   i.file_name, i.mime_type, i.generated_name, i.total_size, i.folder_override,
+                   i.shared_caption, i.group_index, i.group_size, i.lease_token`,
         [jobId, TG_JOB_MAX_ATTEMPTS, limit]
     );
     return result.rows
         .filter(row => row.file_name && row.mime_type)
         .map(row => ({
             id: Number(row.message_id),
+            itemId: String(row.id),
             source: row.source_peer || row.source,
             origin: row.origin === 'comment' ? 'comment' : 'channel',
             channelPostId: row.channel_post_id || undefined,
-            fileInfo: { fileName: row.file_name, mimeType: row.mime_type },
+            fileInfo: persistedTelegramFileInfo(row),
             totalSize: Number(row.total_size || 0),
+            groupedId: row.grouped_id || undefined,
+            sharedCaption: row.shared_caption || null,
+            groupIndex: row.group_index ? Number(row.group_index) : undefined,
+            groupSize: row.group_size ? Number(row.group_size) : undefined,
+            leaseToken: row.lease_token ? String(row.lease_token) : undefined,
         }));
 }
 
+export async function restoreTelegramDownloadRefsWithQuery(
+    runQuery: TelegramJobQuery,
+    jobId: string,
+    refs: TelegramDownloadMessageRef[],
+    status: 'pending' | 'skipped',
+    reason?: string,
+): Promise<boolean> {
+    if (refs.length === 0) return true;
+    const results = await Promise.all(refs.map(ref => runQuery(
+        `UPDATE telegram_download_items
+         SET status = $4::varchar,
+             error = CASE WHEN $4::text = 'skipped' THEN COALESCE(error, $6) ELSE error END,
+             last_error = CASE WHEN $6::text IS NOT NULL THEN $6 ELSE last_error END,
+             locked_at = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             completed_at = CASE WHEN $4::text = 'skipped' THEN NOW() ELSE completed_at END,
+             updated_at = NOW()
+         WHERE job_id = $1 AND source_peer = $2 AND message_id = $3 AND status = 'downloading'
+           AND lease_token = $5::uuid`,
+        [jobId, sourcePeerKey(ref.source, ref.origin === 'comment' ? 'comment' : 'channel'), ref.id, status, ref.leaseToken || null, reason || (status === 'skipped' ? '任务已取消' : null)]
+    )));
+    return results.every(result => (result.rowCount || 0) === 1);
+}
+
+async function restoreClaimedRefs(jobId: string, refs: TelegramDownloadMessageRef[], status: 'pending' | 'skipped'): Promise<boolean> {
+    return restoreTelegramDownloadRefsWithQuery(query, jobId, refs, status);
+}
+
+export function chooseUnfinishedClaimStatus(state: TelegramJobControlState): 'pending' | 'skipped' {
+    return state === 'cancelled' ? 'skipped' : 'pending';
+}
+
+async function restoreUnfinishedClaimedRefs(
+    jobId: string,
+    refs: TelegramDownloadMessageRef[],
+    reason: string,
+    status: 'pending' | 'skipped' = 'pending',
+): Promise<void> {
+    await restoreTelegramDownloadRefsWithQuery(query, jobId, refs, status, reason);
+}
+
+export async function heartbeatTelegramDownloadRefsWithQuery(runQuery: TelegramJobQuery, jobId: string, refs: TelegramDownloadMessageRef[]): Promise<void> {
+    const leased = refs.filter(ref => ref.leaseToken && !telegramLeaseFinalizing.has(telegramLeaseKey(jobId, ref)));
+    if (leased.length === 0) return;
+    const results = await Promise.all(leased.map(ref => runQuery(
+        `UPDATE telegram_download_items
+         SET locked_at = NOW(), lease_expires_at = NOW() + INTERVAL '10 minutes', updated_at = NOW()
+         WHERE job_id = $1 AND source_peer = $2 AND message_id = $3
+           AND status = 'downloading' AND lease_token = $4::uuid`,
+        [jobId, sourcePeerKey(ref.source, ref.origin === 'comment' ? 'comment' : 'channel'), ref.id, ref.leaseToken],
+    )));
+    const lost: TelegramDownloadMessageRef[] = [];
+    for (let index = 0; index < results.length; index += 1) {
+        if ((results[index].rowCount || 0) === 1) continue;
+        const ref = leased[index];
+        const current = await runQuery(
+            `SELECT status, lease_token
+             FROM telegram_download_items
+             WHERE job_id = $1 AND source_peer = $2 AND message_id = $3`,
+            [jobId, sourcePeerKey(ref.source, ref.origin === 'comment' ? 'comment' : 'channel'), ref.id],
+        );
+        const row = current.rows[0];
+        if (row && ['success', 'failed', 'skipped'].includes(String(row.status))) {
+            ref.leaseToken = undefined;
+            continue;
+        }
+        lost.push(ref);
+    }
+    if (lost[0]) throw new TelegramDownloadLeaseLostError(jobId, lost[0]);
+}
+
+async function heartbeatClaimedRefs(jobId: string, refs: TelegramDownloadMessageRef[]): Promise<void> {
+    return heartbeatTelegramDownloadRefsWithQuery(query, jobId, refs);
+}
+
+function startClaimHeartbeat(jobId: string, refs: TelegramDownloadMessageRef[]): () => void {
+    const handleFailure = (error: unknown) => {
+        console.error('Telegram 下载 lease heartbeat 失败:', error);
+        abortChannelExecutionForLeaseLoss(jobId);
+    };
+    void heartbeatClaimedRefs(jobId, refs).catch(handleFailure);
+    const timer = setInterval(() => {
+        void heartbeatClaimedRefs(jobId, refs).catch(handleFailure);
+    }, 2 * 60 * 1000);
+    timer.unref?.();
+    return () => clearInterval(timer);
+}
+
 async function downloadClaimedRefs(botClient: TelegramClient, requestMessage: Api.Message, jobId: string, source: string, refs: TelegramDownloadMessageRef[], folderOverride: string | null | undefined, options: TelegramCommentScanOptions) {
-    if (refs.length === 0) return { found: 0, skipped: 0, failed: 0, successful: 0 };
-    await updateJob(jobId, { status: 'running', download_status: 'active', error: null });
+    if (refs.length === 0) return {
+        found: 0,
+        skipped: 0,
+        failed: 0,
+        successful: 0,
+        successfulMessageIds: [] as number[],
+        failedMessageIds: [] as number[],
+        skippedMessageIds: [] as number[],
+    };
+    const controlState = await ensureJobCanRun(jobId);
+    if (controlState !== 'run') {
+        await restoreClaimedRefs(jobId, refs, controlState === 'cancelled' ? 'skipped' : 'pending');
+        return {
+            found: 0,
+            skipped: controlState === 'cancelled' ? refs.length : 0,
+            failed: 0,
+            successful: 0,
+            successfulMessageIds: [] as number[],
+            failedMessageIds: [] as number[],
+            skippedMessageIds: controlState === 'cancelled' ? refs.map(ref => ref.id) : [] as number[],
+        };
+    }
+    const started = await query(
+        `UPDATE telegram_background_jobs
+         SET status = 'running', download_status = 'active', error = NULL, updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND finished_at IS NULL
+           AND status NOT IN ('cancelled', 'paused', 'cooling')
+           AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+         RETURNING id`,
+        [jobId],
+    );
+    if ((started.rowCount || 0) === 0) {
+        const latestState = await ensureJobCanRun(jobId);
+        await restoreClaimedRefs(jobId, refs, latestState === 'cancelled' ? 'skipped' : 'pending');
+        return {
+            found: 0,
+            skipped: latestState === 'cancelled' ? refs.length : 0,
+            failed: 0,
+            successful: 0,
+            successfulMessageIds: [] as number[],
+            failedMessageIds: [] as number[],
+            skippedMessageIds: latestState === 'cancelled' ? refs.map(ref => ref.id) : [] as number[],
+        };
+    }
+    const taskSignal = getChannelTaskAbortSignal(jobId);
+    const stopHeartbeat = startClaimHeartbeat(jobId, refs);
+    const ownerJob = await getJob(jobId);
+    const ownerUserId = Number(ownerJob?.user_id || 0) || undefined;
     try {
+        const jobParams = typeof ownerJob?.params === 'string' ? JSON.parse(ownerJob.params) : (ownerJob?.params || {});
+        const storageTarget = jobParams.storageProvider
+            ? storageManager.getTarget(jobParams.storageProvider, jobParams.storageAccountId)
+            : storageManager.getActiveTarget();
         const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, refs.length, 'older', refs.map(ref => ref.id), folderOverride, refs, async (ref, status, error) => {
-            await markDownloadRefStatus(jobId, ref, status, error);
+            const settlement = await markDownloadRefStatus(jobId, ref, status, error);
+            if (settlement === 'lease-lost') throw new TelegramDownloadLeaseLostError(jobId, ref);
             await notifyProgress(jobId, options);
-        });
+        }, jobId, () => ensureJobCanRun(jobId), taskSignal, ownerUserId, storageTarget,
+        (ref, operation) => withTelegramDownloadRefLease(pool as unknown as TelegramTransactionPool, jobId, Object.assign(ref, { jobId }), async () => {
+            const persisted = await operation();
+            if (taskSignal.aborted) throw new Error('Telegram 下载 lease heartbeat 失败，已停止保存');
+            return persisted;
+        }));
+        const latestState = await ensureJobCanRun(jobId);
+        if (latestState !== 'run') {
+            await restoreUnfinishedClaimedRefs(
+                jobId,
+                refs,
+                latestState === 'cancelled' ? '任务已取消' : '任务已暂停',
+                chooseUnfinishedClaimStatus(latestState),
+            );
+        }
         return result;
     } catch (error) {
+        if (error instanceof TelegramDownloadLeaseLostError) {
+            abortChannelExecutionForLeaseLoss(jobId);
+            throw error;
+        }
         const flood = isFloodWait(error);
         if (flood) {
             const cooldownUntil = new Date(Date.now() + flood.seconds * 1000);
-            await updateJob(jobId, { status: 'running', cooldown_until: cooldownUntil, error: `Telegram FloodWait，冷却到 ${cooldownUntil.toISOString()}` });
-            for (const ref of refs) await markDownloadRefStatus(jobId, ref, 'failed', `FloodWait ${flood.seconds}s`);
-            return { found: 0, skipped: 0, failed: refs.length, successful: 0 };
+            await updateJob(jobId, {
+                status: 'cooling',
+                download_status: 'cooling',
+                cooldown_until: cooldownUntil,
+                error: `Telegram FloodWait，冷却到 ${cooldownUntil.toISOString()}`,
+            });
+            await restoreUnfinishedClaimedRefs(jobId, refs, `FloodWait ${flood.seconds}s`);
+            return { found: 0, skipped: 0, failed: 0, successful: 0, successfulMessageIds: [], failedMessageIds: [], skippedMessageIds: [] };
         }
         if (await handleStorageQuotaCooldownError(botClient, jobId, error)) {
-            return { found: 0, skipped: 0, failed: 0, successful: 0 };
+            await restoreUnfinishedClaimedRefs(jobId, refs, error instanceof Error ? error.message : String(error));
+            return { found: 0, skipped: 0, failed: 0, successful: 0, successfulMessageIds: [], failedMessageIds: [], skippedMessageIds: [] };
         }
         for (const ref of refs) await markDownloadRefStatus(jobId, ref, 'failed', error instanceof Error ? error.message : String(error));
         throw error;
+    } finally {
+        stopHeartbeat();
+        releaseChannelTaskAbortSignal(jobId, taskSignal);
     }
 }
 
 async function downloadPendingForJob(botClient: TelegramClient, requestMessage: Api.Message, jobId: string, source: string, folderOverride: string | null | undefined, options: TelegramCommentScanOptions, drain = false) {
-    let aggregate = { found: 0, skipped: 0, failed: 0, successful: 0 };
+    let aggregate = {
+        found: 0,
+        skipped: 0,
+        failed: 0,
+        successful: 0,
+        successfulMessageIds: [] as number[],
+        failedMessageIds: [] as number[],
+        skippedMessageIds: [] as number[],
+    };
     const userClient = getTelegramUserClient();
     while (await waitUntilRunnable(jobId, options)) {
         if (userClient) await hydratePendingDownloadRefs(userClient, jobId);
@@ -835,6 +1245,9 @@ async function downloadPendingForJob(botClient: TelegramClient, requestMessage: 
             skipped: aggregate.skipped + (result.skipped || 0),
             failed: aggregate.failed + (result.failed || 0),
             successful: aggregate.successful + (result.successful || 0),
+            successfulMessageIds: [...aggregate.successfulMessageIds, ...(result.successfulMessageIds || [])],
+            failedMessageIds: [...aggregate.failedMessageIds, ...(result.failedMessageIds || [])],
+            skippedMessageIds: [...aggregate.skippedMessageIds, ...(result.skippedMessageIds || [])],
         };
         if (!drain) break;
     }
@@ -842,19 +1255,41 @@ async function downloadPendingForJob(botClient: TelegramClient, requestMessage: 
 }
 
 async function finalizeTelegramJob(jobId: string, options: TelegramCommentScanOptions) {
+    const job = await getJob(jobId);
+    if (!job || job.cancelled_at || job.status === 'cancelled') return;
+    if (job.paused_at || job.status === 'paused') {
+        await notifyProgress(jobId, options);
+        return;
+    }
     const stats = await getJobItemStats(jobId);
     const pending = Number(stats.pending || 0) + Number(stats.downloading || 0);
     const failed = Number(stats.failed || 0);
     const status = pending > 0 ? 'running' : failed > 0 ? 'completed_with_errors' : 'completed';
-    await updateJob(jobId, {
-        status,
-        download_status: pending > 0 ? 'active' : 'done',
-        enqueued_count: Number(stats.success || 0),
-        skipped_count: Number(stats.skipped || 0),
-        error: failed > 0 ? `${failed} 个文件下载失败` : null,
-        finished_at: pending > 0 ? null : new Date(),
-    });
-    await notifyProgress(jobId, options);
+    const result = await query(
+        `UPDATE telegram_background_jobs
+         SET status = $2,
+             download_status = $3,
+             enqueued_count = $4,
+             skipped_count = $5,
+             error = $6,
+             finished_at = $7,
+             updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND status NOT IN ('cancelled', 'paused')
+         RETURNING id`,
+        [
+            jobId,
+            status,
+            pending > 0 ? 'active' : 'done',
+            Number(stats.success || 0),
+            Number(stats.skipped || 0),
+            failed > 0 ? `${failed} 个文件下载失败` : null,
+            pending > 0 ? null : new Date(),
+        ]
+    );
+    if ((result.rowCount || 0) > 0) await notifyProgress(jobId, options);
 }
 
 async function scanChannelSegment(userClient: TelegramClient, jobId: string, source: string, params: any, cursor: any, options: TelegramCommentScanOptions): Promise<{ messages: Api.Message[]; done: boolean; nextOffsetId: number }> {
@@ -893,7 +1328,36 @@ async function runSegmentedTelegramJob(botClient: TelegramClient, requestMessage
     let cursor = job?.scan_cursor || {};
     const discoveredRefKeys = new Set<string>();
     let totals = { found: 0, skipped: 0, failed: 0, successful: 0 };
-    await updateJob(jobId, { status: 'running', scan_status: 'scanning', download_status: 'active', started_at: job?.started_at || new Date(), error: null });
+    const initialState = await ensureJobCanRun(jobId);
+    if (initialState === 'cancelled') {
+        return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+    }
+    if (initialState !== 'run') {
+        const runnable = await waitUntilRunnable(jobId, options);
+        if (!runnable) return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+    }
+    const started = await query(
+        `UPDATE telegram_background_jobs
+         SET status = 'running', scan_status = 'scanning', download_status = 'active',
+             started_at = COALESCE(started_at, NOW()), error = NULL, updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND finished_at IS NULL
+           AND status NOT IN ('cancelled', 'paused', 'cooling')
+           AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+         RETURNING id`,
+        [jobId],
+    );
+    if ((started.rowCount || 0) === 0) {
+        const state = await ensureJobCanRun(jobId);
+        if (state === 'cancelled') return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+        if (state !== 'run') {
+            const runnable = await waitUntilRunnable(jobId, options);
+            if (!runnable) return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+        }
+        return { jobId, deferred: true, ...totals, requested: 0, commentMessagesScanned: 0, commentMediaFound: 0 };
+    }
 
     while (await waitUntilRunnable(jobId, options)) {
         const current = await getJob(jobId);
@@ -940,7 +1404,7 @@ async function runSegmentedTelegramJob(botClient: TelegramClient, requestMessage
     const runnable = await waitUntilRunnable(jobId, options);
     if (!runnable) {
         await updateJob(jobId, { status: 'cancelled', scan_status: 'cancelled', download_status: 'cancelled', finished_at: new Date() });
-        return { jobId, ...totals, requested: 0, commentMessagesScanned: Number(cursor.commentMessagesScanned || 0), commentMediaFound: Number(cursor.commentMediaFound || 0) };
+        return { jobId, cancelled: true, ...totals, requested: 0, commentMessagesScanned: Number(cursor.commentMessagesScanned || 0), commentMediaFound: Number(cursor.commentMediaFound || 0) };
     }
     await updateJob(jobId, { scan_status: 'done' });
     const drained = await downloadPendingForJob(botClient, requestMessage, jobId, source, folderOverride, options, true);
@@ -1030,8 +1494,8 @@ export async function listTelegramActiveTaskQueues(userId: number, limit = 10) {
              GROUP BY job_id
          )
          SELECT
-             j.id, j.kind, j.source, j.status, j.scan_status, j.download_status,
-             j.scan_cursor, j.cooldown_until, j.paused_at, j.cancelled_at,
+             j.id, j.user_id, j.chat_id, j.kind, j.source, j.status, j.scan_status, j.download_status,
+             j.scan_cursor, j.cooldown_until, j.paused_at, j.cancelled_at, j.params,
              j.total_count, j.enqueued_count, j.skipped_count, j.duplicate_count,
              j.error, j.started_at, j.finished_at, j.created_at, j.updated_at,
              COALESCE(s.item_count, 0)::int AS item_count,
@@ -1042,6 +1506,16 @@ export async function listTelegramActiveTaskQueues(userId: number, limit = 10) {
              COALESCE(s.skipped_count_items, 0)::int AS skipped_count_items,
              COALESCE(s.missing_metadata_count, 0)::int AS missing_metadata_count,
              s.queue_updated_at,
+             (SELECT i.file_name
+                FROM telegram_download_items i
+               WHERE i.job_id = j.id AND i.status = 'downloading'
+               ORDER BY i.locked_at DESC NULLS LAST, i.updated_at DESC
+               LIMIT 1) AS current_file_name,
+             (SELECT i.folder_override
+                FROM telegram_download_items i
+               WHERE i.job_id = j.id AND i.folder_override IS NOT NULL
+               ORDER BY i.updated_at DESC
+               LIMIT 1) AS folder_override,
              (
                  j.status = 'running'
                  AND (
@@ -1057,6 +1531,10 @@ export async function listTelegramActiveTaskQueues(userId: number, limit = 10) {
            AND j.finished_at IS NULL
            AND (
                (
+                   j.status IN ('queued', 'pending')
+                   AND j.finished_at IS NULL
+               )
+               OR (
                    j.status = 'running'
                    AND (
                        COALESCE(s.downloading_count, 0) > 0
@@ -1081,38 +1559,66 @@ export async function listTelegramActiveTaskQueues(userId: number, limit = 10) {
 export const listTelegramBackgroundJobs = listTelegramActiveTaskQueues;
 
 
-export async function pauseTelegramBackgroundJob(userId: number, selector: string) {
+async function resolveUniqueTelegramBackgroundJobId(userId: number, selector: string, chatId?: string): Promise<string | null> {
+    const normalized = selector.trim().toLowerCase();
+    if (!/^[0-9a-f-]{4,36}$/.test(normalized)) return null;
+    const result = await query(
+        `SELECT id
+         FROM telegram_background_jobs
+         WHERE user_id = $1
+           AND id::text LIKE $2
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+         ORDER BY created_at DESC
+         LIMIT 2`,
+        [userId, `${normalized}%`, chatId || null]
+    );
+    return result.rows.length === 1 ? String(result.rows[0].id) : null;
+}
+
+export async function pauseTelegramBackgroundJob(userId: number, selector: string, chatId?: string) {
+    const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+    if (!jobId) return null;
     const result = await query(
         `UPDATE telegram_background_jobs
          SET status = 'paused', paused_at = NOW(), updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $2 AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
+         WHERE user_id = $1 AND id = $2::uuid
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
          RETURNING id, source, status`,
-        [userId, `${selector}%`]
+        [userId, jobId, chatId || null]
     );
     return result.rows[0] || null;
 }
 
-export async function resumeTelegramBackgroundJob(userId: number, selector: string) {
+export async function resumeTelegramBackgroundJob(userId: number, selector: string, chatId?: string) {
+    const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+    if (!jobId) return null;
     const result = await query(
         `UPDATE telegram_background_jobs
          SET status = 'running', paused_at = NULL, finished_at = NULL, error = NULL, download_status = 'active', updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $2 AND cancelled_at IS NULL AND status = 'paused'
+         WHERE user_id = $1 AND id = $2::uuid
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND cancelled_at IS NULL AND status = 'paused'
          RETURNING id, source, status`,
-        [userId, `${selector}%`]
+        [userId, jobId, chatId || null]
     );
     return result.rows[0] || null;
 }
 
-export async function cancelTelegramBackgroundJob(userId: number, selector: string) {
+export async function cancelTelegramBackgroundJob(userId: number, selector: string, chatId?: string) {
+    const jobId = await resolveUniqueTelegramBackgroundJobId(userId, selector, chatId);
+    if (!jobId) return null;
     const result = await query(
         `UPDATE telegram_background_jobs
          SET status = 'cancelled', scan_status = 'cancelled', download_status = 'cancelled', cancelled_at = NOW(), finished_at = NOW(), updated_at = NOW()
-         WHERE user_id = $1 AND id::text LIKE $2 AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
+         WHERE user_id = $1 AND id = $2::uuid
+           AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+           AND finished_at IS NULL AND status NOT IN ('completed', 'completed_with_errors', 'cancelled')
          RETURNING id, source, status`,
-        [userId, `${selector}%`]
+        [userId, jobId, chatId || null]
     );
     if (result.rows[0]) {
-        await query(`UPDATE telegram_download_items SET status = 'skipped', locked_at = NULL, updated_at = NOW() WHERE job_id = $1 AND status IN ('pending', 'downloading')`, [result.rows[0].id]);
+        await query(`UPDATE telegram_download_items SET status = 'skipped', locked_at = NULL, updated_at = NOW() WHERE job_id = $1 AND status = 'pending'`, [result.rows[0].id]);
     }
     return result.rows[0] || null;
 }
@@ -1132,36 +1638,151 @@ export async function cancelAllTelegramBackgroundJobs(userId: number) {
             `UPDATE telegram_download_items
              SET status = 'skipped', locked_at = NULL, updated_at = NOW()
              WHERE job_id = ANY($1::uuid[])
-               AND status IN ('pending', 'downloading')`,
+               AND status = 'pending'`,
             [ids]
         );
     }
     return result.rows;
 }
 
-export async function retryTelegramBackgroundJob(userId: number, selector: string) {
-    const result = await query(
-        `SELECT id FROM telegram_background_jobs WHERE user_id = $1 AND id::text LIKE $2 LIMIT 1`,
-        [userId, `${selector}%`]
+export async function retryTelegramBackgroundJobWithQuery(runQuery: TelegramJobQuery, userId: number, selector: string, chatId?: string) {
+    const normalized = selector.trim().toLowerCase();
+    if (!/^[0-9a-f-]{4,36}$/.test(normalized)) return null;
+    const result = await runQuery(
+        `WITH matched_job AS (
+             SELECT id
+             FROM telegram_background_jobs
+             WHERE user_id = $1
+               AND id::text LIKE $2
+               AND ($3::bigint IS NULL OR chat_id = $3::bigint)
+               AND cancelled_at IS NULL
+               AND paused_at IS NULL
+               AND status IN ('failed', 'completed_with_errors')
+               AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+             GROUP BY id
+             HAVING COUNT(*) = 1
+             LIMIT 2
+         ), unique_job AS (
+             SELECT MIN(id::text)::uuid AS id FROM matched_job HAVING COUNT(*) = 1
+         ), locked_job AS (
+             SELECT j.id
+             FROM telegram_background_jobs j
+             JOIN unique_job u ON u.id = j.id
+             WHERE j.cancelled_at IS NULL
+               AND j.paused_at IS NULL
+               AND j.status IN ('failed', 'completed_with_errors')
+               AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+             FOR UPDATE OF j
+         ), retried AS (
+             UPDATE telegram_download_items i
+             SET status = 'pending', attempts = 0, locked_at = NULL,
+                 completed_at = NULL, last_error = NULL, error = NULL, updated_at = NOW()
+             FROM locked_job u
+             WHERE i.job_id = u.id AND i.status = 'failed'
+ AND NOT EXISTS (
+     SELECT 1 FROM telegram_write_reconciliations r
+     WHERE r.item_id = i.id AND r.status = 'pending'
+ )
+             RETURNING i.job_id
+         ), updated_job AS (
+             UPDATE telegram_background_jobs j
+             SET status = 'running', download_status = 'active', error = NULL,
+                 finished_at = NULL, cooldown_until = NULL, updated_at = NOW()
+             FROM locked_job u
+             WHERE j.id = u.id
+               AND j.cancelled_at IS NULL
+               AND j.paused_at IS NULL
+               AND j.status IN ('failed', 'completed_with_errors')
+               AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+               AND EXISTS (SELECT 1 FROM retried)
+             RETURNING j.id
+         )
+         SELECT updated_job.id, COUNT(retried.*)::int AS retried
+         FROM updated_job JOIN retried ON retried.job_id = updated_job.id
+         GROUP BY updated_job.id`,
+        [userId, `${normalized}%`, chatId || null],
     );
-    const row = result.rows[0];
-    if (!row) return null;
-    const retry = await query(
-        `UPDATE telegram_download_items
-         SET status = 'pending', locked_at = NULL, last_error = NULL, error = NULL, updated_at = NOW()
-         WHERE job_id = $1 AND status = 'failed'
+    return result.rows[0] || null;
+}
+
+export async function retryTelegramBackgroundJob(userId: number, selector: string, chatId?: string) {
+    return retryTelegramBackgroundJobWithQuery(query, userId, selector, chatId);
+}
+
+export interface FinalizeSubscriptionJobInput {
+    jobId: string;
+    subscriptionId: string;
+    status: 'completed' | 'completed_with_errors';
+    safeAdvanceId: number;
+    enqueuedCount: number;
+    skippedCount: number;
+    error: string | null;
+}
+
+export async function finalizeSubscriptionJobWithQuery(
+    runQuery: TelegramJobQuery,
+    input: FinalizeSubscriptionJobInput,
+): Promise<boolean> {
+    const finalized = await runQuery(
+        `UPDATE telegram_background_jobs
+         SET status = $2, enqueued_count = $3, skipped_count = $4, error = $5,
+             finished_at = NOW(), updated_at = NOW()
+         WHERE id = $1
+           AND cancelled_at IS NULL
+           AND paused_at IS NULL
+           AND finished_at IS NULL
+           AND status NOT IN ('cancelled', 'paused', 'cooling')
          RETURNING id`,
-        [row.id]
+        [input.jobId, input.status, input.enqueuedCount, input.skippedCount, input.error],
     );
-    await updateJob(row.id, { status: 'running', download_status: 'active', error: null, finished_at: null });
-    return { id: row.id, retried: retry.rowCount || 0 };
+    if ((finalized.rowCount || 0) !== 1) return false;
+    const cursor = await runQuery(
+        `UPDATE telegram_channel_subscriptions
+         SET last_message_id = GREATEST(last_message_id, $1), updated_at = NOW()
+         WHERE id = $2 AND enabled = true
+         RETURNING id`,
+        [input.safeAdvanceId, input.subscriptionId],
+    );
+    if ((cursor.rowCount || 0) !== 1) throw new Error(`Telegram 订阅 cursor 更新影响 0 行: subscription=${input.subscriptionId}`);
+    return true;
+}
+
+export async function finalizeSubscriptionJobInTransaction(
+    transactionPool: TelegramTransactionPool,
+    input: FinalizeSubscriptionJobInput,
+): Promise<boolean> {
+    const client = await transactionPool.connect();
+    try {
+        await client.query('BEGIN');
+        const finalized = await finalizeSubscriptionJobWithQuery(client.query.bind(client), input);
+        if (!finalized) {
+            await client.query('ROLLBACK');
+            return false;
+        }
+        await client.query('COMMIT');
+        return true;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 async function runSubscriptionScan(botClient: TelegramClient) {
-    const userClient = getTelegramUserClient();
-    if (!userClient || !isTelegramUserClientReady()) return;
+    if (subscriptionScanRunning) return;
+    subscriptionScanRunning = true;
+    let lockClient: PoolClient | null = null;
+    let lockHeld = false;
+    try {
+        lockClient = await pool.connect();
+        const lockResult = await lockClient.query(`SELECT pg_try_advisory_lock(hashtext('tg-vault:telegram-subscription-scan')) AS locked`);
+        lockHeld = Boolean(lockResult.rows[0]?.locked);
+        if (!lockHeld) return;
+        const userClient = getTelegramUserClient();
+        if (!userClient || !isTelegramUserClientReady()) return;
 
-    const result = await query(
+        const result = await query(
         `SELECT id, user_id, chat_id, source, source_original, source_type, last_message_id, folder_override
          FROM telegram_channel_subscriptions
          WHERE enabled = true
@@ -1177,7 +1798,7 @@ async function runSubscriptionScan(botClient: TelegramClient) {
 
             const count = Math.min(SUBSCRIPTION_SCAN_LIMIT, latestMessageId - lastMessageId);
             const ids = Array.from({ length: count }, (_, index) => lastMessageId + index + 1);
-            const jobId = await createJob(Number(row.user_id), row.chat_id?.toString(), 'subscription_sync', row.source, { fromId: lastMessageId + 1, toId: latestMessageId });
+            const jobId = await createJob(Number(row.user_id), row.chat_id?.toString(), 'subscription_sync', row.source, { subscriptionId: String(row.id), fromId: lastMessageId + 1, toId: latestMessageId });
             const candidateMessages = await expandMessagesWithMediaGroups(userClient, row.source, (await userClient.getMessages(row.source as any, { ids })).filter(Boolean) as Api.Message[]);
             await persistDownloadMessages(jobId, row.source, candidateMessages, row.folder_override || null);
             await updateJob(jobId, { status: 'running', started_at: new Date(), total_count: ids.length });
@@ -1187,23 +1808,42 @@ async function runSubscriptionScan(botClient: TelegramClient) {
             const subscriptionRefs = candidateMessages
                 .map(message => toChannelDownloadRef(row.source, message))
                 .filter((ref): ref is TelegramDownloadMessageRef => Boolean(ref));
-            await markDownloadRefsDownloading(jobId, subscriptionRefs);
-            const downloadResult = await downloadTelegramChannelRange(botClient, requestMessage, row.source, 0, ids.length, 'newer', ids, row.folder_override || null, subscriptionRefs, (ref, status, error) => markDownloadRefStatus(jobId, ref, status, error));
+            propagateTelegramDownloadGroupContext(subscriptionRefs);
+            const downloadableMessageIds = new Set(subscriptionRefs.map(ref => ref.id));
+            const nonDownloadableMessageIds = ids.filter(id => !downloadableMessageIds.has(id));
+            const downloadResult = await downloadPendingForJob(
+                botClient,
+                requestMessage,
+                jobId,
+                row.source,
+                row.folder_override || null,
+                {},
+                true,
+            );
             const cooledJob = await getJob(jobId);
             if (cooledJob?.status === 'cooling') {
                 await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
                 continue;
             }
-            await updateJob(jobId, {
-                status: downloadResult.failed > 0 ? 'completed_with_errors' : 'completed',
-                enqueued_count: downloadResult.found,
-                skipped_count: downloadResult.skipped,
-                error: downloadResult.failed > 0 ? `${downloadResult.failed} 个文件下载失败` : null,
-                finished_at: new Date(),
-            });
+            const latestJob = await getJob(jobId);
+            if (latestJob?.cancelled_at || latestJob?.status === 'cancelled') continue;
+            if (latestJob?.paused_at || latestJob?.status === 'paused') continue;
+            const remainingStats = await getJobItemStats(jobId);
+            if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) continue;
             const scannedMaxId = ids.length > 0 ? ids[ids.length - 1] : lastMessageId;
-            const safeAdvanceId = downloadResult.failed > 0 ? Math.max(lastMessageId, maxProcessedMessageId(downloadResult)) : scannedMaxId;
-            await query('UPDATE telegram_channel_subscriptions SET last_message_id = $1, updated_at = NOW() WHERE id = $2', [safeAdvanceId, row.id]);
+            const safeAdvanceId = downloadResult.failed > 0
+                ? contiguousProcessedMessageId(lastMessageId, downloadResult.successfulMessageIds, [...downloadResult.skippedMessageIds, ...nonDownloadableMessageIds], downloadResult.failedMessageIds)
+                : scannedMaxId;
+            const finalized = await finalizeSubscriptionJobInTransaction(pool as unknown as TelegramTransactionPool, {
+                jobId,
+                subscriptionId: String(row.id),
+                status: downloadResult.failed > 0 ? 'completed_with_errors' : 'completed',
+                safeAdvanceId,
+                enqueuedCount: downloadResult.found,
+                skippedCount: downloadResult.skipped,
+                error: downloadResult.failed > 0 ? `${downloadResult.failed} 个文件下载失败` : null,
+            });
+            if (!finalized) continue;
             if (downloadResult.found > 0) {
                 await botClient.sendMessage(targetChat, { message: `✅ 订阅 ${row.source} 已同步 ${downloadResult.found} 个新文件，跳过 ${downloadResult.skipped} 条${downloadResult.failed ? `，失败 ${downloadResult.failed} 条` : ''}${safeAdvanceId < latestMessageId ? '。本轮达到扫描上限或存在失败项，剩余将在后续继续处理。' : '。'}` }).catch(() => undefined);
             }
@@ -1218,12 +1858,17 @@ async function runSubscriptionScan(botClient: TelegramClient) {
                 }).catch(() => undefined);
             }
         }
+        }
+    } finally {
+        if (lockHeld && lockClient) await lockClient.query(`SELECT pg_advisory_unlock(hashtext('tg-vault:telegram-subscription-scan'))`).catch(() => undefined);
+        lockClient?.release();
+        subscriptionScanRunning = false;
     }
 }
 
 async function recoverTelegramJob(botClient: TelegramClient, job: any): Promise<void> {
     const itemResult = await query(
-        `SELECT id, source, source_peer, origin, message_id, channel_post_id, file_name, mime_type, total_size, folder_override
+        `SELECT file_name, mime_type, folder_override
          FROM telegram_download_items
          WHERE job_id = $1 AND status = 'pending'
          ORDER BY created_at ASC`,
@@ -1242,51 +1887,65 @@ async function recoverTelegramJob(botClient: TelegramClient, job: any): Promise<
         return;
     }
 
-    const refs: TelegramDownloadMessageRef[] = itemResult.rows
-        .filter(row => row.file_name && row.mime_type)
-        .map(row => ({
-            id: Number(row.message_id),
-            source: row.source_peer || row.source,
-            origin: row.origin === 'comment' ? 'comment' : 'channel',
-            channelPostId: row.channel_post_id || undefined,
-            fileInfo: { fileName: row.file_name, mimeType: row.mime_type },
-            totalSize: Number(row.total_size || 0),
-        }));
-
-    if (refs.length === 0) return;
-
     const targetChat = job.chat_id || job.user_id;
     const requestMessage = ({ chatId: targetChat, id: 0 } as unknown) as Api.Message;
-    console.log(`♻️ 恢复 Telegram 下载任务 ${String(job.id).slice(0, 8)}，待处理 ${refs.length} 个文件`);
-    await updateJob(job.id, { status: 'running', started_at: job.started_at || new Date(), error: null });
-
     try {
-        const result = await downloadTelegramChannelRange(
+        const latest = await getJob(job.id);
+        if (!latest || latest.cancelled_at || latest.status === 'cancelled') return;
+        if (latest.paused_at || latest.status === 'paused') return;
+        console.log(`♻️ 恢复 Telegram 下载任务 ${String(job.id).slice(0, 12)}，待处理 ${itemResult.rows.length} 个文件`);
+        await updateJob(job.id, { status: 'running', started_at: job.started_at || new Date(), error: null });
+        const result = await downloadPendingForJob(
             botClient,
             requestMessage,
+            String(job.id),
             job.source,
-            0,
-            refs.length,
-            'older',
-            refs.map(ref => ref.id),
             itemResult.rows[0]?.folder_override || null,
-            refs,
-            (ref, status, error) => markDownloadRefStatus(job.id, ref, status, error),
+            {},
+            true,
         );
         const cooledJob = await getJob(job.id);
         if (cooledJob?.status === 'cooling') {
             await notifyStorageCooldownOnce(botClient, cooledJob, new Date(cooledJob.cooldown_until));
             return;
         }
-        await updateJob(job.id, {
-            status: result.failed > 0 ? 'completed_with_errors' : 'completed',
-            enqueued_count: result.found,
-            skipped_count: result.skipped,
-            error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
-            finished_at: new Date(),
-        });
+        const latestJob = await getJob(job.id);
+        if (latestJob?.cancelled_at || latestJob?.status === 'cancelled') return;
+        if (latestJob?.paused_at || latestJob?.status === 'paused') return;
+        const remainingStats = await getJobItemStats(job.id);
+        if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) return;
+        let finalized: boolean;
+        if (job.kind === 'subscription_sync') {
+            const subscriptionId = String(job.params?.subscriptionId || '');
+            const targetMessageId = Number(job.params?.toId || 0);
+            if (!subscriptionId || targetMessageId <= 0) {
+                throw new Error('恢复订阅任务缺少 subscriptionId/toId，禁止非原子推进 cursor');
+            }
+            finalized = await finalizeSubscriptionJobInTransaction(pool as unknown as TelegramTransactionPool, {
+                jobId: String(job.id),
+                subscriptionId,
+                status: result.failed > 0 ? 'completed_with_errors' : 'completed',
+                safeAdvanceId: result.failed > 0
+                    ? contiguousProcessedMessageId(Number(job.params?.fromId || 1) - 1, result.successfulMessageIds, result.skippedMessageIds, result.failedMessageIds)
+                    : targetMessageId,
+                enqueuedCount: result.found,
+                skippedCount: result.skipped,
+                error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
+            });
+        } else {
+            finalized = (await updateJob(job.id, {
+                status: result.failed > 0 ? 'completed_with_errors' : 'completed',
+                download_status: result.failed > 0 ? 'completed_with_errors' : 'completed',
+                cooldown_until: null,
+                enqueued_count: result.found,
+                skipped_count: result.skipped,
+                error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
+                finished_at: new Date(),
+            })) === 1;
+        }
+        if (!finalized) return;
         await botClient.sendMessage(targetChat, {
-            message: `♻️ 已恢复并完成任务 ${String(job.id).slice(0, 8)}：成功 ${result.successful}，跳过 ${result.skipped}，失败 ${result.failed}`,
+            message: `♻️ 已恢复并完成任务 ${String(job.id).slice(0, 12)}：成功 ${result.successful}，跳过 ${result.skipped}，失败 ${result.failed}`,
         }).catch(() => undefined);
     } catch (error) {
         await updateJob(job.id, { status: 'failed', error: error instanceof Error ? error.message : String(error), finished_at: new Date() });
@@ -1294,10 +1953,76 @@ async function recoverTelegramJob(botClient: TelegramClient, job: any): Promise<
     }
 }
 
+export async function repairTelegramJobInvariantsWithQuery(runQuery: TelegramJobQuery = query): Promise<number> {
+    const result = await runQuery(
+        `WITH inconsistent AS (
+             SELECT j.id,
+                    COUNT(*) FILTER (WHERE i.status IN ('pending', 'downloading'))::int AS unfinished_count
+             FROM telegram_background_jobs j
+             JOIN telegram_download_items i ON i.job_id = j.id
+             WHERE j.cancelled_at IS NULL
+               AND j.paused_at IS NULL
+               AND j.status IN ('completed', 'completed_with_errors', 'failed', 'running')
+             GROUP BY j.id, j.finished_at, j.status
+             HAVING COUNT(*) FILTER (WHERE i.status = 'pending') > 0
+                AND (j.finished_at IS NOT NULL OR j.status IN ('completed', 'completed_with_errors', 'failed'))
+         ), reset_items AS (
+             UPDATE telegram_download_items i
+             SET status = 'pending', locked_at = NULL, completed_at = NULL, updated_at = NOW()
+             FROM inconsistent x
+             WHERE i.job_id = x.id
+               AND i.status = 'downloading'
+               AND (i.locked_at IS NULL OR i.locked_at < NOW() - INTERVAL '30 minutes')
+               AND NOT EXISTS (
+                   SELECT 1 FROM telegram_write_reconciliations r
+                   WHERE r.item_id = i.id AND r.status = 'pending'
+               )
+             RETURNING i.job_id
+         ), repaired AS (
+             UPDATE telegram_background_jobs j
+             SET status = 'running',
+                 finished_at = NULL,
+                 cancelled_at = NULL,
+                 download_status = 'active',
+                 scan_status = CASE
+                     WHEN j.params ? 'mode' AND COALESCE(j.scan_status, 'pending') <> 'done' THEN j.scan_status
+                     ELSE 'done'
+                 END,
+                 error = CASE WHEN j.error IS NULL THEN '检测到未完成下载条目，已自动恢复' ELSE j.error END,
+                 updated_at = NOW()
+             FROM inconsistent x
+             WHERE j.id = x.id
+             RETURNING j.id
+         )
+         SELECT COUNT(*)::int AS repaired_jobs FROM repaired`
+    );
+    return Number(result.rows[0]?.repaired_jobs || 0);
+}
+
 export async function recoverInterruptedTelegramJobs(botClient: TelegramClient): Promise<void> {
     if (recoveryRunning) return;
     recoveryRunning = true;
+    let lockClient: PoolClient | null = null;
+    let lockHeld = false;
     try {
+        const client = await pool.connect();
+        lockClient = client;
+        const lockResult = await client.query(`SELECT pg_try_advisory_lock(hashtext('tg-vault:telegram-job-recovery')) AS locked`);
+        lockHeld = Boolean(lockResult.rows[0]?.locked);
+        if (!lockHeld) return;
+        const reconciliationLease = crypto.randomUUID();
+        const pendingWrites = await claimTelegramWriteReconciliations(pool, reconciliationLease, 100);
+        for (const pendingWrite of pendingWrites) {
+            const target = storageManager.getTarget(pendingWrite.provider, pendingWrite.accountId);
+            await resolveClaimedTelegramWrite({
+                db: pool,
+                leaseToken: reconciliationLease,
+                row: pendingWrite,
+                deleteObject: storedPath => target.provider.deleteFile(storedPath),
+            }).catch(error => console.error(`♻️ Telegram write journal resolve 失败: ${pendingWrite.operationId}`, error));
+        }
+        const repaired = await repairTelegramJobInvariantsWithQuery();
+        if (repaired > 0) console.warn(`♻️ 已修复 ${repaired} 个 Telegram 父子任务状态不一致`);
         await clearExpiredStorageCooldowns();
         await query(
             `UPDATE telegram_background_jobs
@@ -1305,6 +2030,7 @@ export async function recoverInterruptedTelegramJobs(botClient: TelegramClient):
              WHERE status = 'cooling'
                AND cooldown_until IS NOT NULL
                AND cooldown_until <= NOW()
+               AND paused_at IS NULL
                AND cancelled_at IS NULL
                AND finished_at IS NULL`
         );
@@ -1312,13 +2038,25 @@ export async function recoverInterruptedTelegramJobs(botClient: TelegramClient):
             `UPDATE telegram_download_items
              SET status = 'pending', locked_at = NULL, updated_at = NOW()
              WHERE status = 'downloading'
-               AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL '30 minutes')`
+               AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+               AND NOT EXISTS (
+                   SELECT 1 FROM telegram_write_reconciliations r
+                   WHERE r.item_id = telegram_download_items.id AND r.status = 'pending'
+               )
+               AND EXISTS (
+                   SELECT 1 FROM telegram_background_jobs j
+                   WHERE j.id = telegram_download_items.job_id
+                     AND j.finished_at IS NULL
+                     AND j.cancelled_at IS NULL
+                     AND j.paused_at IS NULL
+                     AND j.status NOT IN ('cancelled', 'paused')
+               )`
         );
         const jobs = await query(
             `SELECT DISTINCT j.*
              FROM telegram_background_jobs j
              JOIN telegram_download_items i ON i.job_id = j.id
-             WHERE j.kind IN ('date_range', 'tag_download')
+             WHERE j.kind IN ('date_range', 'tag_download', 'subscription_sync')
                AND j.finished_at IS NULL
                AND j.cancelled_at IS NULL
                AND j.status IN ('pending', 'running', 'failed', 'completed_with_errors', 'cooling')
@@ -1336,6 +2074,11 @@ export async function recoverInterruptedTelegramJobs(botClient: TelegramClient):
             }
         }
     } finally {
+        const client = lockClient;
+        if (lockHeld && client) {
+            await client.query(`SELECT pg_advisory_unlock(hashtext('tg-vault:telegram-job-recovery'))`).catch(() => undefined);
+        }
+        client?.release();
         recoveryRunning = false;
     }
 }

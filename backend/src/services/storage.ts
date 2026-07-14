@@ -6,7 +6,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, Head
 import { getSignedUrl as getS3SignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createClient, WebDAVClient } from 'webdav';
 import { google } from 'googleapis';
-import { query } from '../db/index.js';
+import { query, pool } from '../db/index.js';
 import { safeJoin } from '../utils/localPath.js';
 import {
     decryptSettingValue,
@@ -19,6 +19,8 @@ import {
     storageConfigNeedsEncryption,
 } from '../utils/credentialCrypto.js';
 import { DEFAULT_STORAGE_COOLDOWN_MS, STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT } from './storageCooldown.js';
+import { switchStorageAccountWithClient, switchStorageToLocalWithClient } from './storageAccountLifecycle.js';
+import { validateConfiguredStorageTarget } from './storageTargetReadiness.js';
 
 export class StorageQuotaCooldownError extends Error {
     provider: string;
@@ -106,6 +108,12 @@ export interface IStorageProvider {
      * @param expiration 过期时间 ISO 字符串（可选）
      */
     createShareLink?(storedPath: string, password?: string, expiration?: string): Promise<{ link: string; error?: string }>;
+}
+
+export interface StorageTargetSnapshot {
+    provider: IStorageProvider;
+    accountId: string | null;
+    providerKey: string;
 }
 
 // 本地存储实现
@@ -471,7 +479,7 @@ export class OneDriveStorageProvider implements IStorageProvider {
         private refreshToken: string,
         private tenantId: string = 'common'
     ) {
-        console.log(`[OneDrive] Provider ${id} initialized with clientId:`, clientId.substring(0, 8) + '...', 'Tenant:', tenantId);
+        console.log(`[OneDrive] Provider initialized: ${id}`);
     }
 
     /**
@@ -1182,6 +1190,11 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
      * 创建分享链接
      */
     async createShareLink(storedPath: string, password?: string, expiration?: string): Promise<{ link: string; error?: string }> {
+        if (password || expiration) {
+            const unsupported = [password ? '密码' : '', expiration ? '过期时间' : ''].filter(Boolean).join('和');
+            return { link: '', error: `Google Drive 普通账户不支持通过 API 设置分享${unsupported}，未创建公开权限。` };
+        }
+
         await this.ensureAuthenticated();
 
         try {
@@ -1207,14 +1220,7 @@ export class GoogleDriveStorageProvider implements IStorageProvider {
             }
 
             console.log('[GoogleDrive] Share link created successfully:', link);
-
-            // 提示用户 Google Drive 不支持在 API 层面直接设置密码或过期时间（针对普通账户）
-            let errorMsg = undefined;
-            if (password || expiration) {
-                errorMsg = 'Google Drive 普通账户暂不支持通过 API 设置分享密码或过期时间，已为您生成公开分享链接。';
-            }
-
-            return { link, error: errorMsg };
+            return { link };
 
         } catch (error: any) {
             console.error('[GoogleDrive] Create share link failed:', error.message);
@@ -1296,6 +1302,10 @@ export class StorageManager {
 
             // 3. 加载所有存储账户。敏感字段在数据库中加密存储，读取时解密；旧明文配置会自动迁移为加密格式。
             const accountsRes = await query('SELECT * FROM storage_accounts');
+            const configuredTarget = validateConfiguredStorageTarget(
+                providerName,
+                accountsRes.rows.filter((row: any) => row.is_active).map((row: any) => ({ id: String(row.id), type: String(row.type) })),
+            );
             // 获取全局 Secret 作为回退（兼容旧版本或用户未特定输入的情况）
             const globalSecretRes = await query("SELECT value FROM system_settings WHERE key = 'onedrive_client_secret'");
             const globalSecretRaw = globalSecretRes.rows[0]?.value || '';
@@ -1370,15 +1380,36 @@ export class StorageManager {
                 }
             }
 
-            // 如果没有激活的云存储账户，或者激活的是local，则使用local
-            if (providerName === 'local' || !this.activeAccountId) {
+            // Only an explicitly configured local target may select local storage.
+            if (!configuredTarget) {
                 this.activeProvider = this.providers.get('local')!;
                 this.activeAccountId = null;
                 console.log('Storage Provider initialized: Local');
+            } else if (!this.activeProvider || this.activeAccountId !== configuredTarget.id) {
+                throw new Error(`configured cloud storage target ${providerName} could not be initialized`);
             }
         } catch (error) {
             console.error('Failed to init storage manager:', error);
-            this.activeProvider = this.providers.get('local')!;
+            throw error;
+        }
+    }
+
+    async assertReady(): Promise<void> {
+        const providerRes = await query('SELECT value FROM system_settings WHERE key = $1', ['active_storage_provider']);
+        const providerName = String(providerRes.rows[0]?.value || 'local');
+        const activeRes = await query('SELECT id, type FROM storage_accounts WHERE is_active = true ORDER BY id');
+        const target = validateConfiguredStorageTarget(
+            providerName,
+            activeRes.rows.map((row: any) => ({ id: String(row.id), type: String(row.type) })),
+        );
+        if (!target) {
+            if (this.activeAccountId !== null || this.activeProvider.name !== 'local') {
+                throw new Error('in-memory storage target does not match configured local target');
+            }
+            return;
+        }
+        if (this.activeAccountId !== target.id || this.activeProvider.name !== target.type) {
+            throw new Error(`in-memory storage target does not match configured ${providerName} target`);
         }
     }
 
@@ -1475,6 +1506,25 @@ export class StorageManager {
         return this.activeAccountId;
     }
 
+    getActiveTarget(): StorageTargetSnapshot {
+        const provider = this.activeProvider;
+        const accountId = this.activeAccountId;
+        return {
+            provider,
+            accountId,
+            providerKey: accountId ? `${provider.name}:${accountId}` : provider.name,
+        };
+    }
+
+    getTarget(providerName: string, accountId: string | null | undefined): StorageTargetSnapshot {
+        const providerKey = accountId ? `${providerName}:${accountId}` : providerName;
+        return {
+            provider: this.getProvider(providerKey),
+            accountId: accountId || null,
+            providerKey,
+        };
+    }
+
     async getAccounts() {
         const res = await query('SELECT id, name, type, is_active FROM storage_accounts ORDER BY created_at ASC');
         return res.rows;
@@ -1520,14 +1570,17 @@ export class StorageManager {
 
     // 切换激活账户
     async switchAccount(accountId: string | 'local') {
-        if (accountId === 'local') {
-            await StorageManager.updateSetting('active_storage_provider', 'local');
-            await query('UPDATE storage_accounts SET is_active = false');
-        } else {
-            const accRes = await query('SELECT type FROM storage_accounts WHERE id = $1', [accountId]);
-            const type = accRes.rows[0]?.type || 'local';
-            await StorageManager.updateSetting('active_storage_provider', type);
-            await query('UPDATE storage_accounts SET is_active = (id = $1)', [accountId]);
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            if (accountId === 'local') await switchStorageToLocalWithClient(client);
+            else await switchStorageAccountWithClient(client, accountId);
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK').catch(() => undefined);
+            throw error;
+        } finally {
+            client.release();
         }
 
         // 重新初始化以刷新状态

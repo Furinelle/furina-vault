@@ -7,7 +7,7 @@ import path from 'path';
 import { storageManager } from '../services/storage.js';
 import { authenticatedUsers, passwordInputState, isAuthenticatedAsync, loadAuthenticatedUsers, persistAuthenticatedUser, userStates, TelegramUserState } from './telegramState.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleDelete, handleDeleteConfirmCallback, handleTasks, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleChannelTaskQueueCallback, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
+import { handleStart, handleHelp, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleDelete, handleDeleteConfirmCallback, handleTasks, handleTaskCenterCallback, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleChannelTaskQueueCallback, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
 import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask, loadFileDownloadConcurrencySetting } from './telegramUpload.js';
 import { handleYtDlpCommand } from './ytDlpDownload.js';
 import {
@@ -299,36 +299,41 @@ interface TelegramDownloadScanSummary {
     commentsMaxPerPost: number;
 }
 
-async function updateJobProgressMessage(statusMessage: Api.Message, summary: TelegramJobProgressSummary): Promise<void> {
+export function buildLegacyJobProgressPresentation(summary: TelegramJobProgressSummary): string {
     const totalDone = summary.completed + summary.failed + summary.skipped;
-    const lines = [
-        summary.status === 'paused'
-            ? `⏸️ **频道下载已暂停**`
-            : summary.status === 'cooling'
-                ? `⏸️ **Google Drive 限额冷却中**`
-                : summary.status === 'cancelled'
-                    ? `🛑 **频道下载已取消**`
-                    : totalDone >= summary.totalMediaFound && summary.scanStatus === 'done'
-                        ? `✅ **频道任务完成**`
-                        : `🔎 **频道任务运行中**`,
-        `🆔 job: ${summary.jobId.slice(0, 8)}`,
-        `📍 频道：${summary.source}`,
+    const cooldownIsFloodWait = summary.status === 'cooling' && /floodwait/i.test((summary as TelegramJobProgressSummary & { error?: string }).error || '');
+    const title = summary.status === 'paused'
+        ? '⏸️ **频道下载已暂停**'
+        : summary.status === 'cooling'
+            ? (cooldownIsFloodWait ? '⏳ **Telegram FloodWait 冷却中**' : '⏸️ **存储服务保护冷却中**')
+            : summary.status === 'cancelled'
+                ? '🛑 **频道下载已取消**'
+                : totalDone >= summary.totalMediaFound && summary.scanStatus === 'done'
+                    ? '✅ **频道任务完成**'
+                    : '🔎 **频道任务运行中**';
+    const controls = summary.status === 'paused'
+        ? `控制：/task_resume ${summary.jobId.slice(0, 12)} · /task_cancel ${summary.jobId.slice(0, 12)}`
+        : summary.status === 'cooling' || summary.status === 'cancelled'
+            ? ''
+            : `控制：/task_pause ${summary.jobId.slice(0, 12)} · /task_cancel ${summary.jobId.slice(0, 12)}`;
+    return [
+        title,
+        `🆔 job: ${summary.jobId.slice(0, 12)}`,
+        `📍 频道：${summary.source || '未知'}`,
         ``,
-        `🔎 扫描：${summary.scanStatus}`,
-        `📄 频道正文：已扫 ${summary.channelMessagesScanned} 条，发现 ${summary.channelMediaFound} 个文件`,
-        `💬 评论区：已扫 ${summary.commentMessagesScanned} 条，发现 ${summary.commentMediaFound} 个文件`,
+        `🔎 扫描：${summary.scanStatus || 'pending'}`,
+        `📄 频道正文：已扫 ${summary.channelMessagesScanned || 0} 条，发现 ${summary.channelMediaFound || 0} 个文件`,
+        `💬 评论区：已扫 ${summary.commentMessagesScanned || 0} 条，发现 ${summary.commentMediaFound || 0} 个文件`,
         ``,
         `⬇️ 下载：${summary.downloadStatus}`,
-        `✅ 成功 ${summary.completed}　⏳ 待下载 ${summary.pending}　🔄 下载中 ${summary.downloading}　❌ 失败 ${summary.failed}　⏭ 跳过 ${summary.skipped}`,
-        summary.cooldownUntil
-            ? (summary.status === 'cooling'
-                ? `⏸️ Google Drive 限额冷却到：${summary.cooldownUntil}`
-                : `⏳ FloodWait 冷却到：${summary.cooldownUntil}`)
-            : '',
-        ``,
-        `控制：/task_pause ${summary.jobId.slice(0, 8)} · /task_resume ${summary.jobId.slice(0, 8)} · /task_cancel ${summary.jobId.slice(0, 8)}`,
-    ].filter(Boolean);
-    await statusMessage.edit({ text: lines.join('\n') }).catch(() => undefined);
+        `✅ 成功 ${summary.completed || 0}　⏳ 待下载 ${summary.pending || 0}　🔄 下载中 ${summary.downloading || 0}　❌ 失败 ${summary.failed || 0}　⏭ 跳过 ${summary.skipped || 0}`,
+        summary.cooldownUntil ? `${cooldownIsFloodWait ? '⏳ Telegram FloodWait' : '⏸️ 存储服务保护'}冷却到：${summary.cooldownUntil}` : '',
+        controls,
+    ].filter(Boolean).join('\n');
+}
+
+async function updateJobProgressMessage(statusMessage: Api.Message, summary: TelegramJobProgressSummary): Promise<void> {
+    await statusMessage.edit({ text: buildLegacyJobProgressPresentation(summary) }).catch(() => undefined);
 }
 
 async function updateScanStatusMessage(statusMessage: Api.Message, summary: TelegramDownloadScanSummary): Promise<void> {
@@ -350,12 +355,15 @@ async function updateScanStatusMessage(statusMessage: Api.Message, summary: Tele
 async function replyWithJobResult(statusMessage: Api.Message, fallbackMessage: Api.Message, promise: Promise<any>, kind: 'date' | 'tag'): Promise<void> {
     promise
         .then(result => {
+            const cancelled = Boolean(result.cancelled);
             const commentLine = result.commentMediaFound || result.commentMessagesScanned
                 ? `\n评论区: 扫描 ${result.commentMessagesScanned || 0} 条，发现 ${result.commentMediaFound || 0} 个文件`
                 : '';
-            const text = kind === 'tag'
-                ? `✅ 标签下载任务完成\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`
-                : `✅ 日期范围任务完成\nID: ${String(result.jobId).slice(0, 8)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`;
+            const text = cancelled
+                ? `🛑 ${kind === 'tag' ? '标签' : '日期'}下载任务已取消\nID: ${String(result.jobId).slice(0, 12)}\n已完成: ${result.successful || 0}\n跳过: ${result.skipped || 0}${commentLine}`
+                : kind === 'tag'
+                    ? `✅ 标签下载任务完成\n标签: ${result.tag}\nID: ${String(result.jobId).slice(0, 12)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`
+                    : `✅ 日期范围任务完成\nID: ${String(result.jobId).slice(0, 12)}\n入队: ${result.found}\n跳过: ${result.skipped}\n失败: ${result.failed}${commentLine}`;
             statusMessage.edit({ text }).catch(() => fallbackMessage.reply({ message: text }).catch(() => undefined));
         })
         .catch(error => {
@@ -679,6 +687,10 @@ function generatePasswordKeyboard(currentLength: number): Api.ReplyInlineMarkup 
 }
 
 // Handle Password Callback
+export function canTelegramUserAuthenticate(userId: number, allowedUsers: number[]): boolean {
+    return allowedUsers.length > 0 && allowedUsers.includes(userId);
+}
+
 async function handlePasswordCallback(update: Api.UpdateBotCallbackQuery): Promise<void> {
     if (!client) return;
 
@@ -747,7 +759,7 @@ async function handlePasswordCallback(update: Api.UpdateBotCallbackQuery): Promi
                     }
 
                     const allowedUsers = await getConfiguredTelegramAllowedUsers();
-                    if (allowedUsers.length > 0 && !allowedUsers.includes(userId)) {
+                    if (!canTelegramUserAuthenticate(userId, allowedUsers)) {
                         state.password = '';
                         await client.editMessage(update.peer, {
                             message: update.msgId,
@@ -853,7 +865,14 @@ async function handleTaskQueueCallback(update: Api.UpdateBotCallbackQuery, data:
     if (!match) return;
     const [, action, taskId] = match;
     const controlChatId = resolveTaskChatIdForControl(taskId);
-    if (!controlChatId || !canControlTask(taskId, controlChatId, userId)) {
+    const callbackChatId = (() => {
+        const peer: any = update.peer as any;
+        const value = peer?.userId || peer?.chatId || peer?.channelId;
+        if (value && typeof value.toString === 'function') return value.toString().replace(/^-100/, '').replace(/^-/, '');
+        return String(value || '');
+    })();
+    const canonicalControlChatId = String(controlChatId || '').replace(/^-100/, '').replace(/^-/, '');
+    if (!controlChatId || callbackChatId !== canonicalControlChatId || !canControlTask(taskId, controlChatId, userId)) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({
             queryId: update.queryId,
             message: '任务已完成、已失效或不属于当前聊天',
@@ -863,15 +882,15 @@ async function handleTaskQueueCallback(update: Api.UpdateBotCallbackQuery, data:
     }
     try {
         if (action === 'pause') {
-            pauseDownloadTasks(taskId);
-            await refreshSilentProgress(client, update.peer);
-            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已暂停全局下载队列' }));
+            const result = pauseDownloadTasks(taskId);
+            await refreshSilentProgress(client, update.peer, userId);
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.total > 0 ? '已暂停下载队列' : '当前没有可暂停的下载任务' }));
             return;
         }
         if (action === 'resume') {
-            resumeDownloadTasks(taskId);
-            await refreshSilentProgress(client, update.peer);
-            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: '已继续全局下载队列' }));
+            const result = resumeDownloadTasks(taskId);
+            await refreshSilentProgress(client, update.peer, userId);
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.total > 0 ? '已继续下载队列' : '当前没有等待中的下载任务' }));
             return;
         }
         await cancelSilentTask(client, update.peer, taskId, update.msgId, userId);
@@ -1165,7 +1184,8 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
-                console.log(`🤖 Received text from ${senderId}: ${text}`);
+                const commandName = text.trim().split(/\s+/, 1)[0].replace(/@\w+$/, '') || 'text';
+                console.log(`🤖 Received Telegram message from ${senderId}: command=${commandName} messageId=${message.id}`);
 
                 // Commands
                 if (text === '/start') {
@@ -1219,7 +1239,7 @@ export async function initTelegramBot(): Promise<void> {
                 {
                     const match = text.match(/^\s*\/ytdlp(?:@\w+)?(?:\s+([\s\S]*))?\s*$/i);
                     if (match) {
-                        console.log(`🤖 /ytdlp command received from ${senderId}: ${text}`);
+                        console.log(`🤖 /ytdlp command received from ${senderId}: messageId=${message.id}`);
                     if (!(await isAuthenticatedAsync(senderId))) {
                         await message.reply({ message: MSG.AUTH_REQUIRED });
                         return;
@@ -1733,7 +1753,13 @@ export async function initTelegramBot(): Promise<void> {
                     return;
                 }
 
-                // 处理 /tasks 频道任务队列按钮
+                // 处理新版 /tasks 任务中心导航与控制
+                if (data.startsWith('tc_')) {
+                    await handleTaskCenterCallback(activeClient, callbackUpdate, data);
+                    return;
+                }
+
+                // 处理旧版 /tasks 频道任务队列按钮（兼容历史消息）
                 if (data.startsWith('ctq_')) {
                     await handleChannelTaskQueueCallback(activeClient, callbackUpdate, data);
                     return;

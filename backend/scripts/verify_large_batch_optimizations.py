@@ -28,20 +28,20 @@ if webdav_block:
     check('fs.createReadStream(tempPath)' in webdav_block.group(0), 'WebDAV saveFile does not use fs.createReadStream(tempPath)')
 
 # 2) Disk watermark should pause queue globally rather than only throw synchronously.
-check('pauseForDiskPressure' in tg_text, 'download queue lacks disk-pressure pause method')
+check('acquireDiskPressureBlocker' in tg_text, 'download queue lacks disk-pressure blocker lease')
 check('waitForDiskWatermark' in tg_text, 'missing waitForDiskWatermark helper')
 check('TG_DISK_WATERMARK_RECHECK_MS' in tg_text, 'missing disk-watermark recheck interval')
-check('磁盘空间不足，已暂停下载队列' in tg_text, 'missing user-facing disk pause message')
+check('磁盘空间不足：可用' in tg_text, 'missing user-facing disk pause reason')
 
 # 3) Media group processing should avoid Promise.all(queue.files.map(...)).
 check('Promise.all(queue.files.map' not in tg_text, 'media group still starts all file promises at once')
 check('TG_MEDIA_GROUP_ENQUEUE_BATCH_SIZE' in tg_text, 'missing media group bounded enqueue batch size')
-check('processMediaGroupFilesBounded' in tg_text, 'missing bounded media group processor')
+check('takePendingMediaGroupSnapshot' in tg_text, 'missing bounded media group snapshot processor')
 
 # 4) Channel range should not retain full Api.Message objects for all downloadable messages long-term.
 check('downloadableMessages: Array<{ message: Api.Message' not in tg_text, 'channel range still keeps full message objects in downloadableMessages')
 check('DownloadableMessageRef' in tg_text, 'missing lightweight downloadable message ref type')
-check('getMessages(sourceEntity as any, { ids: segmentIds })' in tg_text, 'segments are not re-fetching messages by lightweight ids')
+check('getMessages(sourceItems[0].sourceEntity as any, { ids: segmentIds })' in tg_text, 'segments are not re-fetching messages by lightweight ids')
 
 if failures:
     print('FAIL')

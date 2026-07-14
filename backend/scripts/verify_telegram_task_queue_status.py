@@ -3,31 +3,53 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 jobs = (root / 'src/services/telegramChannelJobs.ts').read_text()
 commands = (root / 'src/services/telegramCommands.ts').read_text()
-messages = (root / 'src/utils/telegramMessages.ts').read_text()
+bot = (root / 'src/services/telegramBot.ts').read_text()
+upload = (root / 'src/services/telegramUpload.ts').read_text()
+center = (root / 'src/services/telegramTaskCenter.ts').read_text()
+queue = (root / 'src/services/downloadTaskQueue.ts').read_text()
 
 checks = [
     ('listTelegramActiveTaskQueues', jobs),
     ('finished_at IS NULL', jobs),
     ('cancelled_at IS NULL', jobs),
-    ("j.status = 'running'", jobs),
-    ("j.status = 'paused'", jobs),
-    ("pending_count", jobs),
-    ("downloading_count", jobs),
-    ("is_actively_running", jobs),
-    ("completed_with_errors", jobs),
-    ('buildChannelTaskQueueReport', commands),
-    ('buildTasksKeyboard', commands),
-    ('handleChannelTaskQueueCallback', commands),
-    ('ctq_cancel_all', commands),
-    ('频道任务队列', commands),
-    ('正在运行', commands),
-    ('已暂停', commands),
-    ('等待接手', commands),
-    ('buildTasksReport(status.active, status.pending)', commands),
-    ('historyCount', commands, False),
-    ('最近完成', messages, False),
-    ('实时下载队列', messages),
-    ('等待开始', messages),
+    ('pending_count', jobs),
+    ('downloading_count', jobs),
+    ('current_file_name', jobs),
+    ('folder_override', jobs),
+    ('j.params', jobs),
+    ('class DownloadTaskQueue', queue),
+    ('prioritizeGroup', queue),
+    ('pauseGroup', queue),
+    ('resumeGroup', queue),
+    ('cancelGroup', queue),
+    ("kind: 'single'", upload),
+    ("kind: 'album'", upload),
+    ('hidden: true', upload),
+    ('listDownloadTaskGroups', upload),
+    ('pauseChannelExecutionGroup', upload),
+    ('cancelChannelExecutionGroup', upload),
+    ('buildTaskCenterPage', center),
+    ('buildTaskCenterDetail', center),
+    ('buildTaskCancelConfirm', center),
+    ('parseTaskCenterCallback', center),
+    ('暂停任务', center),
+    ('优先开始', center),
+    ('handleTaskCenterCallback', commands),
+    ('buildTaskCenterPage', commands),
+    ('cancelDownloadTaskGroup', commands),
+    ('cancelTelegramBackgroundJob', commands),
+    ('FOR UPDATE OF i SKIP LOCKED', jobs),
+    ('taskCenterCardOwners', commands),
+    ('pendingTaskCenterCancels', commands),
+    ('forceStopDownloadTasksForScope', commands),
+    ('getExecutionControlState', upload),
+    ('下载任务已取消', bot),
+    ("data.startsWith('tc_')", bot),
+    ('handleTaskCenterCallback', bot),
+    ('buildChannelTaskQueueReport', commands, False),
+    ('buildTasksKeyboard', commands, False),
+    ('buildTasksReport(status.active, status.pending)', commands, False),
+    ('最近完成', commands, False),
 ]
 
 missing = []
@@ -42,5 +64,5 @@ for check in checks:
         missing.append(("missing" if should_exist else "unexpected") + f": {needle}")
 
 if missing:
-    raise SystemExit('Telegram /tasks queue rendering verification failed: ' + ', '.join(missing))
-print('Telegram /tasks queue rendering verifies active/paused-only output and hides history')
+    raise SystemExit('Telegram task center verification failed: ' + ', '.join(missing))
+print('Telegram task center verifies selectable list/detail/confirm controls and active-only queues')
