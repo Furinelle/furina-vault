@@ -2254,15 +2254,35 @@ async function createInitialAdminCredentials(webPassword, telegramPin) {
     client2.release();
   }
 }
-function parseUserIds(value) {
+function parseTelegramAllowedUserIds(value) {
   if (!value) return [];
-  return [...new Set(String(value).split(",").map((item) => Number(item.trim())).filter((item) => Number.isSafeInteger(item) && item > 0))];
+  return [...new Set(String(value).split(/[\s,]+/).map((item) => Number(item.trim())).filter((item) => Number.isSafeInteger(item) && item > 0))].sort((a, b) => a - b);
+}
+function shouldAutoAllowFirstTelegramUser(allowedUsers, authenticatedUserCount) {
+  return allowedUsers.length === 0 && authenticatedUserCount === 0;
+}
+async function getStoredTelegramAllowedUsers() {
+  const stored = await getSetting(TELEGRAM_ALLOWED_USERS_KEY, "");
+  return parseTelegramAllowedUserIds(stored || "");
 }
 async function getConfiguredTelegramAllowedUsers() {
-  const envUsers = parseUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || "");
+  const envUsers = parseTelegramAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || "");
   if (envUsers.length > 0) return envUsers;
-  const stored = await getSetting(TELEGRAM_ALLOWED_USERS_KEY, "");
-  return parseUserIds(stored || "");
+  return getStoredTelegramAllowedUsers();
+}
+async function countAuthenticatedTelegramUsers() {
+  const result = await pool.query("SELECT COUNT(*)::int AS count FROM telegram_auth");
+  return Number(result.rows[0]?.count || 0);
+}
+async function setTelegramAllowedUsers(userIds) {
+  const users = parseTelegramAllowedUserIds(userIds.join(","));
+  await setSetting(TELEGRAM_ALLOWED_USERS_KEY, users.join(","));
+  return users;
+}
+async function addTelegramAllowedUser(userId) {
+  const users = await getStoredTelegramAllowedUsers();
+  if (!users.includes(userId)) users.push(userId);
+  return setTelegramAllowedUsers(users);
 }
 
 // src/services/telegramState.ts
@@ -11837,7 +11857,13 @@ async function handlePasswordCallback(update) {
             }));
             return;
           }
-          const allowedUsers = await getConfiguredTelegramAllowedUsers();
+          let allowedUsers = await getConfiguredTelegramAllowedUsers();
+          if (!canTelegramUserAuthenticate(userId, allowedUsers)) {
+            const authenticatedUserCount = await countAuthenticatedTelegramUsers();
+            if (shouldAutoAllowFirstTelegramUser(allowedUsers, authenticatedUserCount)) {
+              allowedUsers = await addTelegramAllowedUser(userId);
+            }
+          }
           if (!canTelegramUserAuthenticate(userId, allowedUsers)) {
             state.password = "";
             await client.editMessage(update.peer, {
@@ -14753,6 +14779,8 @@ router5.get("/config", requireAuth, async (req, res) => {
     const activeAccountId = storageManager2.getActiveAccountId();
     const accounts = await storageManager2.getAccounts();
     const telegramUserDownloadEnabled = await getSetting("telegram_user_download_enabled", "false");
+    const telegramAllowedUserIds = await getConfiguredTelegramAllowedUsers();
+    const telegramAllowedUserIdsFromEnv = parseTelegramAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || "").length > 0;
     const telegramUserSessionFilePath = getTelegramUserSessionFilePath();
     const telegramUserSessionReady = fs14.existsSync(telegramUserSessionFilePath) && isTelegramUserClientReady();
     const oneDriveOAuth = getOAuthRouteConfig("onedrive");
@@ -14764,7 +14792,9 @@ router5.get("/config", requireAuth, async (req, res) => {
       redirectUri: oneDriveOAuth.redirectUri,
       googleDriveRedirectUri: googleDriveOAuth.redirectUri,
       telegramUserDownloadEnabled: telegramUserDownloadEnabled === "true",
-      telegramUserSessionReady
+      telegramUserSessionReady,
+      telegramAllowedUserIds,
+      telegramAllowedUserIdsFromEnv
     });
   } catch (error) {
     console.error("\u83B7\u53D6\u5B58\u50A8\u914D\u7F6E\u5931\u8D25:", error);
@@ -14782,6 +14812,23 @@ router5.post("/config/telegram-user-download", requireAuth, async (req, res) => 
   } catch (error) {
     console.error("\u66F4\u65B0 Telegram \u7528\u6237\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25:", error);
     res.status(500).json({ error: "\u66F4\u65B0 Telegram \u7528\u6237\u4E0B\u8F7D\u8BBE\u7F6E\u5931\u8D25" });
+  }
+});
+router5.post("/config/telegram-allowed-users", requireAuth, async (req, res) => {
+  try {
+    if (parseTelegramAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || "").length > 0) {
+      return res.status(409).json({ error: "\u5F53\u524D\u5DF2\u901A\u8FC7 TELEGRAM_ALLOWED_USER_IDS \u73AF\u5883\u53D8\u91CF\u914D\u7F6E\u5141\u8BB8\u5217\u8868\uFF0C\u8BF7\u4FEE\u6539 .env \u5E76\u91CD\u542F\u540E\u7AEF\u3002" });
+    }
+    const rawUserIds = Array.isArray(req.body?.userIds) ? req.body.userIds.join(",") : String(req.body?.userIds ?? "");
+    const userIds = parseTelegramAllowedUserIds(rawUserIds);
+    if (userIds.length === 0) {
+      return res.status(400).json({ error: "\u8BF7\u81F3\u5C11\u586B\u5199\u4E00\u4E2A Telegram user id" });
+    }
+    const saved = await setTelegramAllowedUsers(userIds);
+    res.json({ success: true, userIds: saved });
+  } catch (error) {
+    console.error("\u66F4\u65B0 Telegram \u5141\u8BB8\u7528\u6237\u5217\u8868\u5931\u8D25:", error);
+    res.status(500).json({ error: "\u66F4\u65B0 Telegram \u5141\u8BB8\u7528\u6237\u5217\u8868\u5931\u8D25" });
   }
 });
 router5.post("/maintenance/download-items/cleanup", requireAuth, async (req, res) => {

@@ -8,6 +8,7 @@ import fs from 'fs';
 import axios from 'axios';
 import crypto from 'crypto';
 import { getSetting, setSetting } from '../utils/settings.js';
+import { getConfiguredTelegramAllowedUsers, parseTelegramAllowedUserIds, setTelegramAllowedUsers } from '../utils/authSettings.js';
 import { getTelegramUserSessionFilePath, isTelegramUserClientReady } from '../services/telegramUserClient.js';
 import { assertPublicStorageEndpoint } from '../utils/networkSecurity.js';
 import { getCurrentStorageScope } from '../utils/fileScope.js';
@@ -148,6 +149,8 @@ router.get('/config', requireAuth, async (req: Request, res: Response) => {
         // 获取所有账户概览（不包含敏感配置）
         const accounts = await storageManager.getAccounts();
         const telegramUserDownloadEnabled = await getSetting('telegram_user_download_enabled', 'false');
+        const telegramAllowedUserIds = await getConfiguredTelegramAllowedUsers();
+        const telegramAllowedUserIdsFromEnv = parseTelegramAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || '').length > 0;
         const telegramUserSessionFilePath = getTelegramUserSessionFilePath();
         const telegramUserSessionReady = fs.existsSync(telegramUserSessionFilePath) && isTelegramUserClientReady();
 
@@ -162,6 +165,8 @@ router.get('/config', requireAuth, async (req: Request, res: Response) => {
             googleDriveRedirectUri: googleDriveOAuth.redirectUri,
             telegramUserDownloadEnabled: telegramUserDownloadEnabled === 'true',
             telegramUserSessionReady,
+            telegramAllowedUserIds,
+            telegramAllowedUserIdsFromEnv,
         });
     } catch (error) {
         console.error('获取存储配置失败:', error);
@@ -180,6 +185,26 @@ router.post('/config/telegram-user-download', requireAuth, async (req: Request, 
     } catch (error) {
         console.error('更新 Telegram 用户下载设置失败:', error);
         res.status(500).json({ error: '更新 Telegram 用户下载设置失败' });
+    }
+});
+
+router.post('/config/telegram-allowed-users', requireAuth, async (req: Request, res: Response) => {
+    try {
+        if (parseTelegramAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || '').length > 0) {
+            return res.status(409).json({ error: '当前已通过 TELEGRAM_ALLOWED_USER_IDS 环境变量配置允许列表，请修改 .env 并重启后端。' });
+        }
+        const rawUserIds = Array.isArray(req.body?.userIds)
+            ? req.body.userIds.join(',')
+            : String(req.body?.userIds ?? '');
+        const userIds = parseTelegramAllowedUserIds(rawUserIds);
+        if (userIds.length === 0) {
+            return res.status(400).json({ error: '请至少填写一个 Telegram user id' });
+        }
+        const saved = await setTelegramAllowedUsers(userIds);
+        res.json({ success: true, userIds: saved });
+    } catch (error) {
+        console.error('更新 Telegram 允许用户列表失败:', error);
+        res.status(500).json({ error: '更新 Telegram 允许用户列表失败' });
     }
 });
 

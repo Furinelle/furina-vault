@@ -25,7 +25,7 @@ import {
 import { cleanupOrphanFiles, isAutoCleanupEnabled, startPeriodicCleanup } from './orphanCleanup.js';
 import { MSG, buildStartPrompt, buildAuthSuccess, build2FASetupCaption, buildCleanupNotice } from '../utils/telegramMessages.js';
 import { query } from '../db/index.js';
-import { getConfiguredTelegramAllowedUsers, verifyTelegramPin } from '../utils/authSettings.js';
+import { getConfiguredTelegramAllowedUsers, addTelegramAllowedUser, countAuthenticatedTelegramUsers, shouldAutoAllowFirstTelegramUser, verifyTelegramPin } from '../utils/authSettings.js';
 import { assertPublicHttpUrl } from '../utils/networkSecurity.js';
 import { rememberRecentTelegramPathPersistent, buildPathPreviewLine, applyPendingTelegramPathInputPersistent, getPendingTelegramPathInput, clearPendingTelegramPathInput } from '../utils/telegramPathSettings.js';
 
@@ -758,7 +758,14 @@ async function handlePasswordCallback(update: Api.UpdateBotCallbackQuery): Promi
                         return;
                     }
 
-                    const allowedUsers = await getConfiguredTelegramAllowedUsers();
+                    let allowedUsers = await getConfiguredTelegramAllowedUsers();
+                    if (!canTelegramUserAuthenticate(userId, allowedUsers)) {
+                        const authenticatedUserCount = await countAuthenticatedTelegramUsers();
+                        if (shouldAutoAllowFirstTelegramUser(allowedUsers, authenticatedUserCount)) {
+                            allowedUsers = await addTelegramAllowedUser(userId);
+                        }
+                    }
+
                     if (!canTelegramUserAuthenticate(userId, allowedUsers)) {
                         state.password = '';
                         await client.editMessage(update.peer, {

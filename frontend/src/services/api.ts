@@ -444,6 +444,8 @@ class FileAPI {
         googleDriveRedirectUri: string;
         telegramUserDownloadEnabled?: boolean;
         telegramUserSessionReady?: boolean;
+        telegramAllowedUserIds?: number[];
+        telegramAllowedUserIdsFromEnv?: boolean;
     }> {
         const response = await fetch(`${API_BASE}/api/storage/config`, {
             credentials: 'include',
@@ -465,6 +467,21 @@ class FileAPI {
         if (!response.ok) {
             const error = await response.json().catch(() => ({}));
             throw new Error(error.error || '更新 Telegram 用户下载设置失败');
+        }
+        return response.json();
+    }
+
+    async setTelegramAllowedUserIds(userIds: string): Promise<{ success: boolean; userIds: number[] }> {
+        const response = await fetch(`${API_BASE}/api/storage/config/telegram-allowed-users`, {
+            credentials: 'include',
+            method: 'POST',
+            headers: getHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ userIds }),
+        });
+        if (response.status === 401) throw new Error('UNAUTHORIZED');
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.error || '更新 Telegram 允许用户列表失败');
         }
         return response.json();
     }

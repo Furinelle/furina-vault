@@ -123,24 +123,46 @@ export async function createInitialAdminCredentials(webPassword: string, telegra
     }
 }
 
-function parseUserIds(value: string | null | undefined): number[] {
+export function parseTelegramAllowedUserIds(value: string | null | undefined): number[] {
     if (!value) return [];
     return [...new Set(String(value)
-        .split(',')
+        .split(/[\s,]+/)
         .map(item => Number(item.trim()))
-        .filter(item => Number.isSafeInteger(item) && item > 0))];
+        .filter(item => Number.isSafeInteger(item) && item > 0))].sort((a, b) => a - b);
+}
+
+export function serializeTelegramAllowedUserIds(userIds: number[]): string {
+    return parseTelegramAllowedUserIds(userIds.join(',')).join(',');
+}
+
+export function shouldAutoAllowFirstTelegramUser(allowedUsers: number[], authenticatedUserCount: number): boolean {
+    return allowedUsers.length === 0 && authenticatedUserCount === 0;
+}
+
+export async function getStoredTelegramAllowedUsers(): Promise<number[]> {
+    const stored = await getSetting<string>(TELEGRAM_ALLOWED_USERS_KEY, '');
+    return parseTelegramAllowedUserIds(stored || '');
 }
 
 export async function getConfiguredTelegramAllowedUsers(): Promise<number[]> {
-    const envUsers = parseUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || '');
+    const envUsers = parseTelegramAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS || '');
     if (envUsers.length > 0) return envUsers;
-    const stored = await getSetting<string>(TELEGRAM_ALLOWED_USERS_KEY, '');
-    return parseUserIds(stored || '');
+    return getStoredTelegramAllowedUsers();
+}
+
+export async function countAuthenticatedTelegramUsers(): Promise<number> {
+    const result = await pool.query('SELECT COUNT(*)::int AS count FROM telegram_auth');
+    return Number(result.rows[0]?.count || 0);
+}
+
+export async function setTelegramAllowedUsers(userIds: number[]): Promise<number[]> {
+    const users = parseTelegramAllowedUserIds(userIds.join(','));
+    await setSetting(TELEGRAM_ALLOWED_USERS_KEY, users.join(','));
+    return users;
 }
 
 export async function addTelegramAllowedUser(userId: number): Promise<number[]> {
-    const users = await getConfiguredTelegramAllowedUsers();
+    const users = await getStoredTelegramAllowedUsers();
     if (!users.includes(userId)) users.push(userId);
-    await setSetting(TELEGRAM_ALLOWED_USERS_KEY, users.join(','));
-    return users;
+    return setTelegramAllowedUsers(users);
 }

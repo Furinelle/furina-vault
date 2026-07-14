@@ -52,7 +52,7 @@ vi .env
 | 使用场景 | 需要填写/执行 |
 | :--- | :--- |
 | 基础 Web 部署 | `DB_PASSWORD`、`VITE_API_URL`、`CORS_ORIGIN`、`DOMAIN` |
-| 启用 Telegram Bot 基础能力 | 额外填写 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_API_ID`、`TELEGRAM_API_HASH` |
+| 启用 Telegram Bot 基础能力 | 额外填写 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_API_ID`、`TELEGRAM_API_HASH`；建议同时填写 `TELEGRAM_ALLOWED_USER_IDS` |
 | 启用账号级 Telegram 下载器 | 在 Bot 基础配置之后，运行登录脚本生成 `TELEGRAM_USER_SESSION_FILE` |
 
 ### 3. 构建前端
@@ -115,6 +115,7 @@ docker compose up -d
 | `TELEGRAM_BOT_TOKEN` | 启用 Bot 基础能力 | 从 [@BotFather](https://t.me/BotFather) 获取 |
 | `TELEGRAM_API_ID` | 启用 Bot 或账号级下载器 | 从 [my.telegram.org](https://my.telegram.org) 获取；Bot 与账号级下载器共用 |
 | `TELEGRAM_API_HASH` | 启用 Bot 或账号级下载器 | 与 `TELEGRAM_API_ID` 同页获取；Bot 与账号级下载器共用这一组 API 配置 |
+| `TELEGRAM_ALLOWED_USER_IDS` | 建议，限制谁可以通过 Bot PIN 登录 | Telegram 数字 user id，多个用英文逗号分隔；可让用户私聊 `@userinfobot` 查看 Id |
 | `TELEGRAM_USER_SESSION_FILE` | 可选，启用账号级下载器 | 默认 `/data/telegram_user_session.txt`；运行登录脚本生成 |
 | `TELEGRAM_DOWNLOAD_WORKERS` | 可选，调单文件分片并发 | 默认 `4`，建议 `4` 或 `8`；`12/16` 更激进，可能触发限流 |
 | `TELEGRAM_FILE_DOWNLOAD_CONCURRENCY` | 可选，调一次同时下载几个文件 | 默认 `2`，可在 Bot 里用 `/file_concurrency` 设置 `1/2/3/4`；选择 `4` 需要二次确认 |
@@ -176,6 +177,16 @@ docker compose up -d
 3. 创建应用后复制 `api_id` 和 `api_hash`。
 4. 写入 `.env` 的 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`。
 5. 如果启用账号级下载器，继续运行 `docker compose run --rm --no-deps backend npm run login:telegram-user` 生成用户账号 session。
+
+### Telegram Bot 允许用户
+
+TG Vault 会限制能通过 Bot PIN 登录的 Telegram 用户。推荐在 `.env` 中填写：
+
+```env
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+```
+
+获取 user id：让用户在 Telegram 私聊 `@userinfobot` 查看 `Id`。如果部署时留空，系统会在“还没有任何 Telegram 用户认证成功”时，把第一个正确输入 Bot PIN 的用户自动加入后台允许列表；之后可以在 Web 后台的 **设置 → Telegram Bot 设置** 中动态维护允许列表。
 
 ### 账号级下载器什么时候需要？
 
