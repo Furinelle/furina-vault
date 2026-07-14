@@ -123,6 +123,10 @@ async function initializeDatabase() {
     throw err;
   }
 }
+function ensureDatabaseInitialized() {
+  if (!initializationPromise) initializationPromise = initializeDatabase();
+  return initializationPromise;
+}
 var __filename, __dirname, Pool, pool, initializationPromise, query;
 var init_db = __esm({
   "src/db/index.ts"() {
@@ -135,12 +139,8 @@ var init_db = __esm({
       connectionString: process.env.DATABASE_URL || "postgresql://tgvault:password@localhost:5432/tgvault"
     });
     initializationPromise = null;
-    pool.on("connect", async () => {
+    pool.on("connect", () => {
       console.log("\u{1F4E6} \u5DF2\u8FDE\u63A5\u5230 PostgreSQL \u6570\u636E\u5E93");
-      if (!initializationPromise) {
-        initializationPromise = initializeDatabase();
-      }
-      await initializationPromise;
     });
     pool.on("error", (err) => {
       console.error("\u274C \u6570\u636E\u5E93\u8FDE\u63A5\u9519\u8BEF:", err);
@@ -435,6 +435,115 @@ var init_storageCooldown = __esm({
   }
 });
 
+// src/services/storageAccountLifecycle.ts
+async function lockStorageAccountForUse(client2, accountId) {
+  const result = await client2.query(
+    "SELECT id, type FROM storage_accounts WHERE id = $1 FOR KEY SHARE",
+    [accountId]
+  );
+  if (!result.rows[0]) throw new StorageAccountNotFoundError();
+  return result.rows[0];
+}
+async function switchStorageAccountWithClient(client2, accountId) {
+  const account = await client2.query(
+    "SELECT id, type FROM storage_accounts WHERE id = $1 FOR UPDATE",
+    [accountId]
+  );
+  if (!account.rows[0]) throw new StorageAccountNotFoundError();
+  const type = String(account.rows[0].type);
+  await client2.query("UPDATE storage_accounts SET is_active = (id = $1)", [accountId]);
+  await client2.query(
+    `INSERT INTO system_settings (key, value, updated_at)
+         VALUES ('active_storage_provider', $1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+    [type]
+  );
+  return type;
+}
+async function switchStorageToLocalWithClient(client2) {
+  await client2.query("UPDATE storage_accounts SET is_active = false");
+  await client2.query(
+    `INSERT INTO system_settings (key, value, updated_at)
+         VALUES ('active_storage_provider', 'local', NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`
+  );
+}
+async function deleteStorageAccountWithClient(client2, accountId) {
+  const accountResult = await client2.query(
+    "SELECT id, name, type, is_active FROM storage_accounts WHERE id = $1 FOR UPDATE",
+    [accountId]
+  );
+  if (!accountResult.rows[0]) throw new StorageAccountNotFoundError();
+  const account = accountResult.rows[0];
+  if (account.is_active) throw new StorageAccountConflictError("active");
+  const taskReference = await client2.query(
+    `SELECT id FROM telegram_background_jobs
+         WHERE finished_at IS NULL AND cancelled_at IS NULL
+           AND params->>'storageAccountId' = $1
+         LIMIT 1 FOR UPDATE`,
+    [accountId]
+  );
+  if (taskReference.rows.length > 0) throw new StorageAccountConflictError("job");
+  const uploadReference = await client2.query(
+    `SELECT id FROM storage_account_leases
+         WHERE storage_account_id = $1 AND released_at IS NULL AND expires_at > NOW()
+         LIMIT 1 FOR UPDATE`,
+    [accountId]
+  );
+  if (uploadReference.rows.length > 0) throw new StorageAccountConflictError("upload");
+  const fileResult = await client2.query("DELETE FROM files WHERE storage_account_id = $1", [accountId]);
+  const deleted = await client2.query(
+    "DELETE FROM storage_accounts WHERE id = $1 AND is_active = false RETURNING id",
+    [accountId]
+  );
+  if (deleted.rowCount !== 1) throw new StorageAccountConflictError("active");
+  return {
+    id: String(account.id),
+    name: String(account.name),
+    type: String(account.type),
+    deletedFiles: fileResult.rowCount || 0
+  };
+}
+var StorageAccountNotFoundError, StorageAccountConflictError;
+var init_storageAccountLifecycle = __esm({
+  "src/services/storageAccountLifecycle.ts"() {
+    "use strict";
+    StorageAccountNotFoundError = class extends Error {
+      constructor() {
+        super("\u5B58\u50A8\u8D26\u6237\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u5220\u9664");
+        this.name = "StorageAccountNotFoundError";
+      }
+    };
+    StorageAccountConflictError = class extends Error {
+      constructor(kind) {
+        super(kind === "active" ? "\u65E0\u6CD5\u5220\u9664\u5F53\u524D\u6B63\u5728\u4F7F\u7528\u7684\u8D26\u6237\uFF0C\u8BF7\u5148\u5207\u6362\u5230\u5176\u4ED6\u8D26\u6237\u6216\u672C\u5730\u5B58\u50A8\u3002" : kind === "job" ? "\u8BE5\u8D26\u6237\u4ECD\u88AB\u672A\u5B8C\u6210\u7684 Telegram \u4EFB\u52A1\u4F7F\u7528\uFF0C\u8BF7\u5148\u5B8C\u6210\u6216\u53D6\u6D88\u8FD9\u4E9B\u4EFB\u52A1\u3002" : "\u8BE5\u8D26\u6237\u4ECD\u88AB\u8FDB\u884C\u4E2D\u7684\u4E0A\u4F20\u4F7F\u7528\uFF0C\u8BF7\u7B49\u5F85\u4E0A\u4F20\u5B8C\u6210\u6216\u53D6\u6D88\u540E\u91CD\u8BD5\u3002");
+        this.kind = kind;
+        this.name = "StorageAccountConflictError";
+      }
+      kind;
+    };
+  }
+});
+
+// src/services/storageTargetReadiness.ts
+function validateConfiguredStorageTarget(configuredProvider, activeAccounts) {
+  if (configuredProvider === "local") {
+    if (activeAccounts.length > 0) {
+      throw new Error("configured local storage conflicts with an active cloud account");
+    }
+    return null;
+  }
+  if (activeAccounts.length !== 1 || activeAccounts[0].type !== configuredProvider) {
+    throw new Error(`configured cloud storage target ${configuredProvider} is missing or inconsistent`);
+  }
+  return activeAccounts[0];
+}
+var init_storageTargetReadiness = __esm({
+  "src/services/storageTargetReadiness.ts"() {
+    "use strict";
+  }
+});
+
 // src/services/storage.ts
 var storage_exports = {};
 __export(storage_exports, {
@@ -483,6 +592,8 @@ var init_storage = __esm({
     init_localPath();
     init_credentialCrypto();
     init_storageCooldown();
+    init_storageAccountLifecycle();
+    init_storageTargetReadiness();
     StorageQuotaCooldownError = class extends Error {
       provider;
       reason;
@@ -1491,6 +1602,10 @@ var init_storage = __esm({
           }
           console.log(`[StorageManager] Active provider from settings: ${providerName}`);
           const accountsRes = await query("SELECT * FROM storage_accounts");
+          const configuredTarget = validateConfiguredStorageTarget(
+            providerName,
+            accountsRes.rows.filter((row) => row.is_active).map((row) => ({ id: String(row.id), type: String(row.type) }))
+          );
           const globalSecretRes = await query("SELECT value FROM system_settings WHERE key = 'onedrive_client_secret'");
           const globalSecretRaw = globalSecretRes.rows[0]?.value || "";
           const globalSecret = globalSecretRaw ? decryptSettingValue("onedrive_client_secret", globalSecretRaw) : "";
@@ -1560,14 +1675,34 @@ var init_storage = __esm({
               console.log(`Storage Provider initialized: ${row.type} Account (${row.name})`);
             }
           }
-          if (providerName === "local" || !this.activeAccountId) {
+          if (!configuredTarget) {
             this.activeProvider = this.providers.get("local");
             this.activeAccountId = null;
             console.log("Storage Provider initialized: Local");
+          } else if (!this.activeProvider || this.activeAccountId !== configuredTarget.id) {
+            throw new Error(`configured cloud storage target ${providerName} could not be initialized`);
           }
         } catch (error) {
           console.error("Failed to init storage manager:", error);
           throw error;
+        }
+      }
+      async assertReady() {
+        const providerRes = await query("SELECT value FROM system_settings WHERE key = $1", ["active_storage_provider"]);
+        const providerName = String(providerRes.rows[0]?.value || "local");
+        const activeRes = await query("SELECT id, type FROM storage_accounts WHERE is_active = true ORDER BY id");
+        const target = validateConfiguredStorageTarget(
+          providerName,
+          activeRes.rows.map((row) => ({ id: String(row.id), type: String(row.type) }))
+        );
+        if (!target) {
+          if (this.activeAccountId !== null || this.activeProvider.name !== "local") {
+            throw new Error("in-memory storage target does not match configured local target");
+          }
+          return;
+        }
+        if (this.activeAccountId !== target.id || this.activeProvider.name !== target.type) {
+          throw new Error(`in-memory storage target does not match configured ${providerName} target`);
         }
       }
       async migrateLegacyConfig() {
@@ -1701,14 +1836,17 @@ var init_storage = __esm({
       }
       // 切换激活账户
       async switchAccount(accountId) {
-        if (accountId === "local") {
-          await _StorageManager.updateSetting("active_storage_provider", "local");
-          await query("UPDATE storage_accounts SET is_active = false");
-        } else {
-          const accRes = await query("SELECT type FROM storage_accounts WHERE id = $1", [accountId]);
-          const type = accRes.rows[0]?.type || "local";
-          await _StorageManager.updateSetting("active_storage_provider", type);
-          await query("UPDATE storage_accounts SET is_active = (id = $1)", [accountId]);
+        const client2 = await pool.connect();
+        try {
+          await client2.query("BEGIN");
+          if (accountId === "local") await switchStorageToLocalWithClient(client2);
+          else await switchStorageAccountWithClient(client2, accountId);
+          await client2.query("COMMIT");
+        } catch (error) {
+          await client2.query("ROLLBACK").catch(() => void 0);
+          throw error;
+        } finally {
+          client2.release();
         }
         await this.init();
       }
@@ -1810,7 +1948,7 @@ import fs12 from "fs";
 import path17 from "path";
 
 // src/middleware/signedUrl.ts
-import crypto11 from "crypto";
+import crypto12 from "crypto";
 
 // src/utils/config.ts
 init_secretStore();
@@ -2851,7 +2989,7 @@ init_db();
 import { Api as Api4 } from "telegram";
 import fs7 from "fs";
 import path11 from "path";
-import crypto9 from "crypto";
+import crypto10 from "crypto";
 import bigInt from "big-integer";
 
 // src/utils/thumbnail.ts
@@ -4517,6 +4655,122 @@ async function saveAndIndexWithCompensation(provider, tempPath, storedName, mime
   }
 }
 
+// src/services/storageAccountLease.ts
+init_storageAccountLifecycle();
+import crypto9 from "node:crypto";
+async function acquireStorageAccountLease(client2, accountId, purpose, ttlMs = 30 * 60 * 1e3) {
+  await lockStorageAccountForUse(client2, accountId);
+  const leaseId = crypto9.randomUUID();
+  const expiresAt = new Date(Date.now() + ttlMs);
+  const result = await client2.query(
+    `INSERT INTO storage_account_leases (id, storage_account_id, purpose, expires_at)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id`,
+    [leaseId, accountId, purpose, expiresAt]
+  );
+  return String(result.rows[0]?.id || leaseId);
+}
+async function releaseStorageAccountLease(client2, leaseId) {
+  await client2.query(
+    "UPDATE storage_account_leases SET released_at = NOW() WHERE id = $1 AND released_at IS NULL",
+    [leaseId]
+  );
+}
+
+// src/services/storageAccountOperation.ts
+async function withStorageAccountOperationLease(pool2, accountId, purpose, operation) {
+  const lease = await acquireStorageAccountOperationLease(pool2, accountId, purpose);
+  let operationError;
+  try {
+    return await operation();
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    try {
+      await lease.release();
+    } catch (releaseError) {
+      if (!operationError) throw releaseError;
+      console.error("[StorageLease] release failed after operation failure:", releaseError);
+    }
+  }
+}
+async function acquireStorageAccountOperationLease(pool2, accountId, purpose, options = {}) {
+  if (!accountId) {
+    return { leaseId: null, release: async () => void 0 };
+  }
+  const ttlMs = options.ttlMs ?? 30 * 60 * 1e3;
+  const renewalIntervalMs = options.renewalIntervalMs ?? Math.max(1e3, Math.floor(ttlMs / 3));
+  const setupClient = await pool2.connect();
+  let leaseId = "";
+  try {
+    await setupClient.query("BEGIN");
+    leaseId = await acquireStorageAccountLease(setupClient, accountId, purpose, ttlMs);
+    await setupClient.query("COMMIT");
+  } catch (error) {
+    await setupClient.query("ROLLBACK").catch(() => void 0);
+    throw error;
+  } finally {
+    setupClient.release();
+  }
+  const lockClient = await pool2.connect();
+  try {
+    await lockClient.query("BEGIN");
+    await lockClient.query("SELECT id, type FROM storage_accounts WHERE id = $1 FOR KEY SHARE", [accountId]);
+  } catch (error) {
+    await lockClient.query("ROLLBACK").catch(() => void 0);
+    lockClient.release();
+    await releaseStorageAccountLease(pool2, leaseId).catch(() => void 0);
+    throw error;
+  }
+  let released = false;
+  let renewalInFlight = null;
+  let renewalError = null;
+  const renew = async () => {
+    if (released) return;
+    const expiresAt = new Date(Date.now() + ttlMs);
+    const result = await pool2.query(
+      `UPDATE storage_account_leases
+             SET expires_at = $2
+             WHERE id = $1 AND released_at IS NULL
+             RETURNING id`,
+      [leaseId, expiresAt]
+    );
+    if ((result.rowCount || 0) !== 1) {
+      throw new Error(`storage account lease ${leaseId} was lost`);
+    }
+  };
+  const timer = setInterval(() => {
+    renewalInFlight = renew().catch((error) => {
+      renewalError = error;
+      console.error("[StorageLease] renewal failed:", error);
+    });
+  }, renewalIntervalMs);
+  timer.unref();
+  return {
+    leaseId,
+    release: async () => {
+      if (released) return;
+      released = true;
+      clearInterval(timer);
+      await renewalInFlight;
+      let releaseError;
+      try {
+        await releaseStorageAccountLease(pool2, leaseId);
+        if (renewalError) throw renewalError;
+      } catch (error) {
+        releaseError = error;
+      } finally {
+        await lockClient.query("COMMIT").catch(async () => {
+          await lockClient.query("ROLLBACK").catch(() => void 0);
+        });
+        lockClient.release();
+      }
+      if (releaseError) throw releaseError;
+    }
+  };
+}
+
 // src/services/telegramUpload.ts
 var UPLOAD_DIR = process.env.UPLOAD_DIR || "./data/uploads";
 var DEFAULT_TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TELEGRAM_DOWNLOAD_WORKERS || "4", 10) || 4));
@@ -4545,6 +4799,24 @@ function appendTelegramDebugLog(line) {
     }
     fs7.appendFileSync(TG_DEBUG_LOG_PATH, line);
   } catch {
+  }
+}
+async function runLeaseProtectedTelegramSave(withLease, save, compensate, validateBeforeSettlement = async () => void 0) {
+  let persisted;
+  try {
+    return await withLease(async () => {
+      persisted = await save();
+      await validateBeforeSettlement();
+      return persisted;
+    });
+  } catch (error) {
+    if (persisted) {
+      const compensation = await compensate(persisted);
+      if (compensation.status !== "compensated") {
+        throw new Error(`Telegram lease \u4E22\u5931\u540E\u9700\u8981\u4EBA\u5DE5\u5BF9\u8D26: ${compensation.error || "\u8865\u507F\u5931\u8D25"}`, { cause: error });
+      }
+    }
+    throw error;
   }
 }
 function clampDownloadWorkers(value) {
@@ -4630,7 +4902,7 @@ async function getDiskWatermarkState(requiredBytes = 0) {
 }
 async function waitForDiskWatermark(requiredBytes = 0, signal) {
   const startedAt = Date.now();
-  const blockerId = crypto9.randomUUID();
+  const blockerId = crypto10.randomUUID();
   let announcedPause = false;
   try {
     while (true) {
@@ -5310,10 +5582,10 @@ function cancelDownloadTaskGroup(groupId, chatId, userId) {
   return downloadQueue.cancelGroup(groupId, { chatId, userId }, "\u7528\u6237\u901A\u8FC7\u4EFB\u52A1\u4E2D\u5FC3\u53D6\u6D88\u4EFB\u52A1");
 }
 function ordinaryGroupId(prefix, chatId, identity) {
-  return `${prefix}${crypto9.createHash("sha256").update(`${chatId}:${identity}`).digest("base64url").slice(0, 22)}`;
+  return `${prefix}${crypto10.createHash("sha256").update(`${chatId}:${identity}`).digest("base64url").slice(0, 22)}`;
 }
 function channelExecutionGroupId(key) {
-  return `j${crypto9.createHash("sha256").update(key).digest("base64url").slice(0, 22)}`;
+  return `j${crypto10.createHash("sha256").update(key).digest("base64url").slice(0, 22)}`;
 }
 function getChannelExecutionGroup(jobId) {
   return downloadQueue.getGroup(channelExecutionGroupId(jobId), {}, true);
@@ -5333,6 +5605,10 @@ function getChannelTaskAbortSignal(jobId) {
 function releaseChannelTaskAbortSignal(jobId, signal) {
   const controller = channelTaskAbortRegistry.get(jobId);
   if (controller?.signal === signal) channelTaskAbortRegistry.release(jobId, controller);
+}
+function abortChannelExecutionForLeaseLoss(jobId) {
+  channelTaskAbortRegistry.cancel(jobId, "Telegram \u4E0B\u8F7D lease \u5DF2\u4E22\u5931");
+  downloadQueue.cancelGroup(channelExecutionGroupId(jobId), {}, "Telegram \u4E0B\u8F7D lease \u5DF2\u4E22\u5931", true);
 }
 function cancelChannelExecutionGroup(jobId) {
   channelTaskAbortRegistry.cancel(jobId, "\u7528\u6237\u53D6\u6D88\u9891\u9053\u4EFB\u52A1");
@@ -5410,7 +5686,7 @@ var mediaGroupDebouncer = createTelegramMediaGroupDebouncer({
 });
 async function downloadAndSaveFile(client2, message, originalFileName, targetDir, onProgress, signal) {
   const ext = path11.extname(originalFileName) || "";
-  const tempStoredName = `${crypto9.randomUUID()}${ext}`;
+  const tempStoredName = `${crypto10.randomUUID()}${ext}`;
   let saveDir = targetDir || UPLOAD_DIR;
   if (!fs7.existsSync(saveDir)) {
     try {
@@ -5625,17 +5901,48 @@ async function processFileUpload(client2, file, queue, groupId, getExecutionCont
           { allowUserPauseForActiveWorker: true }
         );
         if (permissionBeforeStore === "cancelled" || signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
-        finalPath = await saveAndIndexWithCompensation(provider, localFilePath, storedName, file.mimeType, storageFolder, async (savedPath) => {
-          const inserted = await query(`
-                        INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                        RETURNING id
-                    `, [file.fileName, storedName, fileType, file.mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
-          indexedFileId = String(inserted.rows[0].id);
-        });
+        const save = async () => {
+          finalPath = await saveAndIndexWithCompensation(provider, localFilePath, storedName, file.mimeType, storageFolder, async (savedPath) => {
+            const inserted = await query(`
+                            INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                            RETURNING id
+                        `, [file.fileName, storedName, fileType, file.mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+            indexedFileId = String(inserted.rows[0].id);
+          });
+          if (!indexedFileId) throw new Error("Telegram \u6587\u4EF6\u4FDD\u5B58\u540E\u7F3A\u5C11\u7D22\u5F15 ID");
+          return { savedPath: finalPath, fileId: indexedFileId };
+        };
+        const leasedSave = () => withStorageAccountOperationLease(pool, activeAccountId, "telegram_upload", save);
+        if (file.withLease) {
+          const persisted = await runLeaseProtectedTelegramSave(
+            file.withLease,
+            leasedSave,
+            (saved) => compensateIndexedWriteAfterCancel({
+              fileId: saved.fileId,
+              savedPath: saved.savedPath,
+              deleteIndex: async (fileId) => (await query("DELETE FROM files WHERE id = $1", [fileId])).rowCount === 1,
+              deleteObject: (savedPath) => provider.deleteFile(savedPath)
+            }),
+            async () => {
+              if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
+              const state = await waitForChannelExecutionPermission(
+                getExecutionControlState,
+                signal || new AbortController().signal,
+                { allowUserPauseForActiveWorker: true }
+              );
+              if (state === "cancelled") throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
+            }
+          );
+          finalPath = persisted.savedPath;
+          indexedFileId = persisted.fileId;
+          file.leaseSettled = true;
+        } else {
+          await leasedSave();
+        }
         if (fs7.existsSync(localFilePath)) fs7.unlinkSync(localFilePath);
         localFilePath = void 0;
-        if (signal?.aborted) {
+        if (signal?.aborted && !file.leaseSettled) {
           const compensation = indexedFileId ? await compensateIndexedWriteAfterCancel({
             fileId: indexedFileId,
             savedPath: finalPath,
@@ -5659,6 +5966,7 @@ async function processFileUpload(client2, file, queue, groupId, getExecutionCont
         return true;
       });
     } catch (error) {
+      if (error?.name === "TelegramDownloadLeaseLostError") throw error;
       console.error("\u{1F916} \u6587\u4EF6\u4E0A\u4F20\u5931\u8D25:", error);
       if (isStorageQuotaCooldownError(error)) {
         await markStorageAccountCooldown(error.storageAccountId || file.storageTarget?.accountId, error.provider, error.reason, error.cooldownUntil, error.message);
@@ -5938,7 +6246,7 @@ function normalizeTelegramDownloadRefs(refs, defaultSourceEntity) {
   if (!refs) return void 0;
   return refs.filter((ref) => ref.id > 0).map((ref) => ({ ...ref, source: ref.source || defaultSourceEntity }));
 }
-async function downloadTelegramChannelRange(botClient, requestMessage, source, startMessageId, limit = 50, direction = "older", explicitIds, folderOverride, explicitRefs, onItemSettled, executionGroupKey, getExecutionControlState, taskSignal, ownerUserId, storageTarget = storageManager.getActiveTarget()) {
+async function downloadTelegramChannelRange(botClient, requestMessage, source, startMessageId, limit = 50, direction = "older", explicitIds, folderOverride, explicitRefs, onItemSettled, executionGroupKey, getExecutionControlState, taskSignal, ownerUserId, storageTarget = storageManager.getActiveTarget(), withItemLease) {
   const userClient2 = getTelegramUserClient();
   if (!userClient2 || !isTelegramUserClientReady()) {
     throw new Error("Telegram \u7528\u6237\u8D26\u53F7\u4E0B\u8F7D\u5668\u672A\u5C31\u7EEA\uFF1A\u8BF7\u5148\u914D\u7F6E TELEGRAM_API_ID / TELEGRAM_API_HASH \u5E76\u751F\u6210 user session");
@@ -6169,7 +6477,8 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
         sharedCaption: item.sharedCaption,
         groupIndex: item.groupIndex,
         groupSize: item.groupSize,
-        storageTarget
+        storageTarget,
+        withLease: withItemLease ? (operation) => withItemLease(item.persistentRef, operation) : void 0
       };
       try {
         if (taskResolvedStorageFolder !== void 0) {
@@ -6193,7 +6502,7 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
         if (uploadItem.status === "success") {
           successful += 1;
           successfulMessageIds.push(item.id);
-          await onItemSettled?.(item.persistentRef, "success");
+          if (!uploadItem.leaseSettled) await onItemSettled?.(item.persistentRef, "success");
         } else if (uploadItem.storageCooldownUntil) {
           throw new StorageQuotaCooldownError(uploadItem.error || "Google Drive \u4ECA\u65E5\u4E0A\u4F20\u989D\u5EA6\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u4EFB\u52A1\u5C06\u81EA\u52A8\u6682\u505C 24 \u5C0F\u65F6\u540E\u7EE7\u7EED\u3002", {
             provider: "google_drive",
@@ -6207,6 +6516,7 @@ async function downloadTelegramChannelRange(botClient, requestMessage, source, s
           await onItemSettled?.(item.persistentRef, "failed", uploadItem.error || "\u4E0B\u8F7D\u5931\u8D25");
         }
       } catch (err) {
+        if (err?.name === "TelegramDownloadLeaseLostError") throw err;
         if (isStorageQuotaCooldownError(err)) {
           throw err;
         }
@@ -6519,14 +6829,19 @@ async function handleFileUpload(client2, event) {
         let sourceRef = provider.name;
         if (signal?.aborted) throw new Error("\u4E0B\u8F7D\u4EFB\u52A1\u5DF2\u505C\u6B62");
         try {
-          finalPath = await saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, storageFolder, async (savedPath) => {
-            const inserted = await query(`
-                            INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                            RETURNING id
-                        `, [finalFileName, storedName, fileType, mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
-            indexedFileId = String(inserted.rows[0].id);
-          });
+          finalPath = await withStorageAccountOperationLease(
+            pool,
+            activeAccountId,
+            "telegram_upload",
+            () => saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, storageFolder, async (savedPath) => {
+              const inserted = await query(`
+                                INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                RETURNING id
+                            `, [finalFileName, storedName, fileType, mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+              indexedFileId = String(inserted.rows[0].id);
+            })
+          );
           if (fs7.existsSync(localFilePath)) fs7.unlinkSync(localFilePath);
           lastLocalPath = void 0;
           localFilePath = void 0;
@@ -6718,6 +7033,7 @@ init_storage();
 import { Api as Api5 } from "telegram";
 import { getPeerId } from "telegram/Utils.js";
 init_storageCooldown();
+init_storageAccountLifecycle();
 var SUBSCRIPTION_INTERVAL_MS = Math.max(6e4, parseInt(process.env.TELEGRAM_SUBSCRIPTION_INTERVAL_MS || "300000", 10) || 3e5);
 var SUBSCRIPTION_SCAN_LIMIT = Math.max(1, parseInt(process.env.TELEGRAM_SUBSCRIPTION_SCAN_LIMIT || "100", 10) || 100);
 var TG_JOB_RECOVERY_DELAY_MS = Math.max(1e3, parseInt(process.env.TG_JOB_RECOVERY_DELAY_MS || "10000", 10) || 1e4);
@@ -7026,6 +7342,45 @@ async function buildDownloadScanResult(userClient2, source, messages, options = 
     commentMediaFound: commentScan.mediaFound
   };
 }
+var TelegramDownloadLeaseLostError = class extends Error {
+  constructor(jobId, ref) {
+    super(`Telegram \u4E0B\u8F7D lease \u5DF2\u4E22\u5931: job=${jobId} message=${ref.id}`);
+    this.name = "TelegramDownloadLeaseLostError";
+  }
+};
+var telegramLeaseFinalizing = /* @__PURE__ */ new Set();
+function telegramLeaseKey(jobId, ref) {
+  return `${jobId}:${sourcePeerKey(ref.source, ref.origin === "comment" ? "comment" : "channel")}:${ref.id}:${ref.leaseToken || ""}`;
+}
+async function withTelegramDownloadRefLease(transactionPool, jobId, ref, operation) {
+  if (!ref.leaseToken) throw new TelegramDownloadLeaseLostError(jobId, ref);
+  const leaseKey = telegramLeaseKey(jobId, ref);
+  const client2 = await transactionPool.connect();
+  telegramLeaseFinalizing.add(leaseKey);
+  try {
+    await client2.query("BEGIN");
+    const owned = await client2.query(
+      `SELECT i.id
+             FROM telegram_download_items i
+             WHERE i.job_id = $1 AND i.source_peer = $2 AND i.message_id = $3
+               AND i.status = 'downloading' AND i.lease_token = $4::uuid
+             FOR UPDATE`,
+      [jobId, sourcePeerKey(ref.source, ref.origin === "comment" ? "comment" : "channel"), ref.id, ref.leaseToken]
+    );
+    if ((owned.rowCount || 0) !== 1) throw new TelegramDownloadLeaseLostError(jobId, ref);
+    const result = await operation();
+    const settlement = await settleTelegramDownloadRefWithQuery(client2.query.bind(client2), jobId, ref, "success");
+    if (settlement !== "settled") throw new TelegramDownloadLeaseLostError(jobId, ref);
+    await client2.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client2.query("ROLLBACK").catch(() => void 0);
+    throw error;
+  } finally {
+    telegramLeaseFinalizing.delete(leaseKey);
+    client2.release();
+  }
+}
 async function settleTelegramDownloadRefWithQuery(runQuery, jobId, ref, status, error) {
   const sourcePeer = sourcePeerKey(ref.source, ref.origin === "comment" ? "comment" : "channel");
   const leaseToken = ref.leaseToken || null;
@@ -7084,13 +7439,24 @@ async function createJob(userId, chatId, kind, source, params) {
     storageProvider: target.provider.name,
     storageAccountId: target.accountId
   };
-  const result = await query(
-    `INSERT INTO telegram_background_jobs (user_id, chat_id, kind, source, params, status, scan_status, download_status, scan_cursor)
-         VALUES ($1, $2, $3, $4, $5, 'queued', 'pending', 'pending', '{}'::jsonb)
-         RETURNING id`,
-    [userId, chatId || null, kind, source, JSON.stringify(persistedParams)]
-  );
-  return result.rows[0].id;
+  const client2 = await pool.connect();
+  try {
+    await client2.query("BEGIN");
+    if (target.accountId) await lockStorageAccountForUse(client2, target.accountId);
+    const result = await client2.query(
+      `INSERT INTO telegram_background_jobs (user_id, chat_id, kind, source, params, status, scan_status, download_status, scan_cursor)
+             VALUES ($1, $2, $3, $4, $5, 'queued', 'pending', 'pending', '{}'::jsonb)
+             RETURNING id`,
+      [userId, chatId || null, kind, source, JSON.stringify(persistedParams)]
+    );
+    await client2.query("COMMIT");
+    return result.rows[0].id;
+  } catch (error) {
+    await client2.query("ROLLBACK").catch(() => void 0);
+    throw error;
+  } finally {
+    client2.release();
+  }
 }
 async function getJob(jobId) {
   const result = await query(`SELECT * FROM telegram_background_jobs WHERE id = $1`, [jobId]);
@@ -7428,57 +7794,73 @@ async function claimPendingDownloadRefs(jobId, limit = TG_JOB_DOWNLOAD_BATCH_SIZ
     leaseToken: row.lease_token ? String(row.lease_token) : void 0
   }));
 }
-async function restoreClaimedRefs(jobId, refs, status) {
-  if (refs.length === 0) return;
-  await Promise.all(refs.map((ref) => query(
+async function restoreTelegramDownloadRefsWithQuery(runQuery, jobId, refs, status, reason) {
+  if (refs.length === 0) return true;
+  const results = await Promise.all(refs.map((ref) => runQuery(
     `UPDATE telegram_download_items
          SET status = $4::varchar,
-             error = CASE WHEN $4::text = 'skipped' THEN COALESCE(error, '\u4EFB\u52A1\u5DF2\u53D6\u6D88') ELSE error END,
-             last_error = CASE WHEN $4::text = 'skipped' THEN COALESCE(last_error, '\u4EFB\u52A1\u5DF2\u53D6\u6D88') ELSE last_error END,
+             error = CASE WHEN $4::text = 'skipped' THEN COALESCE(error, $6) ELSE error END,
+             last_error = CASE WHEN $6::text IS NOT NULL THEN $6 ELSE last_error END,
              locked_at = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL,
              completed_at = CASE WHEN $4::text = 'skipped' THEN NOW() ELSE completed_at END,
              updated_at = NOW()
-         WHERE job_id = $1 AND source_peer = $2 AND message_id = $3 AND status = 'downloading'`,
-    [jobId, sourcePeerKey(ref.source, ""), ref.id, status]
+         WHERE job_id = $1 AND source_peer = $2 AND message_id = $3 AND status = 'downloading'
+           AND lease_token = $5::uuid`,
+    [jobId, sourcePeerKey(ref.source, ref.origin === "comment" ? "comment" : "channel"), ref.id, status, ref.leaseToken || null, reason || (status === "skipped" ? "\u4EFB\u52A1\u5DF2\u53D6\u6D88" : null)]
   )));
+  return results.every((result) => (result.rowCount || 0) === 1);
+}
+async function restoreClaimedRefs(jobId, refs, status) {
+  return restoreTelegramDownloadRefsWithQuery(query, jobId, refs, status);
 }
 function chooseUnfinishedClaimStatus(state) {
   return state === "cancelled" ? "skipped" : "pending";
 }
 async function restoreUnfinishedClaimedRefs(jobId, refs, reason, status = "pending") {
-  if (refs.length === 0) return;
-  const messageIds = refs.map((ref) => ref.id);
-  await query(
-    `UPDATE telegram_download_items
-         SET status = $4::varchar,
-             locked_at = NULL,
-             lease_token = NULL,
-             lease_expires_at = NULL,
-             last_error = $3,
-             error = CASE WHEN $4::text = 'skipped' THEN COALESCE(error, $3) ELSE error END,
-             completed_at = CASE WHEN $4::text = 'skipped' THEN NOW() ELSE completed_at END,
-             updated_at = NOW()
-         WHERE job_id = $1
-           AND message_id = ANY($2::bigint[])
-           AND status = 'downloading'`,
-    [jobId, messageIds, reason, status]
-  );
+  await restoreTelegramDownloadRefsWithQuery(query, jobId, refs, status, reason);
 }
-async function heartbeatClaimedRefs(jobId, refs) {
-  const leased = refs.filter((ref) => ref.leaseToken);
+async function heartbeatTelegramDownloadRefsWithQuery(runQuery, jobId, refs) {
+  const leased = refs.filter((ref) => ref.leaseToken && !telegramLeaseFinalizing.has(telegramLeaseKey(jobId, ref)));
   if (leased.length === 0) return;
-  await Promise.all(leased.map((ref) => query(
+  const results = await Promise.all(leased.map((ref) => runQuery(
     `UPDATE telegram_download_items
          SET locked_at = NOW(), lease_expires_at = NOW() + INTERVAL '10 minutes', updated_at = NOW()
          WHERE job_id = $1 AND source_peer = $2 AND message_id = $3
            AND status = 'downloading' AND lease_token = $4::uuid`,
     [jobId, sourcePeerKey(ref.source, ref.origin === "comment" ? "comment" : "channel"), ref.id, ref.leaseToken]
   )));
+  const lost = [];
+  for (let index = 0; index < results.length; index += 1) {
+    if ((results[index].rowCount || 0) === 1) continue;
+    const ref = leased[index];
+    const current = await runQuery(
+      `SELECT status, lease_token
+             FROM telegram_download_items
+             WHERE job_id = $1 AND source_peer = $2 AND message_id = $3`,
+      [jobId, sourcePeerKey(ref.source, ref.origin === "comment" ? "comment" : "channel"), ref.id]
+    );
+    const row = current.rows[0];
+    if (row && ["success", "failed", "skipped"].includes(String(row.status))) {
+      ref.leaseToken = void 0;
+      continue;
+    }
+    lost.push(ref);
+  }
+  if (lost[0]) throw new TelegramDownloadLeaseLostError(jobId, lost[0]);
+}
+async function heartbeatClaimedRefs(jobId, refs) {
+  return heartbeatTelegramDownloadRefsWithQuery(query, jobId, refs);
 }
 function startClaimHeartbeat(jobId, refs) {
-  void heartbeatClaimedRefs(jobId, refs).catch((error) => console.error("Telegram \u4E0B\u8F7D lease heartbeat \u5931\u8D25:", error));
+  const handleFailure = (error) => {
+    console.error("Telegram \u4E0B\u8F7D lease heartbeat \u5931\u8D25:", error);
+    abortChannelExecutionForLeaseLoss(jobId);
+  };
+  void heartbeatClaimedRefs(jobId, refs).catch(handleFailure);
   const timer = setInterval(() => {
-    void heartbeatClaimedRefs(jobId, refs).catch((error) => console.error("Telegram \u4E0B\u8F7D lease heartbeat \u5931\u8D25:", error));
+    void heartbeatClaimedRefs(jobId, refs).catch(handleFailure);
   }, 2 * 60 * 1e3);
   timer.unref?.();
   return () => clearInterval(timer);
@@ -7538,10 +7920,32 @@ async function downloadClaimedRefs(botClient, requestMessage, jobId, source, ref
   try {
     const jobParams = typeof ownerJob?.params === "string" ? JSON.parse(ownerJob.params) : ownerJob?.params || {};
     const storageTarget = jobParams.storageProvider ? storageManager.getTarget(jobParams.storageProvider, jobParams.storageAccountId) : storageManager.getActiveTarget();
-    const result = await downloadTelegramChannelRange(botClient, requestMessage, source, 0, refs.length, "older", refs.map((ref) => ref.id), folderOverride, refs, async (ref, status, error) => {
-      await markDownloadRefStatus(jobId, ref, status, error);
-      await notifyProgress(jobId, options);
-    }, jobId, () => ensureJobCanRun(jobId), taskSignal, ownerUserId, storageTarget);
+    const result = await downloadTelegramChannelRange(
+      botClient,
+      requestMessage,
+      source,
+      0,
+      refs.length,
+      "older",
+      refs.map((ref) => ref.id),
+      folderOverride,
+      refs,
+      async (ref, status, error) => {
+        const settlement = await markDownloadRefStatus(jobId, ref, status, error);
+        if (settlement === "lease-lost") throw new TelegramDownloadLeaseLostError(jobId, ref);
+        await notifyProgress(jobId, options);
+      },
+      jobId,
+      () => ensureJobCanRun(jobId),
+      taskSignal,
+      ownerUserId,
+      storageTarget,
+      (ref, operation) => withTelegramDownloadRefLease(pool, jobId, ref, async () => {
+        const persisted = await operation();
+        if (taskSignal.aborted) throw new Error("Telegram \u4E0B\u8F7D lease heartbeat \u5931\u8D25\uFF0C\u5DF2\u505C\u6B62\u4FDD\u5B58");
+        return persisted;
+      })
+    );
     const latestState = await ensureJobCanRun(jobId);
     if (latestState !== "run") {
       await restoreUnfinishedClaimedRefs(
@@ -7553,6 +7957,10 @@ async function downloadClaimedRefs(botClient, requestMessage, jobId, source, ref
     }
     return result;
   } catch (error) {
+    if (error instanceof TelegramDownloadLeaseLostError) {
+      abortChannelExecutionForLeaseLoss(jobId);
+      throw error;
+    }
     const flood = isFloodWait(error);
     if (flood) {
       const cooldownUntil = new Date(Date.now() + flood.seconds * 1e3);
@@ -8008,11 +8416,33 @@ async function finalizeSubscriptionJobWithQuery(runQuery, input) {
     [input.jobId, input.status, input.enqueuedCount, input.skippedCount, input.error]
   );
   if ((finalized.rowCount || 0) !== 1) return false;
-  await runQuery(
-    "UPDATE telegram_channel_subscriptions SET last_message_id = $1, updated_at = NOW() WHERE id = $2",
+  const cursor = await runQuery(
+    `UPDATE telegram_channel_subscriptions
+         SET last_message_id = GREATEST(last_message_id, $1), updated_at = NOW()
+         WHERE id = $2 AND enabled = true
+         RETURNING id`,
     [input.safeAdvanceId, input.subscriptionId]
   );
+  if ((cursor.rowCount || 0) !== 1) throw new Error(`Telegram \u8BA2\u9605 cursor \u66F4\u65B0\u5F71\u54CD 0 \u884C: subscription=${input.subscriptionId}`);
   return true;
+}
+async function finalizeSubscriptionJobInTransaction(transactionPool, input) {
+  const client2 = await transactionPool.connect();
+  try {
+    await client2.query("BEGIN");
+    const finalized = await finalizeSubscriptionJobWithQuery(client2.query.bind(client2), input);
+    if (!finalized) {
+      await client2.query("ROLLBACK");
+      return false;
+    }
+    await client2.query("COMMIT");
+    return true;
+  } catch (error) {
+    await client2.query("ROLLBACK").catch(() => void 0);
+    throw error;
+  } finally {
+    client2.release();
+  }
 }
 async function runSubscriptionScan(botClient) {
   if (subscriptionScanRunning) return;
@@ -8040,7 +8470,7 @@ async function runSubscriptionScan(botClient) {
         if (!latestMessageId || latestMessageId <= lastMessageId) continue;
         const count = Math.min(SUBSCRIPTION_SCAN_LIMIT, latestMessageId - lastMessageId);
         const ids = Array.from({ length: count }, (_, index) => lastMessageId + index + 1);
-        const jobId = await createJob(Number(row.user_id), row.chat_id?.toString(), "subscription_sync", row.source, { fromId: lastMessageId + 1, toId: latestMessageId });
+        const jobId = await createJob(Number(row.user_id), row.chat_id?.toString(), "subscription_sync", row.source, { subscriptionId: String(row.id), fromId: lastMessageId + 1, toId: latestMessageId });
         const candidateMessages = await expandMessagesWithMediaGroups(userClient2, row.source, (await userClient2.getMessages(row.source, { ids })).filter(Boolean));
         await persistDownloadMessages(jobId, row.source, candidateMessages, row.folder_override || null);
         await updateJob(jobId, { status: "running", started_at: /* @__PURE__ */ new Date(), total_count: ids.length });
@@ -8071,7 +8501,7 @@ async function runSubscriptionScan(botClient) {
         if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) continue;
         const scannedMaxId = ids.length > 0 ? ids[ids.length - 1] : lastMessageId;
         const safeAdvanceId = downloadResult.failed > 0 ? contiguousProcessedMessageId(lastMessageId, downloadResult.successfulMessageIds, [...downloadResult.skippedMessageIds, ...nonDownloadableMessageIds], downloadResult.failedMessageIds) : scannedMaxId;
-        const finalized = await finalizeSubscriptionJobWithQuery(query, {
+        const finalized = await finalizeSubscriptionJobInTransaction(pool, {
           jobId,
           subscriptionId: String(row.id),
           status: downloadResult.failed > 0 ? "completed_with_errors" : "completed",
@@ -8151,26 +8581,34 @@ async function recoverTelegramJob(botClient, job) {
     if (latestJob?.paused_at || latestJob?.status === "paused") return;
     const remainingStats = await getJobItemStats(job.id);
     if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) return;
-    if (job.kind === "subscription_sync" && result.failed === 0) {
+    let finalized;
+    if (job.kind === "subscription_sync") {
+      const subscriptionId = String(job.params?.subscriptionId || "");
       const targetMessageId = Number(job.params?.toId || 0);
-      if (targetMessageId > 0) {
-        await query(
-          `UPDATE telegram_channel_subscriptions
-                     SET last_message_id = GREATEST(last_message_id, $3), updated_at = NOW()
-                     WHERE user_id = $1 AND source = $2 AND enabled = true`,
-          [job.user_id, job.source, targetMessageId]
-        );
+      if (!subscriptionId || targetMessageId <= 0) {
+        throw new Error("\u6062\u590D\u8BA2\u9605\u4EFB\u52A1\u7F3A\u5C11 subscriptionId/toId\uFF0C\u7981\u6B62\u975E\u539F\u5B50\u63A8\u8FDB cursor");
       }
+      finalized = await finalizeSubscriptionJobInTransaction(pool, {
+        jobId: String(job.id),
+        subscriptionId,
+        status: result.failed > 0 ? "completed_with_errors" : "completed",
+        safeAdvanceId: result.failed > 0 ? contiguousProcessedMessageId(Number(job.params?.fromId || 1) - 1, result.successfulMessageIds, result.skippedMessageIds, result.failedMessageIds) : targetMessageId,
+        enqueuedCount: result.found,
+        skippedCount: result.skipped,
+        error: result.failed > 0 ? `${result.failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null
+      });
+    } else {
+      finalized = await updateJob(job.id, {
+        status: result.failed > 0 ? "completed_with_errors" : "completed",
+        download_status: result.failed > 0 ? "completed_with_errors" : "completed",
+        cooldown_until: null,
+        enqueued_count: result.found,
+        skipped_count: result.skipped,
+        error: result.failed > 0 ? `${result.failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null,
+        finished_at: /* @__PURE__ */ new Date()
+      }) === 1;
     }
-    await updateJob(job.id, {
-      status: result.failed > 0 ? "completed_with_errors" : "completed",
-      download_status: result.failed > 0 ? "completed_with_errors" : "completed",
-      cooldown_until: null,
-      enqueued_count: result.found,
-      skipped_count: result.skipped,
-      error: result.failed > 0 ? `${result.failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null,
-      finished_at: /* @__PURE__ */ new Date()
-    });
+    if (!finalized) return;
     await botClient.sendMessage(targetChat, {
       message: `\u267B\uFE0F \u5DF2\u6062\u590D\u5E76\u5B8C\u6210\u4EFB\u52A1 ${String(job.id).slice(0, 12)}\uFF1A\u6210\u529F ${result.successful}\uFF0C\u8DF3\u8FC7 ${result.skipped}\uFF0C\u5931\u8D25 ${result.failed}`
     }).catch(() => void 0);
@@ -8820,7 +9258,7 @@ function channelTaskCenterItem(row) {
 }
 
 // src/services/destructiveConfirmation.ts
-import crypto10 from "crypto";
+import crypto11 from "crypto";
 var DestructiveConfirmationStore = class {
   confirmations = /* @__PURE__ */ new Map();
   ttlMs;
@@ -8829,7 +9267,7 @@ var DestructiveConfirmationStore = class {
   constructor(options = {}) {
     this.ttlMs = options.ttlMs ?? 5 * 60 * 1e3;
     this.now = options.now ?? (() => Date.now());
-    this.tokenFactory = options.tokenFactory ?? (() => crypto10.randomBytes(18).toString("base64url"));
+    this.tokenFactory = options.tokenFactory ?? (() => crypto11.randomBytes(18).toString("base64url"));
   }
   issue(binding) {
     const token = this.tokenFactory();
@@ -10443,12 +10881,17 @@ async function uploadDownloadedFile(localFilePath, originalFileName) {
     } catch {
     }
   }
-  const finalPath = await saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, folder, async (savedPath) => {
-    await query(`
-            INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        `, [safeName, storedName, fileType, mimeType, size, savedPath, thumbnailPath, dimensions.width, dimensions.height, provider.name, folder, activeAccountId]);
-  });
+  const finalPath = await withStorageAccountOperationLease(
+    pool,
+    activeAccountId,
+    "ytdlp_upload",
+    () => saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, folder, async (savedPath) => {
+      await query(`
+                INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            `, [safeName, storedName, fileType, mimeType, size, savedPath, thumbnailPath, dimensions.width, dimensions.height, provider.name, folder, activeAccountId]);
+    })
+  );
   try {
     if (fs10.existsSync(localFilePath)) await fs10.promises.unlink(localFilePath);
   } catch {
@@ -12381,7 +12824,7 @@ function generateSignature(fileId, typeOrExpires, expires) {
     throw new Error("Missing signed URL expiration timestamp");
   }
   const data = `${fileId}:${type}:${expiresTimestamp}`;
-  return crypto11.createHmac("sha256", SESSION_SECRET).update(data).digest("hex");
+  return crypto12.createHmac("sha256", SESSION_SECRET).update(data).digest("hex");
 }
 function getSignedUrl(fileId, type, expiresIn = 24 * 60 * 60) {
   const expires = Date.now() + expiresIn * 1e3;
@@ -12409,7 +12852,7 @@ function verifySignedUrl(req) {
   try {
     const received = Buffer.from(sign, "hex");
     const expected = Buffer.from(expectedSign, "hex");
-    if (received.length !== expected.length || !crypto11.timingSafeEqual(received, expected)) {
+    if (received.length !== expected.length || !crypto12.timingSafeEqual(received, expected)) {
       console.log("[SignedURL] Signature mismatch:", { id, type });
       return false;
     }
@@ -13303,9 +13746,9 @@ function logOperationalEvent(event, requestId, data) {
 }
 
 // src/services/batchDeleteConfirmation.ts
-import crypto12 from "node:crypto";
+import crypto13 from "node:crypto";
 function hashAuthToken(token) {
-  return crypto12.createHash("sha256").update(token).digest("hex");
+  return crypto13.createHash("sha256").update(token).digest("hex");
 }
 function normalizeFileIds(fileIds) {
   return [...new Set(fileIds)].sort();
@@ -13318,7 +13761,7 @@ var BatchDeleteConfirmationStore = class {
   constructor(options = {}) {
     this.ttlMs = options.ttlMs ?? 5 * 60 * 1e3;
     this.now = options.now ?? (() => Date.now());
-    this.tokenFactory = options.tokenFactory ?? (() => crypto12.randomBytes(24).toString("base64url"));
+    this.tokenFactory = options.tokenFactory ?? (() => crypto13.randomBytes(24).toString("base64url"));
   }
   issue(input) {
     const confirmationToken = this.tokenFactory();
@@ -13689,6 +14132,7 @@ var handleUpload = async (req, res, source = "web") => {
   const mimeType = file.mimetype;
   const size = file.size;
   const tempPath = path18.resolve(file.path);
+  let storageLease = null;
   const target = storageManager.getActiveTarget();
   const { provider, accountId: activeAccountId } = target;
   const storageRules = await getStoragePathRules();
@@ -13697,6 +14141,7 @@ var handleUpload = async (req, res, source = "web") => {
   console.log(`[Upload] \u{1F4C1} Received file: ${originalName} (${mimeType}, ${size} bytes)`);
   console.log(`[Upload] \u{1F3E0} Local temp path: ${tempPath}`);
   try {
+    storageLease = await acquireStorageAccountOperationLease(pool, activeAccountId, "web_upload");
     await assertStorageTargetWritable(target);
     console.log(`[Upload] \u{1F6E0}\uFE0F  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || "none (local)"}`);
     let thumbnailPath = null;
@@ -13794,6 +14239,8 @@ var handleUpload = async (req, res, source = "web") => {
       return sendStorageCooldownHttpError(res, error);
     }
     res.status(500).json({ error: "\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25" });
+  } finally {
+    await storageLease?.release();
   }
 };
 router4.post("/", uploadLimiter, upload.single("file"), async (req, res) => {
@@ -13812,12 +14259,12 @@ import os3 from "os";
 import path19 from "path";
 import fs14 from "fs";
 import axios3 from "axios";
-import crypto14 from "crypto";
+import crypto15 from "crypto";
 
 // src/services/oauthFlowStore.ts
 init_db();
 init_credentialCrypto();
-import crypto13 from "node:crypto";
+import crypto14 from "node:crypto";
 var OAuthFlowError = class extends Error {
   code = "OAUTH_FLOW_INVALID";
   constructor() {
@@ -13826,7 +14273,7 @@ var OAuthFlowError = class extends Error {
   }
 };
 function sha256(value) {
-  return crypto13.createHash("sha256").update(value).digest("hex");
+  return crypto14.createHash("sha256").update(value).digest("hex");
 }
 function parsePendingConfig(value) {
   const parsed = typeof value === "string" ? JSON.parse(value) : value;
@@ -13843,8 +14290,8 @@ var OAuthFlowStore = class {
     this.db = options.db ?? pool;
     this.ttlMs = options.ttlMs ?? 10 * 60 * 1e3;
     this.now = options.now ?? (() => Date.now());
-    this.stateFactory = options.stateFactory ?? (() => crypto13.randomBytes(32).toString("base64url"));
-    this.nonceFactory = options.nonceFactory ?? (() => crypto13.randomBytes(24).toString("base64url"));
+    this.stateFactory = options.stateFactory ?? (() => crypto14.randomBytes(32).toString("base64url"));
+    this.nonceFactory = options.nonceFactory ?? (() => crypto14.randomBytes(24).toString("base64url"));
   }
   async ensureSchema() {
     if (!this.schemaPromise) {
@@ -13991,64 +14438,13 @@ function renderOAuthSuccessPage(input) {
     `;
 }
 
-// src/services/storageAccountLifecycle.ts
-var StorageAccountNotFoundError = class extends Error {
-  constructor() {
-    super("\u5B58\u50A8\u8D26\u6237\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u5220\u9664");
-    this.name = "StorageAccountNotFoundError";
-  }
-};
-var StorageAccountConflictError = class extends Error {
-  constructor(kind) {
-    super(kind === "active" ? "\u65E0\u6CD5\u5220\u9664\u5F53\u524D\u6B63\u5728\u4F7F\u7528\u7684\u8D26\u6237\uFF0C\u8BF7\u5148\u5207\u6362\u5230\u5176\u4ED6\u8D26\u6237\u6216\u672C\u5730\u5B58\u50A8\u3002" : kind === "job" ? "\u8BE5\u8D26\u6237\u4ECD\u88AB\u672A\u5B8C\u6210\u7684 Telegram \u4EFB\u52A1\u4F7F\u7528\uFF0C\u8BF7\u5148\u5B8C\u6210\u6216\u53D6\u6D88\u8FD9\u4E9B\u4EFB\u52A1\u3002" : "\u8BE5\u8D26\u6237\u4ECD\u88AB\u8FDB\u884C\u4E2D\u7684\u4E0A\u4F20\u4F7F\u7528\uFF0C\u8BF7\u7B49\u5F85\u4E0A\u4F20\u5B8C\u6210\u6216\u53D6\u6D88\u540E\u91CD\u8BD5\u3002");
-    this.kind = kind;
-    this.name = "StorageAccountConflictError";
-  }
-  kind;
-};
-async function deleteStorageAccountWithClient(client2, accountId) {
-  const accountResult = await client2.query(
-    "SELECT id, name, type, is_active FROM storage_accounts WHERE id = $1 FOR UPDATE",
-    [accountId]
-  );
-  if (!accountResult.rows[0]) throw new StorageAccountNotFoundError();
-  const account = accountResult.rows[0];
-  if (account.is_active) throw new StorageAccountConflictError("active");
-  const taskReference = await client2.query(
-    `SELECT id FROM telegram_background_jobs
-         WHERE finished_at IS NULL AND cancelled_at IS NULL
-           AND params->>'storageAccountId' = $1
-         LIMIT 1 FOR UPDATE`,
-    [accountId]
-  );
-  if (taskReference.rows.length > 0) throw new StorageAccountConflictError("job");
-  const uploadReference = await client2.query(
-    `SELECT id FROM storage_account_leases
-         WHERE storage_account_id = $1 AND released_at IS NULL AND expires_at > NOW()
-         LIMIT 1 FOR UPDATE`,
-    [accountId]
-  );
-  if (uploadReference.rows.length > 0) throw new StorageAccountConflictError("upload");
-  const fileResult = await client2.query("DELETE FROM files WHERE storage_account_id = $1", [accountId]);
-  const deleted = await client2.query(
-    "DELETE FROM storage_accounts WHERE id = $1 AND is_active = false RETURNING id",
-    [accountId]
-  );
-  if (deleted.rowCount !== 1) throw new StorageAccountConflictError("active");
-  return {
-    id: String(account.id),
-    name: String(account.name),
-    type: String(account.type),
-    deletedFiles: fileResult.rowCount || 0
-  };
-}
-
 // src/routes/storage.ts
+init_storageAccountLifecycle();
 var checkDiskSpace2 = checkDiskSpaceModule2.default || checkDiskSpaceModule2;
 var router5 = Router5();
 var UPLOAD_DIR6 = process.env.UPLOAD_DIR || "./data/uploads";
 function sendOAuthSuccessPage(res, input) {
-  const nonce = crypto14.randomBytes(16).toString("base64");
+  const nonce = crypto15.randomBytes(16).toString("base64");
   res.setHeader("Content-Security-Policy", [
     "default-src 'self'",
     "style-src 'unsafe-inline'",
@@ -14506,7 +14902,7 @@ var storage_default = router5;
 // src/routes/chunkedUpload.ts
 init_db();
 import { Router as Router6 } from "express";
-import crypto16 from "node:crypto";
+import crypto18 from "node:crypto";
 import fs16 from "node:fs";
 import fsPromises2 from "node:fs/promises";
 import path21 from "node:path";
@@ -14515,8 +14911,97 @@ import { rateLimit as rateLimit3 } from "express-rate-limit";
 import checkDiskSpaceModule3 from "check-disk-space";
 init_storage();
 
+// src/services/chunkUploadReconciliation.ts
+import crypto16 from "node:crypto";
+async function beginChunkCompletionReconciliation(db, input) {
+  const operationId = crypto16.randomUUID();
+  await db.query(
+    `INSERT INTO chunk_upload_reconciliations
+         (operation_id, upload_id, completion_token, provider, account_id, object_state, index_state, reason, status, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,'unknown','unknown','\u5206\u5757\u5B8C\u6210\u526F\u4F5C\u7528\u8FDB\u884C\u4E2D','pending',NOW(),NOW())`,
+    [operationId, input.uploadId, input.completionToken, input.provider, input.accountId]
+  );
+  return operationId;
+}
+async function markChunkReconciliationObjectPresent(db, operationId, storedPath) {
+  const result = await db.query(
+    `UPDATE chunk_upload_reconciliations SET stored_path = $2, object_state = 'present', updated_at = NOW()
+         WHERE operation_id = $1 AND status = 'pending'`,
+    [operationId, storedPath]
+  );
+  if (result.rowCount !== 1) throw new Error("\u5206\u5757\u5B8C\u6210\u5BF9\u8D26 journal \u5BF9\u8C61\u72B6\u6001\u66F4\u65B0\u5931\u8D25");
+}
+async function markChunkReconciliationIndexPresent(db, operationId, fileId) {
+  const result = await db.query(
+    `UPDATE chunk_upload_reconciliations SET file_id = $2, index_state = 'present', updated_at = NOW()
+         WHERE operation_id = $1 AND status = 'pending'`,
+    [operationId, fileId]
+  );
+  if (result.rowCount !== 1) throw new Error("\u5206\u5757\u5B8C\u6210\u5BF9\u8D26 journal \u7D22\u5F15\u72B6\u6001\u66F4\u65B0\u5931\u8D25");
+}
+async function updateChunkReconciliationAfterCompensation(db, operationId, evidence) {
+  const resolved = evidence.objectState === "deleted" && evidence.indexState === "deleted";
+  const result = await db.query(
+    `UPDATE chunk_upload_reconciliations
+         SET object_state = $2, index_state = $3, reason = $4,
+             status = CASE WHEN $5::boolean THEN 'resolved' ELSE 'pending' END,
+             resolved_at = CASE WHEN $5::boolean THEN NOW() ELSE NULL END,
+             updated_at = NOW()
+         WHERE operation_id = $1 AND status = 'pending'
+         RETURNING operation_id`,
+    [operationId, evidence.objectState, evidence.indexState, evidence.reason.slice(0, 2e3), resolved]
+  );
+  if (result.rowCount !== 1) throw new Error("\u5206\u5757\u5B8C\u6210\u5BF9\u8D26 journal \u8865\u507F\u72B6\u6001\u66F4\u65B0\u5931\u8D25");
+  return operationId;
+}
+async function compensateChunkCompletionFailure(input) {
+  let objectState = "present";
+  let indexState = input.initialIndexState || "present";
+  const errors = [];
+  try {
+    await input.deleteObject();
+    objectState = "deleted";
+  } catch (error) {
+    objectState = "unknown";
+    errors.push(`object: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    if (!await input.deleteIndex()) throw new Error("\u6570\u636E\u5E93\u7D22\u5F15\u8865\u507F\u5F71\u54CD 0 \u884C");
+    indexState = "deleted";
+  } catch (error) {
+    indexState = "unknown";
+    errors.push(`index: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (objectState === "deleted" && indexState === "deleted") {
+    const operationId2 = await input.persist({
+      uploadId: input.uploadId,
+      completionToken: input.completionToken,
+      provider: input.provider,
+      accountId: input.accountId,
+      storedPath: input.storedPath,
+      fileId: input.fileId,
+      objectState,
+      indexState,
+      reason: "\u8865\u507F\u5DF2\u786E\u8BA4\u5B8C\u6210"
+    });
+    return { reconciled: true, operationId: operationId2 };
+  }
+  const operationId = await input.persist({
+    uploadId: input.uploadId,
+    completionToken: input.completionToken,
+    provider: input.provider,
+    accountId: input.accountId,
+    storedPath: input.storedPath,
+    fileId: input.fileId,
+    objectState,
+    indexState,
+    reason: errors.join("; ") || "\u8865\u507F\u7ED3\u679C\u4E0D\u786E\u5B9A"
+  });
+  return { reconciled: false, operationId };
+}
+
 // src/services/chunkUploadSessions.ts
-import crypto15 from "node:crypto";
+import crypto17 from "node:crypto";
 import fs15 from "node:fs";
 import fsPromises from "node:fs/promises";
 import path20 from "node:path";
@@ -14529,8 +15014,9 @@ var ChunkUploadProtocolError = class extends Error {
 };
 async function writeChunkAtomically(input) {
   await fsPromises.mkdir(path20.dirname(input.finalPath), { recursive: true });
-  const temporaryPath = `${input.finalPath}.${crypto15.randomUUID()}.part`;
-  const hash = crypto15.createHash("sha256");
+  const committedPath = `${input.finalPath}.${crypto17.randomUUID()}.chunk`;
+  const temporaryPath = `${committedPath}.part`;
+  const hash = crypto17.createHash("sha256");
   let size = 0;
   const counter = new (await import("node:stream")).Transform({
     transform(chunk, _encoding, callback) {
@@ -14545,12 +15031,32 @@ async function writeChunkAtomically(input) {
     if (size !== input.expectedSize) throw new ChunkUploadProtocolError("ChunkSizeMismatchError", "\u5206\u5757\u5927\u5C0F\u4E0D\u5339\u914D");
     const sha2562 = hash.digest("hex");
     if (sha2562 !== input.expectedSha256.toLowerCase()) throw new ChunkUploadProtocolError("ChunkHashMismatchError", "\u5206\u5757\u54C8\u5E0C\u4E0D\u5339\u914D");
-    await fsPromises.rename(temporaryPath, input.finalPath);
-    return { index: -1, size, sha256: sha2562, path: input.finalPath, createdAt: /* @__PURE__ */ new Date() };
+    await fsPromises.rename(temporaryPath, committedPath);
+    return { index: -1, size, sha256: sha2562, path: committedPath, createdAt: /* @__PURE__ */ new Date() };
   } catch (error) {
     await fsPromises.rm(temporaryPath, { force: true }).catch(() => void 0);
     throw error;
   }
+}
+async function verifyChunkIntegrity(chunk, expectedDirectory, maxChunkBytes) {
+  const chunkPath = path20.resolve(chunk.path);
+  const directory = path20.resolve(expectedDirectory);
+  if (path20.dirname(chunkPath) !== directory) throw new ChunkUploadProtocolError("ChunkPathError", `\u5206\u5757 ${chunk.index} \u8DEF\u5F84\u65E0\u6548`);
+  const stat = await fsPromises.stat(chunkPath);
+  if (stat.size !== chunk.size || stat.size < 1 || stat.size > maxChunkBytes) {
+    throw new ChunkUploadProtocolError("ChunkSizeMismatchError", `\u5206\u5757 ${chunk.index} \u5927\u5C0F\u65E0\u6548`);
+  }
+  const hash = crypto17.createHash("sha256");
+  await pipeline(fs15.createReadStream(chunkPath), new (await import("node:stream")).Writable({
+    write(buffer, _encoding, callback) {
+      hash.update(buffer);
+      callback();
+    }
+  }));
+  if (hash.digest("hex") !== chunk.sha256) {
+    throw new ChunkUploadProtocolError("ChunkHashMismatchError", `\u5206\u5757 ${chunk.index} \u54C8\u5E0C\u65E0\u6548`);
+  }
+  return chunkPath;
 }
 var ChunkUploadSessionStore = class {
   constructor(repository, limits) {
@@ -14587,20 +15093,25 @@ var ChunkUploadSessionStore = class {
       }
       throw new ChunkUploadProtocolError("ChunkConflictError", "\u540C\u4E00\u5206\u5757\u7D22\u5F15\u7684\u5927\u5C0F\u6216\u54C8\u5E0C\u51B2\u7A81");
     }
-    const chunk = await writeChunkAtomically({
+    const candidate = await writeChunkAtomically({
       stream: input.input,
       finalPath: input.finalPath,
       expectedSize: input.expectedSize,
       expectedSha256: input.expectedSha256,
       maxChunkBytes: input.maxChunkBytes
     });
-    chunk.index = input.index;
-    const result = await this.repository.recordChunk(input.uploadId, input.ownerId, chunk);
-    if (result.status === "recorded") return result;
-    if (result.status === "duplicate") return result;
-    await fsPromises.rm(input.finalPath, { force: true }).catch(() => void 0);
-    if (result.status === "conflict") throw new ChunkUploadProtocolError("ChunkConflictError", "\u540C\u4E00\u5206\u5757\u7D22\u5F15\u7684\u5927\u5C0F\u6216\u54C8\u5E0C\u51B2\u7A81");
-    throw new ChunkUploadProtocolError("ChunkSessionStateError", "\u4E0A\u4F20\u4F1A\u8BDD\u4E0D\u53EF\u5199");
+    candidate.index = input.index;
+    try {
+      const result = await this.repository.recordChunk(input.uploadId, input.ownerId, candidate);
+      if (result.status === "recorded") return result;
+      await fsPromises.rm(candidate.path, { force: true }).catch(() => void 0);
+      if (result.status === "duplicate") return result;
+      if (result.status === "conflict") throw new ChunkUploadProtocolError("ChunkConflictError", "\u540C\u4E00\u5206\u5757\u7D22\u5F15\u7684\u5927\u5C0F\u6216\u54C8\u5E0C\u51B2\u7A81");
+      throw new ChunkUploadProtocolError("ChunkSessionStateError", "\u4E0A\u4F20\u4F1A\u8BDD\u4E0D\u53EF\u5199");
+    } catch (error) {
+      await fsPromises.rm(candidate.path, { force: true }).catch(() => void 0);
+      throw error;
+    }
   }
   status(uploadId, ownerId2) {
     return this.repository.getSession(uploadId, ownerId2);
@@ -14608,14 +15119,20 @@ var ChunkUploadSessionStore = class {
   chunks(uploadId, ownerId2) {
     return this.repository.listChunks(uploadId, ownerId2);
   }
-  claimCompletion(uploadId, ownerId2, token) {
-    return this.repository.claimCompletion(uploadId, ownerId2, token);
+  claimCompletion(uploadId, ownerId2, token, expiresAt) {
+    return this.repository.claimCompletion(uploadId, ownerId2, token, expiresAt);
+  }
+  renewCompletion(uploadId, ownerId2, token, expiresAt) {
+    return this.repository.renewCompletion(uploadId, ownerId2, token, expiresAt);
   }
   failCompletion(uploadId, ownerId2, token, error) {
     return this.repository.markCompletionFailed(uploadId, ownerId2, token, error);
   }
   retryFailed(uploadId, ownerId2) {
     return this.repository.reopenFailed(uploadId, ownerId2);
+  }
+  completeWithReconciliation(uploadId, ownerId2, token, fileId, operationId) {
+    return this.repository.completeWithReconciliation(uploadId, ownerId2, token, fileId, operationId);
   }
   complete(uploadId, ownerId2, token, fileId) {
     return this.repository.markCompleted(uploadId, ownerId2, token, fileId);
@@ -14639,6 +15156,7 @@ function mapSession(row) {
     targetAccountId: row.target_account_id == null && row.targetAccountId == null ? null : String(row.target_account_id ?? row.targetAccountId),
     expiresAt: new Date(String(row.expires_at ?? row.expiresAt)),
     completionToken: row.completion_token == null && row.completionToken == null ? null : String(row.completion_token ?? row.completionToken),
+    completionExpiresAt: row.completion_expires_at == null && row.completionExpiresAt == null ? null : new Date(String(row.completion_expires_at ?? row.completionExpiresAt)),
     completedFileId: row.completed_file_id == null && row.completedFileId == null ? null : String(row.completed_file_id ?? row.completedFileId),
     lastError: row.last_error == null && row.lastError == null ? null : String(row.last_error ?? row.lastError),
     createdAt: new Date(String(row.created_at ?? row.createdAt)),
@@ -14655,8 +15173,8 @@ function mapChunk(row) {
   };
 }
 var PostgresChunkUploadSessionRepository = class {
-  constructor(pool3) {
-    this.pool = pool3;
+  constructor(pool2) {
+    this.pool = pool2;
   }
   pool;
   insertParams(value) {
@@ -14674,6 +15192,7 @@ var PostgresChunkUploadSessionRepository = class {
       value.targetAccountId,
       value.expiresAt,
       value.completionToken,
+      value.completionExpiresAt,
       value.completedFileId,
       value.lastError,
       value.createdAt,
@@ -14684,8 +15203,8 @@ var PostgresChunkUploadSessionRepository = class {
     await this.pool.query(
       `INSERT INTO chunk_upload_sessions
              (upload_id, owner_id, filename, mime_type, folder, total_size, total_chunks, received_bytes, status,
-              target_provider, target_account_id, expires_at, completion_token, completed_file_id, last_error, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+              target_provider, target_account_id, expires_at, completion_token, completion_expires_at, completed_file_id, last_error, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
       this.insertParams(value)
     );
   }
@@ -14706,8 +15225,8 @@ var PostgresChunkUploadSessionRepository = class {
       await client2.query(
         `INSERT INTO chunk_upload_sessions
                  (upload_id, owner_id, filename, mime_type, folder, total_size, total_chunks, received_bytes, status,
-                  target_provider, target_account_id, expires_at, completion_token, completed_file_id, last_error, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+                  target_provider, target_account_id, expires_at, completion_token, completion_expires_at, completed_file_id, last_error, created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
         this.insertParams(value)
       );
       await client2.query("COMMIT");
@@ -14793,18 +15312,18 @@ var PostgresChunkUploadSessionRepository = class {
       client2.release();
     }
   }
-  async claimCompletion(uploadId, ownerId2, token) {
+  async claimCompletion(uploadId, ownerId2, token, expiresAt) {
     const client2 = await this.pool.connect();
     try {
       await client2.query("BEGIN");
       const claimed = await client2.query(
         `UPDATE chunk_upload_sessions s
-                 SET status = 'completing', completion_token = $3, last_error = NULL, updated_at = NOW()
+                 SET status = 'completing', completion_token = $3, completion_expires_at = $4, last_error = NULL, updated_at = NOW()
                  WHERE upload_id = $1 AND owner_id = $2 AND status = 'open' AND completion_token IS NULL
                    AND received_bytes = total_size
                    AND (SELECT COUNT(*) FROM chunk_upload_chunks c WHERE c.upload_id = s.upload_id) = total_chunks
                  RETURNING s.*`,
-        [uploadId, ownerId2, token]
+        [uploadId, ownerId2, token, expiresAt]
       );
       if (!claimed.rows[0]) {
         await client2.query("ROLLBACK");
@@ -14823,9 +15342,19 @@ var PostgresChunkUploadSessionRepository = class {
       client2.release();
     }
   }
+  async renewCompletion(uploadId, ownerId2, token, expiresAt) {
+    const result = await this.pool.query(
+      `UPDATE chunk_upload_sessions
+             SET completion_expires_at = $4, updated_at = NOW()
+             WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3
+             RETURNING upload_id`,
+      [uploadId, ownerId2, token, expiresAt]
+    );
+    return result.rowCount === 1;
+  }
   async markCompletionFailed(uploadId, ownerId2, token, error) {
     const result = await this.pool.query(
-      `UPDATE chunk_upload_sessions SET status = 'failed', completion_token = NULL, last_error = $4, updated_at = NOW()
+      `UPDATE chunk_upload_sessions SET status = 'failed', completion_token = NULL, completion_expires_at = NULL, last_error = $4, updated_at = NOW()
              WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3`,
       [uploadId, ownerId2, token, error.slice(0, 2e3)]
     );
@@ -14834,18 +15363,96 @@ var PostgresChunkUploadSessionRepository = class {
   async reopenFailed(uploadId, ownerId2) {
     const result = await this.pool.query(
       `UPDATE chunk_upload_sessions SET status = 'open', last_error = NULL, updated_at = NOW()
-             WHERE upload_id = $1 AND owner_id = $2 AND status = 'failed' AND expires_at > NOW()`,
+             WHERE upload_id = $1 AND owner_id = $2 AND status = 'failed' AND expires_at > NOW()
+               AND NOT EXISTS (SELECT 1 FROM chunk_upload_reconciliations r WHERE r.upload_id = $1 AND r.status = 'pending')`,
       [uploadId, ownerId2]
     );
     return result.rowCount === 1;
   }
+  async completeWithReconciliation(uploadId, ownerId2, token, fileId, operationId) {
+    const client2 = await this.pool.connect();
+    try {
+      await client2.query("BEGIN");
+      const completed = await client2.query(
+        `UPDATE chunk_upload_sessions SET status = 'completed', completed_file_id = $4, completion_expires_at = NULL, updated_at = NOW()
+                 WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3
+                 RETURNING upload_id`,
+        [uploadId, ownerId2, token, fileId]
+      );
+      if (completed.rowCount !== 1) {
+        await client2.query("ROLLBACK");
+        return false;
+      }
+      const resolved = await client2.query(
+        `UPDATE chunk_upload_reconciliations
+                 SET status = 'resolved', reason = '\u5206\u5757\u5B8C\u6210\u5DF2\u63D0\u4EA4', resolved_at = NOW(), updated_at = NOW()
+                 WHERE operation_id = $1 AND upload_id = $2 AND completion_token = $3 AND status = 'pending'
+                 RETURNING operation_id`,
+        [operationId, uploadId, token]
+      );
+      if (resolved.rowCount !== 1) throw new Error("\u5206\u5757\u5B8C\u6210 journal resolve \u5F71\u54CD 0 \u884C");
+      await client2.query("COMMIT");
+      return true;
+    } catch (error) {
+      await client2.query("ROLLBACK").catch(() => void 0);
+      throw error;
+    } finally {
+      client2.release();
+    }
+  }
   async markCompleted(uploadId, ownerId2, token, fileId) {
     const result = await this.pool.query(
-      `UPDATE chunk_upload_sessions SET status = 'completed', completed_file_id = $4, updated_at = NOW()
+      `UPDATE chunk_upload_sessions SET status = 'completed', completed_file_id = $4, completion_expires_at = NULL, updated_at = NOW()
              WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3`,
       [uploadId, ownerId2, token, fileId]
     );
     return result.rowCount === 1;
+  }
+  async deleteExpiredSessions(limit) {
+    const result = await this.pool.query(
+      `WITH expired AS (
+                SELECT s.upload_id
+                FROM chunk_upload_sessions s
+                WHERE s.status IN ('open','failed','cancelled') AND s.expires_at <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chunk_upload_reconciliations r
+                      WHERE r.upload_id = s.upload_id AND r.status = 'pending'
+                  )
+                ORDER BY s.expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+             )
+             DELETE FROM chunk_upload_sessions s
+             USING expired
+             WHERE s.upload_id = expired.upload_id
+             RETURNING s.upload_id`,
+      [Math.max(1, Math.min(limit, 1e3))]
+    );
+    return result.rows.map((row) => String(row.upload_id));
+  }
+  async recoverExpiredCompletions(limit) {
+    const result = await this.pool.query(
+      `WITH expired AS (
+                SELECT s.upload_id
+                FROM chunk_upload_sessions s
+                WHERE s.status = 'completing' AND s.completion_expires_at <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chunk_upload_reconciliations r
+                      WHERE r.upload_id = s.upload_id AND r.status = 'pending'
+                  )
+                ORDER BY s.completion_expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+             )
+             UPDATE chunk_upload_sessions s
+             SET status = 'failed', completion_token = NULL, completion_expires_at = NULL,
+                 last_error = '\u5B8C\u6210\u79DF\u7EA6\u5DF2\u8FC7\u671F\uFF0C\u53EF\u5B89\u5168\u91CD\u8BD5', updated_at = NOW()
+             FROM expired
+             WHERE s.upload_id = expired.upload_id
+             RETURNING s.upload_id`,
+      [Math.max(1, Math.min(limit, 1e3))]
+    );
+    return result.rows.map((row) => String(row.upload_id));
   }
   async cancel(uploadId, ownerId2) {
     const client2 = await this.pool.connect();
@@ -14869,7 +15476,7 @@ var PostgresChunkUploadSessionRepository = class {
         return "terminal";
       }
       const updated = await client2.query(
-        `UPDATE chunk_upload_sessions SET status = 'cancelled', completion_token = NULL, updated_at = NOW()
+        `UPDATE chunk_upload_sessions SET status = 'cancelled', completion_token = NULL, completion_expires_at = NULL, updated_at = NOW()
                  WHERE upload_id = $1 AND owner_id = $2 AND status IN ('open','failed')`,
         [uploadId, ownerId2]
       );
@@ -14896,13 +15503,26 @@ var GLOBAL_BUDGET_BYTES = Math.max(MAX_TOTAL_BYTES, (parseInt(process.env.CHUNK_
 var DISK_RESERVE_BYTES = Math.max(1024 ** 3, (parseInt(process.env.CHUNK_DISK_RESERVE_GB || "8", 10) || 8) * 1024 ** 3);
 var MAX_TOTAL_CHUNKS = Math.max(1, parseInt(process.env.MAX_TOTAL_CHUNKS || "50000", 10) || 5e4);
 var SESSION_TTL_MS = Math.max(60 * 60 * 1e3, parseInt(process.env.CHUNK_SESSION_TTL_MS || String(24 * 60 * 60 * 1e3), 10));
+var COMPLETION_LEASE_MS = Math.max(6e4, parseInt(process.env.CHUNK_COMPLETION_LEASE_MS || String(30 * 60 * 1e3), 10));
 [UPLOAD_DIR7, THUMBNAIL_DIR6, CHUNK_DIR].forEach((dir) => fs16.mkdirSync(dir, { recursive: true }));
-var chunkStore = new ChunkUploadSessionStore(new PostgresChunkUploadSessionRepository(pool), {
+var chunkRepository = new PostgresChunkUploadSessionRepository(pool);
+var chunkStore = new ChunkUploadSessionStore(chunkRepository, {
   maxTotalBytes: MAX_TOTAL_BYTES,
   globalBudgetBytes: GLOBAL_BUDGET_BYTES,
   diskReserveBytes: DISK_RESERVE_BYTES,
   getDiskFreeBytes: async () => (await checkDiskSpace3(path21.resolve(CHUNK_DIR))).free
 });
+var runChunkMaintenance = async () => {
+  const expiredIds = await chunkRepository.deleteExpiredSessions(100);
+  await Promise.all(expiredIds.map(
+    (uploadId) => fsPromises2.rm(path21.join(CHUNK_DIR, uploadId), { recursive: true, force: true }).catch((error) => console.error(`\u6E05\u7406\u8FC7\u671F\u5206\u5757\u76EE\u5F55\u5931\u8D25: ${uploadId}`, error))
+  ));
+  await chunkRepository.recoverExpiredCompletions(100);
+};
+var completionRecoveryTimer = setInterval(() => {
+  void runChunkMaintenance().catch((error) => console.error("\u5206\u5757\u4E0A\u4F20\u7EF4\u62A4\u5931\u8D25:", error));
+}, Math.max(6e4, Math.floor(COMPLETION_LEASE_MS / 2)));
+completionRecoveryTimer.unref?.();
 router6.use(rateLimit3({
   windowMs: 15 * 60 * 1e3,
   max: 300,
@@ -14913,7 +15533,7 @@ router6.use(rateLimit3({
 function ownerId(req) {
   const token = getAuthToken(req);
   if (!token) throw new ChunkUploadProtocolError("ChunkOwnerError", "\u7F3A\u5C11\u8BA4\u8BC1\u4F1A\u8BDD");
-  return crypto16.createHash("sha256").update(token).digest("hex");
+  return crypto18.createHash("sha256").update(token).digest("hex");
 }
 function decodeFilename2(filename) {
   try {
@@ -14949,9 +15569,9 @@ function sendProtocolError(res, error) {
 router6.post("/init", async (req, res) => {
   let uploadDirectory = "";
   try {
-    const { filename, totalChunks, mimeType, totalSize, folder } = req.body;
-    const chunks = Number(totalChunks);
+    const { filename, mimeType, totalSize, folder } = req.body;
     const bytes = Number(totalSize);
+    const chunks = Math.ceil(bytes / MAX_CHUNK_BYTES);
     if (typeof filename !== "string" || !filename.trim() || typeof mimeType !== "string") {
       return res.status(400).json({ error: "\u7F3A\u5C11\u5FC5\u8981\u53C2\u6570" });
     }
@@ -14961,7 +15581,7 @@ router6.post("/init", async (req, res) => {
     const target = storageManager.getActiveTarget();
     const now = /* @__PURE__ */ new Date();
     const session = {
-      uploadId: crypto16.randomUUID(),
+      uploadId: crypto18.randomUUID(),
       ownerId: ownerId(req),
       filename: decodeFilename2(filename).slice(0, 255),
       mimeType: mimeType.slice(0, 100),
@@ -14974,6 +15594,7 @@ router6.post("/init", async (req, res) => {
       targetAccountId: target.accountId,
       expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
       completionToken: null,
+      completionExpiresAt: null,
       completedFileId: null,
       lastError: null,
       createdAt: now,
@@ -14982,7 +15603,13 @@ router6.post("/init", async (req, res) => {
     uploadDirectory = path21.join(CHUNK_DIR, session.uploadId);
     await fsPromises2.mkdir(uploadDirectory, { recursive: true });
     await chunkStore.reserve(session);
-    res.json({ success: true, uploadId: session.uploadId, expiresAt: session.expiresAt.toISOString() });
+    res.json({
+      success: true,
+      uploadId: session.uploadId,
+      expiresAt: session.expiresAt.toISOString(),
+      maxChunkBytes: MAX_CHUNK_BYTES,
+      totalChunks: chunks
+    });
   } catch (error) {
     if (uploadDirectory) await fsPromises2.rm(uploadDirectory, { recursive: true, force: true }).catch(() => void 0);
     sendProtocolError(res, error);
@@ -15031,18 +15658,17 @@ router6.post("/chunk", async (req, res) => {
   }
 });
 async function mergeChunks(uploadId, chunks, targetPath, expectedBytes) {
-  const temporary = `${targetPath}.${crypto16.randomUUID()}.part`;
+  const temporary = `${targetPath}.${crypto18.randomUUID()}.part`;
   await fsPromises2.mkdir(path21.dirname(targetPath), { recursive: true });
   const output = fs16.createWriteStream(temporary, { flags: "wx" });
   try {
     if (chunks.length === 0) throw new Error("\u5206\u5757\u4E0D\u5B8C\u6574");
     for (let index = 0; index < chunks.length; index++) {
       const chunk = chunks[index];
-      const expectedPath = path21.resolve(safeChunkPath(uploadId, index));
-      if (chunk.index !== index || path21.resolve(chunk.path) !== expectedPath) throw new Error(`\u5206\u5757 ${index} \u5143\u6570\u636E\u65E0\u6548`);
-      const stat2 = await fsPromises2.stat(expectedPath);
-      if (stat2.size !== chunk.size || stat2.size < 1 || stat2.size > MAX_CHUNK_BYTES) throw new Error(`\u5206\u5757 ${index} \u5927\u5C0F\u65E0\u6548`);
-      await pipeline2(fs16.createReadStream(expectedPath), output, { end: false });
+      const expectedDirectory = path21.dirname(path21.resolve(safeChunkPath(uploadId, index)));
+      if (chunk.index !== index) throw new Error(`\u5206\u5757 ${index} \u5143\u6570\u636E\u65E0\u6548`);
+      const verifiedPath = await verifyChunkIntegrity(chunk, expectedDirectory, MAX_CHUNK_BYTES);
+      await pipeline2(fs16.createReadStream(verifiedPath), output, { end: false });
     }
     await new Promise((resolve, reject) => {
       output.end(resolve);
@@ -15062,6 +15688,9 @@ router6.post("/complete", async (req, res) => {
   let owner = "";
   let token = "";
   let tempMergedPath = "";
+  let storageLease = null;
+  let completionHeartbeat = null;
+  let completionLeaseError = null;
   try {
     owner = ownerId(req);
     const current = await chunkStore.status(uploadId, owner);
@@ -15088,10 +15717,19 @@ router6.post("/complete", async (req, res) => {
     if (current.status === "failed") {
       return res.status(409).json({ error: "\u4E0A\u6B21\u5B8C\u6210\u5931\u8D25\uFF0C\u8BF7\u5148\u91CD\u8BD5\u4E0A\u4F20\u4F1A\u8BDD", retryable: true, lastError: current.lastError });
     }
-    token = crypto16.randomUUID();
-    const claim = await chunkStore.claimCompletion(uploadId, owner, token);
+    token = crypto18.randomUUID();
+    const claim = await chunkStore.claimCompletion(uploadId, owner, token, new Date(Date.now() + COMPLETION_LEASE_MS));
     if (!claim) return res.status(409).json({ error: "\u4E0A\u4F20\u672A\u5B8C\u6574\u3001\u5DF2\u7531\u5176\u4ED6\u8BF7\u6C42\u5904\u7406\u6216\u72B6\u6001\u4E0D\u53EF\u5B8C\u6210" });
+    completionHeartbeat = setInterval(() => {
+      void chunkStore.renewCompletion(uploadId, owner, token, new Date(Date.now() + COMPLETION_LEASE_MS)).then((renewed) => {
+        if (!renewed) completionLeaseError = new Error("\u5B8C\u6210\u79DF\u7EA6\u5DF2\u5931\u6548");
+      }).catch((error) => {
+        completionLeaseError = error;
+      });
+    }, Math.max(3e4, Math.floor(COMPLETION_LEASE_MS / 3)));
+    completionHeartbeat.unref?.();
     const session = claim.session;
+    storageLease = await acquireStorageAccountOperationLease(pool, session.targetAccountId, "chunk_completion");
     const target = storageManager.getTarget(session.targetProvider, session.targetAccountId);
     await assertStorageTargetWritable(target);
     const storageFolder = buildStorageFolderWithRules({
@@ -15137,9 +15775,43 @@ router6.post("/complete", async (req, res) => {
       previewPath = preview ? path21.basename(preview) : null;
     }
     const type = getFileType2(session.mimeType);
-    let indexed;
-    const storedPath = await saveAndIndexWithCompensation(target.provider, tempMergedPath, storedName, session.mimeType, storageFolder, async (savedPath) => {
-      indexed = await query(
+    const operationId = await beginChunkCompletionReconciliation(pool, {
+      uploadId,
+      completionToken: token,
+      provider: target.provider.name,
+      accountId: session.targetAccountId
+    });
+    let storedPath = "";
+    let file = null;
+    const compensateAfterSideEffectFailure = async (reason) => {
+      if (!storedPath) {
+        await updateChunkReconciliationAfterCompensation(pool, operationId, {
+          objectState: "unknown",
+          indexState: "deleted",
+          reason: `provider \u4FDD\u5B58\u7ED3\u679C\u4E0D\u786E\u5B9A: ${reason instanceof Error ? reason.message : String(reason)}`
+        });
+        throw new Error(`\u5206\u5757\u5B8C\u6210\u4FDD\u5B58\u7ED3\u679C\u4E0D\u786E\u5B9A\uFF0C\u9700\u8981\u4EBA\u5DE5\u5BF9\u8D26: operation=${operationId}`, { cause: reason });
+      }
+      const outcome = await compensateChunkCompletionFailure({
+        uploadId,
+        completionToken: token,
+        provider: target.provider.name,
+        accountId: session.targetAccountId,
+        storedPath,
+        fileId: file ? String(file.id) : "",
+        deleteObject: () => target.provider.deleteFile(storedPath),
+        deleteIndex: async () => !file || (await query("DELETE FROM files WHERE id = $1", [file.id])).rowCount === 1,
+        persist: (evidence) => updateChunkReconciliationAfterCompensation(pool, operationId, evidence),
+        initialIndexState: file ? "present" : "deleted"
+      });
+      if (!outcome.reconciled) {
+        throw new Error(`\u5206\u5757\u5B8C\u6210\u8865\u507F\u7ED3\u679C\u4E0D\u786E\u5B9A\uFF0C\u9700\u8981\u4EBA\u5DE5\u5BF9\u8D26: operation=${outcome.operationId}`, { cause: reason });
+      }
+    };
+    try {
+      storedPath = await target.provider.saveFile(tempMergedPath, storedName, session.mimeType, storageFolder);
+      await markChunkReconciliationObjectPresent(pool, operationId, storedPath);
+      const indexed = await query(
         `INSERT INTO files
                  (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
@@ -15150,7 +15822,7 @@ router6.post("/complete", async (req, res) => {
           type,
           session.mimeType,
           session.totalSize,
-          savedPath,
+          storedPath,
           thumbnailPath,
           previewPath,
           width,
@@ -15160,20 +15832,25 @@ router6.post("/complete", async (req, res) => {
           session.targetAccountId
         ]
       );
-    });
-    const file = indexed.rows[0];
+      file = indexed.rows[0];
+      await markChunkReconciliationIndexPresent(pool, operationId, String(file.id));
+    } catch (sideEffectError) {
+      await compensateAfterSideEffectFailure(sideEffectError);
+      throw sideEffectError;
+    }
+    const compensateAfterCompletionFailure = compensateAfterSideEffectFailure;
     let completed = false;
     try {
-      completed = await chunkStore.complete(uploadId, owner, token, file.id);
+      if (completionLeaseError) throw completionLeaseError;
+      completed = await chunkStore.completeWithReconciliation(uploadId, owner, token, file.id, operationId);
     } catch (completionError) {
-      await target.provider.deleteFile(storedPath).catch((error) => console.error("\u5B8C\u6210 CAS \u5F02\u5E38\u540E\u5220\u9664\u5B58\u50A8\u5BF9\u8C61\u5931\u8D25:", error));
-      await query("DELETE FROM files WHERE id = $1", [file.id]).catch((error) => console.error("\u5B8C\u6210 CAS \u5F02\u5E38\u540E\u5220\u9664\u6587\u4EF6\u7D22\u5F15\u5931\u8D25:", error));
+      await compensateAfterCompletionFailure(completionError);
       throw completionError;
     }
     if (!completed) {
-      await target.provider.deleteFile(storedPath).catch((error) => console.error("\u5B8C\u6210 CAS \u5931\u8D25\u540E\u5220\u9664\u5B58\u50A8\u5BF9\u8C61\u5931\u8D25:", error));
-      await query("DELETE FROM files WHERE id = $1", [file.id]).catch((error) => console.error("\u5B8C\u6210 CAS \u5931\u8D25\u540E\u5220\u9664\u6587\u4EF6\u7D22\u5F15\u5931\u8D25:", error));
-      throw new Error("\u6C38\u4E45\u6587\u4EF6\u5DF2\u4FDD\u5B58\uFF0C\u4F46\u5B8C\u6210\u79DF\u7EA6\u5931\u6548");
+      const completionError = new Error("\u6C38\u4E45\u6587\u4EF6\u5DF2\u4FDD\u5B58\uFF0C\u4F46\u5B8C\u6210\u79DF\u7EA6\u5931\u6548");
+      await compensateAfterCompletionFailure(completionError);
+      throw completionError;
     }
     await fsPromises2.rm(tempMergedPath, { force: true }).catch((error) => console.error("\u6E05\u7406\u5408\u5E76\u4E34\u65F6\u6587\u4EF6\u5931\u8D25:", error));
     await fsPromises2.rm(path21.join(CHUNK_DIR, uploadId), { recursive: true, force: true }).catch((error) => console.error("\u6E05\u7406\u5DF2\u5B8C\u6210\u4E0A\u4F20\u7684\u5206\u5757\u5931\u8D25:", error));
@@ -15200,6 +15877,9 @@ router6.post("/complete", async (req, res) => {
     if (tempMergedPath) await fsPromises2.rm(tempMergedPath, { force: true }).catch(() => void 0);
     if (isStorageCooldownError(error)) return sendStorageCooldownHttpError(res, error);
     sendProtocolError(res, error);
+  } finally {
+    if (completionHeartbeat) clearInterval(completionHeartbeat);
+    await storageLease?.release();
   }
 });
 router6.post("/:uploadId/retry", async (req, res) => {
@@ -15247,7 +15927,7 @@ var chunkedUpload_default = router6;
 // src/index.ts
 init_db();
 import helmet from "helmet";
-import crypto17 from "node:crypto";
+import crypto19 from "node:crypto";
 dotenv3.config();
 var app = express();
 app.set("trust proxy", process.env.TRUST_PROXY || "loopback");
@@ -15289,7 +15969,7 @@ app.use(cors({
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "2mb" }));
 app.use((req, res, next) => {
   const provided = normalizeRequestId(req.headers["x-request-id"]);
-  const requestId = provided || crypto17.randomUUID();
+  const requestId = provided || crypto19.randomUUID();
   res.locals.requestId = requestId;
   res.setHeader("X-Request-Id", requestId);
   next();
@@ -15341,7 +16021,10 @@ app.get("/livez", (_req, res) => {
 app.get("/readyz", async (_req, res) => {
   try {
     if (!applicationReady) throw new Error(readinessError || "\u5E94\u7528\u4ECD\u5728\u521D\u59CB\u5316");
+    await ensureDatabaseInitialized();
     await pool.query("SELECT 1");
+    const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+    await storageManager2.assertReady();
     const twoFactor = await get2FAReadiness();
     if (!twoFactor.ready) throw new Error("2FA \u5BC6\u94A5\u4E0D\u53EF\u8BFB\u53D6");
     res.json({ status: "ready", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
@@ -15359,6 +16042,7 @@ app.use((err, _req, res, _next) => {
 var server = null;
 async function initializeApplication() {
   const telegramEnabled = !!process.env.TELEGRAM_BOT_TOKEN && !!process.env.TELEGRAM_API_ID && !!process.env.TELEGRAM_API_HASH;
+  await ensureDatabaseInitialized();
   const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
   await storageManager2.init();
   const twoFactor = await get2FAReadiness();

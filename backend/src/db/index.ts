@@ -135,14 +135,13 @@ async function initializeDatabase() {
     }
 }
 
-// 测试连接
-pool.on('connect', async () => {
+export function ensureDatabaseInitialized(): Promise<void> {
+    if (!initializationPromise) initializationPromise = initializeDatabase();
+    return initializationPromise;
+}
+
+pool.on('connect', () => {
     console.log('📦 已连接到 PostgreSQL 数据库');
-    // 自动初始化数据库表结构
-    if (!initializationPromise) {
-        initializationPromise = initializeDatabase();
-    }
-    await initializationPromise;
 });
 
 pool.on('error', (err) => {

@@ -11,6 +11,11 @@ for file in postgres.dump file-storage.tar.gz manifest.txt; do
   [[ -s "$BACKUP/$file" ]] || { echo "缺少或为空：$BACKUP/$file" >&2; exit 1; }
 done
 
+grep -qx 'consistency=backend-stopped' "$BACKUP/manifest.txt" || {
+  echo "manifest 缺少受支持的一致性策略 consistency=backend-stopped" >&2
+  exit 1
+}
+
 (
   cd "$BACKUP"
   expected=$(grep -E '^[0-9a-f]{64}  ' manifest.txt || true)

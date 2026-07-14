@@ -22,6 +22,7 @@ export interface ChunkUploadSession {
     targetAccountId: string | null;
     expiresAt: Date;
     completionToken: string | null;
+    completionExpiresAt: Date | null;
     completedFileId: string | null;
     lastError: string | null;
     createdAt: Date;
@@ -55,7 +56,9 @@ export interface ChunkUploadSessionRepository {
     getChunk(uploadId: string, ownerId: string, index: number): Promise<ChunkUploadChunk | null>;
     listChunks(uploadId: string, ownerId: string): Promise<ChunkUploadChunk[]>;
     recordChunk(uploadId: string, ownerId: string, chunk: ChunkUploadChunk): Promise<ChunkRecordResult>;
-    claimCompletion(uploadId: string, ownerId: string, token: string): Promise<ChunkUploadCompletionClaim | null>;
+    claimCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<ChunkUploadCompletionClaim | null>;
+    renewCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<boolean>;
+    completeWithReconciliation(uploadId: string, ownerId: string, token: string, fileId: string, operationId: string): Promise<boolean>;
     markCompletionFailed(uploadId: string, ownerId: string, token: string, error: string): Promise<boolean>;
     reopenFailed(uploadId: string, ownerId: string): Promise<boolean>;
     markCompleted(uploadId: string, ownerId: string, token: string, fileId: string): Promise<boolean>;
@@ -84,7 +87,8 @@ export async function writeChunkAtomically(input: {
     maxChunkBytes: number;
 }): Promise<ChunkUploadChunk> {
     await fsPromises.mkdir(path.dirname(input.finalPath), { recursive: true });
-    const temporaryPath = `${input.finalPath}.${crypto.randomUUID()}.part`;
+    const committedPath = `${input.finalPath}.${crypto.randomUUID()}.chunk`;
+    const temporaryPath = `${committedPath}.part`;
     const hash = crypto.createHash('sha256');
     let size = 0;
     const counter = new (await import('node:stream')).Transform({
@@ -100,12 +104,33 @@ export async function writeChunkAtomically(input: {
         if (size !== input.expectedSize) throw new ChunkUploadProtocolError('ChunkSizeMismatchError', '分块大小不匹配');
         const sha256 = hash.digest('hex');
         if (sha256 !== input.expectedSha256.toLowerCase()) throw new ChunkUploadProtocolError('ChunkHashMismatchError', '分块哈希不匹配');
-        await fsPromises.rename(temporaryPath, input.finalPath);
-        return { index: -1, size, sha256, path: input.finalPath, createdAt: new Date() };
+        await fsPromises.rename(temporaryPath, committedPath);
+        return { index: -1, size, sha256, path: committedPath, createdAt: new Date() };
     } catch (error) {
         await fsPromises.rm(temporaryPath, { force: true }).catch(() => undefined);
         throw error;
     }
+}
+
+export async function verifyChunkIntegrity(chunk: ChunkUploadChunk, expectedDirectory: string, maxChunkBytes: number): Promise<string> {
+    const chunkPath = path.resolve(chunk.path);
+    const directory = path.resolve(expectedDirectory);
+    if (path.dirname(chunkPath) !== directory) throw new ChunkUploadProtocolError('ChunkPathError', `分块 ${chunk.index} 路径无效`);
+    const stat = await fsPromises.stat(chunkPath);
+    if (stat.size !== chunk.size || stat.size < 1 || stat.size > maxChunkBytes) {
+        throw new ChunkUploadProtocolError('ChunkSizeMismatchError', `分块 ${chunk.index} 大小无效`);
+    }
+    const hash = crypto.createHash('sha256');
+    await pipeline(fs.createReadStream(chunkPath), new (await import('node:stream')).Writable({
+        write(buffer: Buffer, _encoding, callback) {
+            hash.update(buffer);
+            callback();
+        },
+    }));
+    if (hash.digest('hex') !== chunk.sha256) {
+        throw new ChunkUploadProtocolError('ChunkHashMismatchError', `分块 ${chunk.index} 哈希无效`);
+    }
+    return chunkPath;
 }
 
 export class ChunkUploadSessionStore {
@@ -154,20 +179,25 @@ export class ChunkUploadSessionStore {
             throw new ChunkUploadProtocolError('ChunkConflictError', '同一分块索引的大小或哈希冲突');
         }
 
-        const chunk = await writeChunkAtomically({
+        const candidate = await writeChunkAtomically({
             stream: input.input,
             finalPath: input.finalPath,
             expectedSize: input.expectedSize,
             expectedSha256: input.expectedSha256,
             maxChunkBytes: input.maxChunkBytes,
         });
-        chunk.index = input.index;
-        const result = await this.repository.recordChunk(input.uploadId, input.ownerId, chunk);
-        if (result.status === 'recorded') return result;
-        if (result.status === 'duplicate') return result;
-        await fsPromises.rm(input.finalPath, { force: true }).catch(() => undefined);
-        if (result.status === 'conflict') throw new ChunkUploadProtocolError('ChunkConflictError', '同一分块索引的大小或哈希冲突');
-        throw new ChunkUploadProtocolError('ChunkSessionStateError', '上传会话不可写');
+        candidate.index = input.index;
+        try {
+            const result = await this.repository.recordChunk(input.uploadId, input.ownerId, candidate);
+            if (result.status === 'recorded') return result;
+            await fsPromises.rm(candidate.path, { force: true }).catch(() => undefined);
+            if (result.status === 'duplicate') return result;
+            if (result.status === 'conflict') throw new ChunkUploadProtocolError('ChunkConflictError', '同一分块索引的大小或哈希冲突');
+            throw new ChunkUploadProtocolError('ChunkSessionStateError', '上传会话不可写');
+        } catch (error) {
+            await fsPromises.rm(candidate.path, { force: true }).catch(() => undefined);
+            throw error;
+        }
     }
 
     status(uploadId: string, ownerId: string): Promise<ChunkUploadSession | null> {
@@ -178,8 +208,12 @@ export class ChunkUploadSessionStore {
         return this.repository.listChunks(uploadId, ownerId);
     }
 
-    claimCompletion(uploadId: string, ownerId: string, token: string): Promise<ChunkUploadCompletionClaim | null> {
-        return this.repository.claimCompletion(uploadId, ownerId, token);
+    claimCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<ChunkUploadCompletionClaim | null> {
+        return this.repository.claimCompletion(uploadId, ownerId, token, expiresAt);
+    }
+
+    renewCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<boolean> {
+        return this.repository.renewCompletion(uploadId, ownerId, token, expiresAt);
     }
 
     failCompletion(uploadId: string, ownerId: string, token: string, error: string): Promise<boolean> {
@@ -188,6 +222,10 @@ export class ChunkUploadSessionStore {
 
     retryFailed(uploadId: string, ownerId: string): Promise<boolean> {
         return this.repository.reopenFailed(uploadId, ownerId);
+    }
+
+    completeWithReconciliation(uploadId: string, ownerId: string, token: string, fileId: string, operationId: string): Promise<boolean> {
+        return this.repository.completeWithReconciliation(uploadId, ownerId, token, fileId, operationId);
     }
 
     complete(uploadId: string, ownerId: string, token: string, fileId: string): Promise<boolean> {
@@ -214,6 +252,8 @@ function mapSession(row: Record<string, unknown>): ChunkUploadSession {
         targetAccountId: row.target_account_id == null && row.targetAccountId == null ? null : String(row.target_account_id ?? row.targetAccountId),
         expiresAt: new Date(String(row.expires_at ?? row.expiresAt)),
         completionToken: row.completion_token == null && row.completionToken == null ? null : String(row.completion_token ?? row.completionToken),
+        completionExpiresAt: row.completion_expires_at == null && row.completionExpiresAt == null
+            ? null : new Date(String(row.completion_expires_at ?? row.completionExpiresAt)),
         completedFileId: row.completed_file_id == null && row.completedFileId == null ? null : String(row.completed_file_id ?? row.completedFileId),
         lastError: row.last_error == null && row.lastError == null ? null : String(row.last_error ?? row.lastError),
         createdAt: new Date(String(row.created_at ?? row.createdAt)),
@@ -237,15 +277,15 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
     private insertParams(value: ChunkUploadSession): unknown[] {
         return [value.uploadId, value.ownerId, value.filename, value.mimeType, value.folder, value.totalSize, value.totalChunks,
             value.receivedBytes, value.status, value.targetProvider, value.targetAccountId, value.expiresAt, value.completionToken,
-            value.completedFileId, value.lastError, value.createdAt, value.updatedAt];
+            value.completionExpiresAt, value.completedFileId, value.lastError, value.createdAt, value.updatedAt];
     }
 
     async createSession(value: ChunkUploadSession): Promise<void> {
         await this.pool.query(
             `INSERT INTO chunk_upload_sessions
              (upload_id, owner_id, filename, mime_type, folder, total_size, total_chunks, received_bytes, status,
-              target_provider, target_account_id, expires_at, completion_token, completed_file_id, last_error, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+              target_provider, target_account_id, expires_at, completion_token, completion_expires_at, completed_file_id, last_error, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
             this.insertParams(value),
         );
     }
@@ -267,8 +307,8 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
             await client.query(
                 `INSERT INTO chunk_upload_sessions
                  (upload_id, owner_id, filename, mime_type, folder, total_size, total_chunks, received_bytes, status,
-                  target_provider, target_account_id, expires_at, completion_token, completed_file_id, last_error, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+                  target_provider, target_account_id, expires_at, completion_token, completion_expires_at, completed_file_id, last_error, created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
                 this.insertParams(value),
             );
             await client.query('COMMIT');
@@ -360,18 +400,18 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
         }
     }
 
-    async claimCompletion(uploadId: string, ownerId: string, token: string): Promise<ChunkUploadCompletionClaim | null> {
+    async claimCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<ChunkUploadCompletionClaim | null> {
         const client = await this.pool.connect();
         try {
             await client.query('BEGIN');
             const claimed = await client.query(
                 `UPDATE chunk_upload_sessions s
-                 SET status = 'completing', completion_token = $3, last_error = NULL, updated_at = NOW()
+                 SET status = 'completing', completion_token = $3, completion_expires_at = $4, last_error = NULL, updated_at = NOW()
                  WHERE upload_id = $1 AND owner_id = $2 AND status = 'open' AND completion_token IS NULL
                    AND received_bytes = total_size
                    AND (SELECT COUNT(*) FROM chunk_upload_chunks c WHERE c.upload_id = s.upload_id) = total_chunks
                  RETURNING s.*`,
-                [uploadId, ownerId, token],
+                [uploadId, ownerId, token, expiresAt],
             );
             if (!claimed.rows[0]) {
                 await client.query('ROLLBACK');
@@ -390,9 +430,20 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
         }
     }
 
+    async renewCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<boolean> {
+        const result = await this.pool.query(
+            `UPDATE chunk_upload_sessions
+             SET completion_expires_at = $4, updated_at = NOW()
+             WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3
+             RETURNING upload_id`,
+            [uploadId, ownerId, token, expiresAt],
+        );
+        return result.rowCount === 1;
+    }
+
     async markCompletionFailed(uploadId: string, ownerId: string, token: string, error: string): Promise<boolean> {
         const result = await this.pool.query(
-            `UPDATE chunk_upload_sessions SET status = 'failed', completion_token = NULL, last_error = $4, updated_at = NOW()
+            `UPDATE chunk_upload_sessions SET status = 'failed', completion_token = NULL, completion_expires_at = NULL, last_error = $4, updated_at = NOW()
              WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3`,
             [uploadId, ownerId, token, error.slice(0, 2000)],
         );
@@ -402,19 +453,98 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
     async reopenFailed(uploadId: string, ownerId: string): Promise<boolean> {
         const result = await this.pool.query(
             `UPDATE chunk_upload_sessions SET status = 'open', last_error = NULL, updated_at = NOW()
-             WHERE upload_id = $1 AND owner_id = $2 AND status = 'failed' AND expires_at > NOW()`,
+             WHERE upload_id = $1 AND owner_id = $2 AND status = 'failed' AND expires_at > NOW()
+               AND NOT EXISTS (SELECT 1 FROM chunk_upload_reconciliations r WHERE r.upload_id = $1 AND r.status = 'pending')`,
             [uploadId, ownerId],
         );
         return result.rowCount === 1;
     }
 
+    async completeWithReconciliation(uploadId: string, ownerId: string, token: string, fileId: string, operationId: string): Promise<boolean> {
+        const client = await this.pool.connect();
+        try {
+            await client.query('BEGIN');
+            const completed = await client.query(
+                `UPDATE chunk_upload_sessions SET status = 'completed', completed_file_id = $4, completion_expires_at = NULL, updated_at = NOW()
+                 WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3
+                 RETURNING upload_id`, [uploadId, ownerId, token, fileId],
+            );
+            if (completed.rowCount !== 1) {
+                await client.query('ROLLBACK');
+                return false;
+            }
+            const resolved = await client.query(
+                `UPDATE chunk_upload_reconciliations
+                 SET status = 'resolved', reason = '分块完成已提交', resolved_at = NOW(), updated_at = NOW()
+                 WHERE operation_id = $1 AND upload_id = $2 AND completion_token = $3 AND status = 'pending'
+                 RETURNING operation_id`, [operationId, uploadId, token],
+            );
+            if (resolved.rowCount !== 1) throw new Error('分块完成 journal resolve 影响 0 行');
+            await client.query('COMMIT');
+            return true;
+        } catch (error) {
+            await client.query('ROLLBACK').catch(() => undefined);
+            throw error;
+        } finally {
+            client.release();
+        }
+    }
+
     async markCompleted(uploadId: string, ownerId: string, token: string, fileId: string): Promise<boolean> {
         const result = await this.pool.query(
-            `UPDATE chunk_upload_sessions SET status = 'completed', completed_file_id = $4, updated_at = NOW()
+            `UPDATE chunk_upload_sessions SET status = 'completed', completed_file_id = $4, completion_expires_at = NULL, updated_at = NOW()
              WHERE upload_id = $1 AND owner_id = $2 AND status = 'completing' AND completion_token = $3`,
             [uploadId, ownerId, token, fileId],
         );
         return result.rowCount === 1;
+    }
+
+    async deleteExpiredSessions(limit: number): Promise<string[]> {
+        const result = await this.pool.query(
+            `WITH expired AS (
+                SELECT s.upload_id
+                FROM chunk_upload_sessions s
+                WHERE s.status IN ('open','failed','cancelled') AND s.expires_at <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chunk_upload_reconciliations r
+                      WHERE r.upload_id = s.upload_id AND r.status = 'pending'
+                  )
+                ORDER BY s.expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+             )
+             DELETE FROM chunk_upload_sessions s
+             USING expired
+             WHERE s.upload_id = expired.upload_id
+             RETURNING s.upload_id`,
+            [Math.max(1, Math.min(limit, 1000))],
+        );
+        return result.rows.map(row => String(row.upload_id));
+    }
+
+    async recoverExpiredCompletions(limit: number): Promise<string[]> {
+        const result = await this.pool.query(
+            `WITH expired AS (
+                SELECT s.upload_id
+                FROM chunk_upload_sessions s
+                WHERE s.status = 'completing' AND s.completion_expires_at <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chunk_upload_reconciliations r
+                      WHERE r.upload_id = s.upload_id AND r.status = 'pending'
+                  )
+                ORDER BY s.completion_expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+             )
+             UPDATE chunk_upload_sessions s
+             SET status = 'failed', completion_token = NULL, completion_expires_at = NULL,
+                 last_error = '完成租约已过期，可安全重试', updated_at = NOW()
+             FROM expired
+             WHERE s.upload_id = expired.upload_id
+             RETURNING s.upload_id`,
+            [Math.max(1, Math.min(limit, 1000))],
+        );
+        return result.rows.map(row => String(row.upload_id));
     }
 
     async cancel(uploadId: string, ownerId: string): Promise<ChunkCancelResult> {
@@ -438,7 +568,7 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
                 return 'terminal';
             }
             const updated = await client.query(
-                `UPDATE chunk_upload_sessions SET status = 'cancelled', completion_token = NULL, updated_at = NOW()
+                `UPDATE chunk_upload_sessions SET status = 'cancelled', completion_token = NULL, completion_expires_at = NULL, updated_at = NOW()
                  WHERE upload_id = $1 AND owner_id = $2 AND status IN ('open','failed')`, [uploadId, ownerId],
             );
             await client.query('COMMIT');

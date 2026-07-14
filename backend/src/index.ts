@@ -15,7 +15,7 @@ import { initTelegramBot } from './services/telegramBot.js';
 import { initTelegramUserClient, isTelegramUserClientReady } from './services/telegramUserClient.js';
 import { isInitialSetupRequired } from './utils/authSettings.js';
 import { get2FAReadiness } from './utils/security.js';
-import { pool } from './db/index.js';
+import { ensureDatabaseInitialized, pool } from './db/index.js';
 import helmet from 'helmet';
 import crypto from 'node:crypto';
 import { normalizeRequestId } from './services/operationalEvents.js';
@@ -145,7 +145,10 @@ app.get('/livez', (_req, res) => {
 app.get('/readyz', async (_req, res) => {
     try {
         if (!applicationReady) throw new Error(readinessError || '应用仍在初始化');
+        await ensureDatabaseInitialized();
         await pool.query('SELECT 1');
+        const { storageManager } = await import('./services/storage.js');
+        await storageManager.assertReady();
         const twoFactor = await get2FAReadiness();
         if (!twoFactor.ready) throw new Error('2FA 密钥不可读取');
         res.json({ status: 'ready', timestamp: new Date().toISOString() });
@@ -168,6 +171,7 @@ let server: ReturnType<typeof app.listen> | null = null;
 
 async function initializeApplication(): Promise<void> {
     const telegramEnabled = !!process.env.TELEGRAM_BOT_TOKEN && !!process.env.TELEGRAM_API_ID && !!process.env.TELEGRAM_API_HASH;
+    await ensureDatabaseInitialized();
     const { storageManager } = await import('./services/storage.js');
     await storageManager.init();
     const twoFactor = await get2FAReadiness();

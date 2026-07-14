@@ -31,6 +31,7 @@ function session(overrides: Partial<ChunkUploadSession> = {}): ChunkUploadSessio
         targetAccountId: null,
         expiresAt: new Date(Date.now() + 60_000),
         completionToken: null,
+        completionExpiresAt: null,
         completedFileId: null,
         lastError: null,
         createdAt: new Date(),
@@ -99,12 +100,13 @@ class MemoryRepository implements ChunkUploadSessionRepository {
         return { status: 'recorded', chunk: structuredClone(chunk) };
     }
 
-    async claimCompletion(uploadId: string, ownerId: string, token: string): Promise<ChunkUploadCompletionClaim | null> {
+    async claimCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<ChunkUploadCompletionClaim | null> {
         const value = this.sessions.get(uploadId);
         if (!value || value.ownerId !== ownerId || value.status !== 'open') return null;
         if (this.chunks.size !== value.totalChunks || value.receivedBytes !== value.totalSize) return null;
         value.status = 'completing';
         value.completionToken = token;
+        value.completionExpiresAt = expiresAt;
         this.sessions.set(uploadId, value);
         return { session: structuredClone(value), chunks: [...this.chunks.values()].map(chunk => structuredClone(chunk)) };
     }
@@ -115,8 +117,21 @@ class MemoryRepository implements ChunkUploadSessionRepository {
         value.status = 'failed';
         value.lastError = error;
         value.completionToken = null;
+        value.completionExpiresAt = null;
         this.sessions.set(uploadId, value);
         return true;
+    }
+
+    async renewCompletion(uploadId: string, ownerId: string, token: string, expiresAt: Date): Promise<boolean> {
+        const value = this.sessions.get(uploadId);
+        if (!value || value.ownerId !== ownerId || value.status !== 'completing' || value.completionToken !== token) return false;
+        value.completionExpiresAt = expiresAt;
+        this.sessions.set(uploadId, value);
+        return true;
+    }
+
+    async completeWithReconciliation(uploadId: string, ownerId: string, token: string, fileId: string, _operationId: string): Promise<boolean> {
+        return this.markCompleted(uploadId, ownerId, token, fileId);
     }
 
     async reopenFailed(uploadId: string, ownerId: string): Promise<boolean> {
@@ -133,6 +148,7 @@ class MemoryRepository implements ChunkUploadSessionRepository {
         if (!value || value.ownerId !== ownerId || value.status !== 'completing' || value.completionToken !== token) return false;
         value.status = 'completed';
         value.completedFileId = fileId;
+        value.completionExpiresAt = null;
         this.sessions.set(uploadId, value);
         return true;
     }
@@ -202,9 +218,11 @@ test('chunk metadata is recorded only after the atomic file write finishes', asy
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-vault-chunk-'));
     const finalPath = path.join(directory, 'chunk_0');
     let recordedAfterRename = false;
+    let recordedPath = '';
     const originalRecord = repository.recordChunk.bind(repository);
     repository.recordChunk = async (...args) => {
-        recordedAfterRename = await fs.access(finalPath).then(() => true, () => false);
+        recordedPath = args[2].path;
+        recordedAfterRename = await fs.access(recordedPath).then(() => true, () => false);
         return originalRecord(...args);
     };
 
@@ -221,7 +239,7 @@ test('chunk metadata is recorded only after the atomic file write finishes', asy
 
     assert.equal(result.status, 'recorded');
     assert.equal(recordedAfterRename, true);
-    assert.equal(await fs.readFile(finalPath, 'utf8'), 'abcdef');
+    assert.equal(await fs.readFile(recordedPath, 'utf8'), 'abcdef');
     await fs.rm(directory, { recursive: true, force: true });
 });
 
@@ -263,8 +281,109 @@ test('duplicate chunks are idempotent only when size and hash match', async () =
         (error: unknown) => error instanceof Error && error.name === 'ChunkConflictError',
     );
     assert.equal((await store.status(session().uploadId, 'owner-a'))?.receivedBytes, 6);
-    assert.equal(await fs.readFile(finalPath, 'utf8'), 'abcdef');
+    assert.equal(await fs.readFile((await repository.getChunk(session().uploadId, 'owner-a', 0))!.path, 'utf8'), 'abcdef');
     await fs.rm(directory, { recursive: true, force: true });
+});
+
+test('concurrent conflicting writers cannot overwrite or delete the winning chunk file', async () => {
+    const repository = new MemoryRepository();
+    const store = new ChunkUploadSessionStore(repository);
+    await store.create(session({ totalSize: 6, totalChunks: 1 }));
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-vault-chunk-race-'));
+    const finalPath = path.join(directory, 'chunk_0');
+    const firstBody = 'abcdef';
+    const secondBody = 'ghijkl';
+    const firstHash = crypto.createHash('sha256').update(firstBody).digest('hex');
+    const secondHash = crypto.createHash('sha256').update(secondBody).digest('hex');
+    let arrivals = 0;
+    let release!: () => void;
+    const bothReady = new Promise<void>(resolve => { release = resolve; });
+    const originalRecord = repository.recordChunk.bind(repository);
+    repository.recordChunk = async (...args) => {
+        arrivals += 1;
+        if (arrivals === 2) release();
+        await bothReady;
+        return originalRecord(...args);
+    };
+
+    const results = await Promise.allSettled([
+        store.writeChunk({ uploadId: session().uploadId, ownerId: 'owner-a', index: 0, expectedSize: 6, expectedSha256: firstHash, finalPath, input: Readable.from([firstBody]), maxChunkBytes: 10 }),
+        store.writeChunk({ uploadId: session().uploadId, ownerId: 'owner-a', index: 0, expectedSize: 6, expectedSha256: secondHash, finalPath, input: Readable.from([secondBody]), maxChunkBytes: 10 }),
+    ]);
+
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    const winner = repository.chunks.get(`${session().uploadId}:0`);
+    assert.ok(winner);
+    const winnerBody = await fs.readFile(winner.path, 'utf8');
+    assert.equal(crypto.createHash('sha256').update(winnerBody).digest('hex'), winner.sha256);
+    assert.equal(await fs.access(winner.path).then(() => true, () => false), true);
+    await fs.rm(directory, { recursive: true, force: true });
+});
+
+test('completion integrity verification rejects same-size chunk tampering', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-vault-chunk-hash-'));
+    const chunkPath = path.join(directory, 'chunk_0');
+    await fs.writeFile(chunkPath, 'ghijkl');
+    const { verifyChunkIntegrity } = await import('./chunkUploadSessions.js');
+
+    await assert.rejects(
+        verifyChunkIntegrity({
+            index: 0,
+            size: 6,
+            sha256: crypto.createHash('sha256').update('abcdef').digest('hex'),
+            path: chunkPath,
+            createdAt: new Date(),
+        }, directory, 10),
+        /哈希无效/,
+    );
+    await fs.rm(directory, { recursive: true, force: true });
+});
+
+test('completion heartbeat extends only the exact active token lease', async () => {
+    const repository = new MemoryRepository();
+    const store = new ChunkUploadSessionStore(repository);
+    await store.create(session({ totalSize: 6, totalChunks: 1 }));
+    await repository.recordChunk(session().uploadId, 'owner-a', { index: 0, size: 6, sha256: 'a'.repeat(64), path: '/tmp/chunk', createdAt: new Date() });
+    assert.ok(await store.claimCompletion(session().uploadId, 'owner-a', 'token-a', new Date(Date.now() + 1_000)));
+    const renewedTo = new Date(Date.now() + 60_000);
+    assert.equal(await store.renewCompletion(session().uploadId, 'owner-a', 'token-a', renewedTo), true);
+    assert.equal((await store.status(session().uploadId, 'owner-a'))?.completionExpiresAt?.getTime(), renewedTo.getTime());
+    assert.equal(await store.renewCompletion(session().uploadId, 'owner-a', 'token-b', new Date()), false);
+});
+
+test('expired unfinished sessions are locked, deleted from metadata, and returned for directory cleanup', async () => {
+    const calls: string[] = [];
+    const repository = new PostgresChunkUploadSessionRepository({
+        query: async (text: string) => {
+            calls.push(text);
+            return { rows: [{ upload_id: session().uploadId }], rowCount: 1 };
+        },
+    } as never);
+    assert.deepEqual(await repository.deleteExpiredSessions(10), [session().uploadId]);
+    const sql = calls.join('\n');
+    assert.match(sql, /status IN \('open','failed','cancelled'\)/);
+    assert.match(sql, /expires_at <= NOW\(\)/);
+    assert.match(sql, /FOR UPDATE SKIP LOCKED/);
+    assert.match(sql, /DELETE FROM chunk_upload_sessions/);
+    assert.match(sql, /chunk_upload_reconciliations/);
+});
+
+test('an expired completion lease is reclaimed once and can be retried', async () => {
+    const calls: string[] = [];
+    const repository = new PostgresChunkUploadSessionRepository({
+        query: async (text: string) => {
+            calls.push(text);
+            if (text.includes("SET status = 'failed'")) return { rows: [{ upload_id: session().uploadId }], rowCount: 1 };
+            return { rows: [], rowCount: 0 };
+        },
+    } as never);
+
+    const reclaimed = await repository.recoverExpiredCompletions(10);
+    assert.deepEqual(reclaimed, [session().uploadId]);
+    const sql = calls.join('\n');
+    assert.match(sql, /completion_expires_at <= NOW\(\)/);
+    assert.match(sql, /FOR UPDATE SKIP LOCKED/);
+    assert.match(sql, /NOT EXISTS[\s\S]*chunk_upload_reconciliations/);
 });
 
 test('only one complete caller wins the open to completing CAS', async () => {
@@ -274,8 +393,8 @@ test('only one complete caller wins the open to completing CAS', async () => {
     await repository.recordChunk(session().uploadId, 'owner-a', { index: 0, size: 6, sha256: 'a'.repeat(64), path: '/tmp/chunk', createdAt: new Date() });
 
     const [first, second] = await Promise.all([
-        store.claimCompletion(session().uploadId, 'owner-a', 'token-a'),
-        store.claimCompletion(session().uploadId, 'owner-a', 'token-b'),
+        store.claimCompletion(session().uploadId, 'owner-a', 'token-a', new Date(Date.now() + 60_000)),
+        store.claimCompletion(session().uploadId, 'owner-a', 'token-b', new Date(Date.now() + 60_000)),
     ]);
     assert.equal([first, second].filter(Boolean).length, 1);
     assert.equal((await store.status(session().uploadId, 'owner-a'))?.status, 'completing');
@@ -286,7 +405,7 @@ test('cancel loses while completion owns the CAS lease', async () => {
     const store = new ChunkUploadSessionStore(repository);
     await store.create(session({ totalSize: 6, totalChunks: 1 }));
     await repository.recordChunk(session().uploadId, 'owner-a', { index: 0, size: 6, sha256: 'a'.repeat(64), path: '/tmp/chunk', createdAt: new Date() });
-    const claim = await store.claimCompletion(session().uploadId, 'owner-a', 'token-a');
+    const claim = await store.claimCompletion(session().uploadId, 'owner-a', 'token-a', new Date(Date.now() + 60_000));
     assert.ok(claim);
 
     assert.equal(await store.cancel(session().uploadId, 'owner-a'), 'busy');
@@ -298,13 +417,13 @@ test('failed completion preserves chunks and can be retried', async () => {
     const store = new ChunkUploadSessionStore(repository);
     await store.create(session({ totalSize: 6, totalChunks: 1 }));
     await repository.recordChunk(session().uploadId, 'owner-a', { index: 0, size: 6, sha256: 'a'.repeat(64), path: '/tmp/chunk', createdAt: new Date() });
-    assert.ok(await store.claimCompletion(session().uploadId, 'owner-a', 'token-a'));
+    assert.ok(await store.claimCompletion(session().uploadId, 'owner-a', 'token-a', new Date(Date.now() + 60_000)));
 
     assert.equal(await store.failCompletion(session().uploadId, 'owner-a', 'token-a', 'provider unavailable'), true);
     assert.equal((await store.status(session().uploadId, 'owner-a'))?.status, 'failed');
     assert.equal(repository.chunks.size, 1);
     assert.equal(await store.retryFailed(session().uploadId, 'owner-a'), true);
-    assert.ok(await store.claimCompletion(session().uploadId, 'owner-a', 'token-b'));
+    assert.ok(await store.claimCompletion(session().uploadId, 'owner-a', 'token-b', new Date(Date.now() + 60_000)));
 });
 
 test('postgres repository uses row locks and affected-row CAS for budget, complete and cancel', async () => {
@@ -328,11 +447,12 @@ test('postgres repository uses row locks and affected-row CAS for budget, comple
     } as never);
 
     assert.equal(await repository.reserveSession(session(), 20), true);
-    await repository.claimCompletion(session().uploadId, 'owner-a', 'token-a');
+    await repository.claimCompletion(session().uploadId, 'owner-a', 'token-a', new Date(Date.now() + 60_000));
     assert.equal(await repository.cancel(session().uploadId, 'owner-a'), 'busy');
     const sql = calls.map(call => call.text).join('\n');
     assert.match(sql, /pg_advisory_xact_lock/);
     assert.match(sql, /status = 'open'/);
     assert.match(sql, /completion_token IS NULL/);
+    assert.match(sql, /completion_expires_at/);
     assert.match(sql, /FOR UPDATE/);
 });

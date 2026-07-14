@@ -3,9 +3,7 @@ import { sha256Hex } from './chunkHash';
 
 import { API_BASE } from './config';
 import { classifyBatchDeleteResponse, type BatchDeleteResult } from './batchDeleteContract';
-
-// 分块大小：50MB（小于 Cloudflare 100MB 限制）
-const CHUNK_SIZE = 50 * 1024 * 1024;
+import { chunkBounds, parseChunkUploadInit } from './chunkUploadProtocol';
 
 export interface FileData {
     id: string;
@@ -233,7 +231,6 @@ class FileAPI {
 
     // 分块上传（适用于大文件）
     private async chunkedUpload(file: File, folder?: string, onProgress?: (progress: UploadProgress) => void, signal?: AbortSignal): Promise<{ success: boolean; file: FileData }> {
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
         let uploadedBytes = 0;
 
         // 1. 初始化上传
@@ -243,7 +240,6 @@ class FileAPI {
             headers: getHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
                 filename: file.name,
-                totalChunks,
                 mimeType: file.type || 'application/octet-stream',
                 totalSize: file.size,
                 folder,
@@ -254,13 +250,12 @@ class FileAPI {
         if (initResponse.status === 401 || initResponse.status === 428) throw new Error('UNAUTHORIZED');
         if (!initResponse.ok) throw new Error('初始化分块上传失败');
 
-        const { uploadId } = await initResponse.json();
+        const { uploadId, maxChunkBytes, totalChunks } = parseChunkUploadInit(await initResponse.json(), file.size);
 
         try {
             // 2. 逐个上传分块
             for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-                const start = chunkIndex * CHUNK_SIZE;
-                const end = Math.min(start + CHUNK_SIZE, file.size);
+                const { start, end } = chunkBounds(file.size, chunkIndex, maxChunkBytes);
                 const chunk = file.slice(start, end);
                 const chunkHash = await sha256Hex(chunk);
 

@@ -15,11 +15,19 @@ import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getUniqueStoredName } from '../utils/fileUtils.js';
 import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/storagePath.js';
 import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
-import { saveAndIndexWithCompensation } from '../services/storageWrite.js';
+import { acquireStorageAccountOperationLease, type StorageAccountOperationLease } from '../services/storageAccountOperation.js';
+import {
+    beginChunkCompletionReconciliation,
+    compensateChunkCompletionFailure,
+    markChunkReconciliationIndexPresent,
+    markChunkReconciliationObjectPresent,
+    updateChunkReconciliationAfterCompensation,
+} from '../services/chunkUploadReconciliation.js';
 import {
     ChunkUploadProtocolError,
     ChunkUploadSessionStore,
     PostgresChunkUploadSessionRepository,
+    verifyChunkIntegrity,
     type ChunkUploadSession,
 } from '../services/chunkUploadSessions.js';
 
@@ -34,15 +42,29 @@ const GLOBAL_BUDGET_BYTES = Math.max(MAX_TOTAL_BYTES, (parseInt(process.env.CHUN
 const DISK_RESERVE_BYTES = Math.max(1024 ** 3, (parseInt(process.env.CHUNK_DISK_RESERVE_GB || '8', 10) || 8) * 1024 ** 3);
 const MAX_TOTAL_CHUNKS = Math.max(1, parseInt(process.env.MAX_TOTAL_CHUNKS || '50000', 10) || 50000);
 const SESSION_TTL_MS = Math.max(60 * 60 * 1000, parseInt(process.env.CHUNK_SESSION_TTL_MS || String(24 * 60 * 60 * 1000), 10));
+const COMPLETION_LEASE_MS = Math.max(60_000, parseInt(process.env.CHUNK_COMPLETION_LEASE_MS || String(30 * 60 * 1000), 10));
 
 [UPLOAD_DIR, THUMBNAIL_DIR, CHUNK_DIR].forEach(dir => fs.mkdirSync(dir, { recursive: true }));
 
-const chunkStore = new ChunkUploadSessionStore(new PostgresChunkUploadSessionRepository(pool), {
+const chunkRepository = new PostgresChunkUploadSessionRepository(pool);
+const chunkStore = new ChunkUploadSessionStore(chunkRepository, {
     maxTotalBytes: MAX_TOTAL_BYTES,
     globalBudgetBytes: GLOBAL_BUDGET_BYTES,
     diskReserveBytes: DISK_RESERVE_BYTES,
     getDiskFreeBytes: async () => (await checkDiskSpace(path.resolve(CHUNK_DIR))).free,
 });
+const runChunkMaintenance = async () => {
+    const expiredIds = await chunkRepository.deleteExpiredSessions(100);
+    await Promise.all(expiredIds.map(uploadId =>
+        fsPromises.rm(path.join(CHUNK_DIR, uploadId), { recursive: true, force: true })
+            .catch(error => console.error(`清理过期分块目录失败: ${uploadId}`, error)),
+    ));
+    await chunkRepository.recoverExpiredCompletions(100);
+};
+const completionRecoveryTimer = setInterval(() => {
+    void runChunkMaintenance().catch(error => console.error('分块上传维护失败:', error));
+}, Math.max(60_000, Math.floor(COMPLETION_LEASE_MS / 2)));
+completionRecoveryTimer.unref?.();
 
 router.use(rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -98,9 +120,9 @@ function sendProtocolError(res: Response, error: unknown): Response {
 router.post('/init', async (req: Request, res: Response) => {
     let uploadDirectory = '';
     try {
-        const { filename, totalChunks, mimeType, totalSize, folder } = req.body;
-        const chunks = Number(totalChunks);
+        const { filename, mimeType, totalSize, folder } = req.body;
         const bytes = Number(totalSize);
+        const chunks = Math.ceil(bytes / MAX_CHUNK_BYTES);
         if (typeof filename !== 'string' || !filename.trim() || typeof mimeType !== 'string') {
             return res.status(400).json({ error: '缺少必要参数' });
         }
@@ -123,6 +145,7 @@ router.post('/init', async (req: Request, res: Response) => {
             targetAccountId: target.accountId,
             expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
             completionToken: null,
+            completionExpiresAt: null,
             completedFileId: null,
             lastError: null,
             createdAt: now,
@@ -131,7 +154,13 @@ router.post('/init', async (req: Request, res: Response) => {
         uploadDirectory = path.join(CHUNK_DIR, session.uploadId);
         await fsPromises.mkdir(uploadDirectory, { recursive: true });
         await chunkStore.reserve(session);
-        res.json({ success: true, uploadId: session.uploadId, expiresAt: session.expiresAt.toISOString() });
+        res.json({
+            success: true,
+            uploadId: session.uploadId,
+            expiresAt: session.expiresAt.toISOString(),
+            maxChunkBytes: MAX_CHUNK_BYTES,
+            totalChunks: chunks,
+        });
     } catch (error) {
         if (uploadDirectory) await fsPromises.rm(uploadDirectory, { recursive: true, force: true }).catch(() => undefined);
         sendProtocolError(res, error);
@@ -184,11 +213,10 @@ async function mergeChunks(uploadId: string, chunks: Awaited<ReturnType<typeof c
         if (chunks.length === 0) throw new Error('分块不完整');
         for (let index = 0; index < chunks.length; index++) {
             const chunk = chunks[index];
-            const expectedPath = path.resolve(safeChunkPath(uploadId, index));
-            if (chunk.index !== index || path.resolve(chunk.path) !== expectedPath) throw new Error(`分块 ${index} 元数据无效`);
-            const stat = await fsPromises.stat(expectedPath);
-            if (stat.size !== chunk.size || stat.size < 1 || stat.size > MAX_CHUNK_BYTES) throw new Error(`分块 ${index} 大小无效`);
-            await pipeline(fs.createReadStream(expectedPath), output, { end: false });
+            const expectedDirectory = path.dirname(path.resolve(safeChunkPath(uploadId, index)));
+            if (chunk.index !== index) throw new Error(`分块 ${index} 元数据无效`);
+            const verifiedPath = await verifyChunkIntegrity(chunk, expectedDirectory, MAX_CHUNK_BYTES);
+            await pipeline(fs.createReadStream(verifiedPath), output, { end: false });
         }
         await new Promise<void>((resolve, reject) => { output.end(resolve); output.on('error', reject); });
         const stat = await fsPromises.stat(temporary);
@@ -206,6 +234,9 @@ router.post('/complete', async (req: Request, res: Response) => {
     let owner = '';
     let token = '';
     let tempMergedPath = '';
+    let storageLease: StorageAccountOperationLease | null = null;
+    let completionHeartbeat: ReturnType<typeof setInterval> | null = null;
+    let completionLeaseError: unknown = null;
     try {
         owner = ownerId(req);
         const current = await chunkStore.status(uploadId, owner);
@@ -233,10 +264,17 @@ router.post('/complete', async (req: Request, res: Response) => {
             return res.status(409).json({ error: '上次完成失败，请先重试上传会话', retryable: true, lastError: current.lastError });
         }
         token = crypto.randomUUID();
-        const claim = await chunkStore.claimCompletion(uploadId, owner, token);
+        const claim = await chunkStore.claimCompletion(uploadId, owner, token, new Date(Date.now() + COMPLETION_LEASE_MS));
         if (!claim) return res.status(409).json({ error: '上传未完整、已由其他请求处理或状态不可完成' });
+        completionHeartbeat = setInterval(() => {
+            void chunkStore.renewCompletion(uploadId, owner, token, new Date(Date.now() + COMPLETION_LEASE_MS))
+                .then(renewed => { if (!renewed) completionLeaseError = new Error('完成租约已失效'); })
+                .catch(error => { completionLeaseError = error; });
+        }, Math.max(30_000, Math.floor(COMPLETION_LEASE_MS / 3)));
+        completionHeartbeat.unref?.();
 
         const session = claim.session;
+        storageLease = await acquireStorageAccountOperationLease(pool, session.targetAccountId, 'chunk_completion');
         const target = storageManager.getTarget(session.targetProvider, session.targetAccountId);
         await assertStorageTargetWritable(target);
         const storageFolder = buildStorageFolderWithRules({
@@ -284,30 +322,68 @@ router.post('/complete', async (req: Request, res: Response) => {
         }
 
         const type = getFileType(session.mimeType);
-        let indexed: Awaited<ReturnType<typeof query>> | undefined;
-        const storedPath = await saveAndIndexWithCompensation(target.provider, tempMergedPath, storedName, session.mimeType, storageFolder, async savedPath => {
-            indexed = await query(
+        const operationId = await beginChunkCompletionReconciliation(pool, {
+            uploadId,
+            completionToken: token,
+            provider: target.provider.name,
+            accountId: session.targetAccountId,
+        });
+        let storedPath = '';
+        let file: any = null;
+        const compensateAfterSideEffectFailure = async (reason: unknown) => {
+            if (!storedPath) {
+                await updateChunkReconciliationAfterCompensation(pool, operationId, {
+                    objectState: 'unknown', indexState: 'deleted',
+                    reason: `provider 保存结果不确定: ${reason instanceof Error ? reason.message : String(reason)}`,
+                });
+                throw new Error(`分块完成保存结果不确定，需要人工对账: operation=${operationId}`, { cause: reason });
+            }
+            const outcome = await compensateChunkCompletionFailure({
+                uploadId,
+                completionToken: token,
+                provider: target.provider.name,
+                accountId: session.targetAccountId,
+                storedPath,
+                fileId: file ? String(file.id) : '',
+                deleteObject: () => target.provider.deleteFile(storedPath),
+                deleteIndex: async () => !file || (await query('DELETE FROM files WHERE id = $1', [file.id])).rowCount === 1,
+                persist: evidence => updateChunkReconciliationAfterCompensation(pool, operationId, evidence),
+                initialIndexState: file ? 'present' : 'deleted',
+            });
+            if (!outcome.reconciled) {
+                throw new Error(`分块完成补偿结果不确定，需要人工对账: operation=${outcome.operationId}`, { cause: reason });
+            }
+        };
+        try {
+            storedPath = await target.provider.saveFile(tempMergedPath, storedName, session.mimeType, storageFolder);
+            await markChunkReconciliationObjectPresent(pool, operationId, storedPath);
+            const indexed = await query(
                 `INSERT INTO files
                  (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                  RETURNING id, created_at, name, type, size, source`,
-                [session.filename, storedName, type, session.mimeType, session.totalSize, savedPath, thumbnailPath, previewPath,
+                [session.filename, storedName, type, session.mimeType, session.totalSize, storedPath, thumbnailPath, previewPath,
                     width, height, target.provider.name, storageFolder, session.targetAccountId],
             );
-        });
-        const file = indexed!.rows[0];
+            file = indexed.rows[0];
+            await markChunkReconciliationIndexPresent(pool, operationId, String(file.id));
+        } catch (sideEffectError) {
+            await compensateAfterSideEffectFailure(sideEffectError);
+            throw sideEffectError;
+        }
+        const compensateAfterCompletionFailure = compensateAfterSideEffectFailure;
         let completed = false;
         try {
-            completed = await chunkStore.complete(uploadId, owner, token, file.id);
+            if (completionLeaseError) throw completionLeaseError;
+            completed = await chunkStore.completeWithReconciliation(uploadId, owner, token, file.id, operationId);
         } catch (completionError) {
-            await target.provider.deleteFile(storedPath).catch(error => console.error('完成 CAS 异常后删除存储对象失败:', error));
-            await query('DELETE FROM files WHERE id = $1', [file.id]).catch(error => console.error('完成 CAS 异常后删除文件索引失败:', error));
+            await compensateAfterCompletionFailure(completionError);
             throw completionError;
         }
         if (!completed) {
-            await target.provider.deleteFile(storedPath).catch(error => console.error('完成 CAS 失败后删除存储对象失败:', error));
-            await query('DELETE FROM files WHERE id = $1', [file.id]).catch(error => console.error('完成 CAS 失败后删除文件索引失败:', error));
-            throw new Error('永久文件已保存，但完成租约失效');
+            const completionError = new Error('永久文件已保存，但完成租约失效');
+            await compensateAfterCompletionFailure(completionError);
+            throw completionError;
         }
         await fsPromises.rm(tempMergedPath, { force: true }).catch(error => console.error('清理合并临时文件失败:', error));
         await fsPromises.rm(path.join(CHUNK_DIR, uploadId), { recursive: true, force: true })
@@ -335,6 +411,9 @@ router.post('/complete', async (req: Request, res: Response) => {
         if (tempMergedPath) await fsPromises.rm(tempMergedPath, { force: true }).catch(() => undefined);
         if (isStorageCooldownError(error)) return sendStorageCooldownHttpError(res, error);
         sendProtocolError(res, error);
+    } finally {
+        if (completionHeartbeat) clearInterval(completionHeartbeat);
+        await storageLease?.release();
     }
 });
 

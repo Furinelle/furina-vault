@@ -104,6 +104,8 @@ chmod +x deploy/backup.sh deploy/restore-verify.sh
 BACKUP_DIR=./backups ./deploy/backup.sh
 ```
 
+脚本会先按“文件卷未压缩大小 + PostgreSQL 数据库大小 + 512 MiB 安全余量”保守检查备份目标可用空间；空间不足时会在停止 backend 前直接退出。通过预检后，脚本会在 `pg_dump` 与 `/data` 归档的整个窗口内停止 backend（完成后或失败退出时自动恢复），从而阻止 Web/chunk 上传、删除和 Telegram 后台写入跨越两个快照。manifest 必须包含 `consistency=backend-stopped`，且校验和使用备份目录内 basename，供恢复验证器直接校验。备份窗口内 API 会暂时不可用，请安排维护时段。
+
 备份目录可能包含敏感凭证材料，应加密后异地保存并限制访问。恢复前在隔离环境执行：
 
 ```bash

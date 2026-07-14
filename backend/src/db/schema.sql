@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS chunk_upload_sessions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE chunk_upload_sessions ADD COLUMN IF NOT EXISTS completion_expires_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_chunk_upload_sessions_owner ON chunk_upload_sessions(owner_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chunk_upload_sessions_budget ON chunk_upload_sessions(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_chunk_upload_sessions_completion_lease ON chunk_upload_sessions(status, completion_expires_at);
@@ -180,6 +181,31 @@ CREATE TABLE IF NOT EXISTS chunk_upload_chunks (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (upload_id, chunk_index)
 );
+
+-- 永久对象/文件索引补偿出现不确定结果时的持久对账证据。
+CREATE TABLE IF NOT EXISTS chunk_upload_reconciliations (
+    operation_id UUID PRIMARY KEY,
+    upload_id UUID NOT NULL REFERENCES chunk_upload_sessions(upload_id) ON DELETE CASCADE,
+    completion_token UUID NOT NULL,
+    provider VARCHAR(50) NOT NULL,
+    account_id UUID REFERENCES storage_accounts(id) ON DELETE SET NULL,
+    stored_path VARCHAR(2000),
+    file_id UUID,
+    object_state VARCHAR(20) NOT NULL CHECK (object_state IN ('unknown', 'present', 'deleted')),
+    index_state VARCHAR(20) NOT NULL CHECK (index_state IN ('unknown', 'present', 'deleted')),
+    reason TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+    resolved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE chunk_upload_reconciliations ALTER COLUMN stored_path DROP NOT NULL;
+ALTER TABLE chunk_upload_reconciliations ALTER COLUMN file_id DROP NOT NULL;
+ALTER TABLE chunk_upload_reconciliations DROP CONSTRAINT IF EXISTS chunk_upload_reconciliations_upload_id_fkey;
+ALTER TABLE chunk_upload_reconciliations ADD CONSTRAINT chunk_upload_reconciliations_upload_id_fkey
+    FOREIGN KEY (upload_id) REFERENCES chunk_upload_sessions(upload_id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_chunk_upload_reconciliations_pending
+    ON chunk_upload_reconciliations(status, created_at);
 
 CREATE OR REPLACE TRIGGER chunk_upload_sessions_updated_at
     BEFORE UPDATE ON chunk_upload_sessions

@@ -4,7 +4,7 @@ import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
-import { query } from '../db/index.js';
+import { pool, query } from '../db/index.js';
 import { validateApiKey, requireApiKeyPermission } from '../middleware/apiKey.js';
 import { generateThumbnail, getImageDimensions, generateMediaPreview } from '../utils/thumbnail.js';
 import { storageManager } from '../services/storage.js';
@@ -15,6 +15,7 @@ import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/stora
 import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 import { saveAndIndexWithCompensation } from '../services/storageWrite.js';
 import { rateLimit } from 'express-rate-limit';
+import { acquireStorageAccountOperationLease, type StorageAccountOperationLease } from '../services/storageAccountOperation.js';
 
 const router = Router();
 export const apiRouter = Router();
@@ -87,6 +88,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     const mimeType = file.mimetype;
     const size = file.size;
     const tempPath = path.resolve(file.path);
+    let storageLease: StorageAccountOperationLease | null = null;
 
     const target = storageManager.getActiveTarget();
     const { provider, accountId: activeAccountId } = target;
@@ -99,6 +101,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     console.log(`[Upload] 🏠 Local temp path: ${tempPath}`);
 
     try {
+        storageLease = await acquireStorageAccountOperationLease(pool, activeAccountId, 'web_upload');
         // 1. 使用请求开始时捕获的不可变存储目标
         await assertStorageTargetWritable(target);
         console.log(`[Upload] 🛠️  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || 'none (local)'}`);
@@ -213,6 +216,8 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             return sendStorageCooldownHttpError(res, error);
         }
         res.status(500).json({ error: '文件上传失败' });
+    } finally {
+        await storageLease?.release();
     }
 };
 

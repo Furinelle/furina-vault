@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import os from 'os';
-import { query } from '../db/index.js';
+import { query, pool } from '../db/index.js';
 import { storageManager, isStorageQuotaCooldownError } from './storage.js';
 import { assertActiveStorageWritable, formatStorageCooldownNotice } from './storageCooldownGuard.js';
 import { markStorageAccountCooldown } from './storageCooldown.js';
@@ -13,6 +13,7 @@ import { getUniqueStoredName } from '../utils/fileUtils.js';
 import { buildStorageFolderWithRules, getStoragePathRules } from '../utils/storagePath.js';
 import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 import { saveAndIndexWithCompensation } from './storageWrite.js';
+import { withStorageAccountOperationLease } from './storageAccountOperation.js';
 
 type YtDlpTaskStatus = 'pending' | 'active' | 'success' | 'failed';
 
@@ -173,12 +174,14 @@ async function uploadDownloadedFile(localFilePath: string, originalFileName: str
         }
     }
 
-    const finalPath = await saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, folder, async savedPath => {
-        await query(`
-            INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        `, [safeName, storedName, fileType, mimeType, size, savedPath, thumbnailPath, dimensions.width, dimensions.height, provider.name, folder, activeAccountId]);
-    });
+    const finalPath = await withStorageAccountOperationLease(pool, activeAccountId, 'ytdlp_upload', () =>
+        saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, folder, async savedPath => {
+            await query(`
+                INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            `, [safeName, storedName, fileType, mimeType, size, savedPath, thumbnailPath, dimensions.width, dimensions.height, provider.name, folder, activeAccountId]);
+        }),
+    );
     try {
         if (fs.existsSync(localFilePath)) await fs.promises.unlink(localFilePath);
     } catch {

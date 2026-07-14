@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import bigInt from 'big-integer';
-import { query } from '../db/index.js';
+import { query, pool } from '../db/index.js';
 import { generateThumbnail, getImageDimensions } from '../utils/thumbnail.js';
 import { storageManager, StorageQuotaCooldownError, isStorageQuotaCooldownError, type StorageTargetSnapshot } from './storage.js';
 import { TaskAbortRegistry } from './taskAbortRegistry.js';
@@ -42,6 +42,7 @@ import { resolveTelegramStorageFolder, resolveTelegramBatchStorageFolder, resolv
 import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js';
 import { DownloadTaskQueue } from './downloadTaskQueue.js';
 import { saveAndIndexWithCompensation, compensateIndexedWriteAfterCancel } from './storageWrite.js';
+import { withStorageAccountOperationLease } from './storageAccountOperation.js';
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './data/uploads';
 const DEFAULT_TELEGRAM_DOWNLOAD_WORKERS = Math.max(1, Math.min(16, parseInt(process.env.TELEGRAM_DOWNLOAD_WORKERS || '4', 10) || 4));
@@ -88,6 +89,35 @@ export interface TelegramDownloadMessageRef {
     groupIndex?: number;
     groupSize?: number;
     leaseToken?: string;
+}
+
+export interface TelegramPersistedWrite {
+    savedPath: string;
+    fileId: string;
+}
+
+export async function runLeaseProtectedTelegramSave<T extends TelegramPersistedWrite>(
+    withLease: (operation: () => Promise<T>) => Promise<T>,
+    save: () => Promise<T>,
+    compensate: (persisted: T) => Promise<{ status: 'compensated' | 'reconciliation-required'; error?: string }>,
+    validateBeforeSettlement: () => Promise<void> = async () => undefined,
+): Promise<T> {
+    let persisted: T | undefined;
+    try {
+        return await withLease(async () => {
+            persisted = await save();
+            await validateBeforeSettlement();
+            return persisted;
+        });
+    } catch (error) {
+        if (persisted) {
+            const compensation = await compensate(persisted);
+            if (compensation.status !== 'compensated') {
+                throw new Error(`Telegram lease 丢失后需要人工对账: ${compensation.error || '补偿失败'}`, { cause: error });
+            }
+        }
+        throw error;
+    }
 }
 
 interface DownloadableMessageRef {
@@ -1153,6 +1183,11 @@ export function releaseChannelTaskAbortSignal(jobId: string, signal: AbortSignal
     if (controller?.signal === signal) channelTaskAbortRegistry.release(jobId, controller);
 }
 
+export function abortChannelExecutionForLeaseLoss(jobId: string): void {
+    channelTaskAbortRegistry.cancel(jobId, 'Telegram 下载 lease 已丢失');
+    downloadQueue.cancelGroup(channelExecutionGroupId(jobId), {}, 'Telegram 下载 lease 已丢失', true);
+}
+
 export function cancelChannelExecutionGroup(jobId: string) {
     channelTaskAbortRegistry.cancel(jobId, '用户取消频道任务');
     return downloadQueue.cancelGroup(channelExecutionGroupId(jobId), {}, '用户取消频道任务', true);
@@ -1264,6 +1299,8 @@ interface FileUploadItem {
     groupSize?: number;
     forwardedSourceCache?: ForwardedSourceMessageCache;
     storageTarget?: StorageTargetSnapshot;
+    leaseSettled?: boolean;
+    withLease?: <T>(operation: () => Promise<T>) => Promise<T>;
 }
 
 interface MediaGroupQueue {
@@ -1586,18 +1623,51 @@ async function processFileUpload(
                     { allowUserPauseForActiveWorker: true },
                 );
                 if (permissionBeforeStore === 'cancelled' || signal?.aborted) throw new Error('下载任务已停止');
-                finalPath = await saveAndIndexWithCompensation(provider, localFilePath!, storedName, file.mimeType, storageFolder, async savedPath => {
-                    const inserted = await query(`
-                        INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                        RETURNING id
-                    `, [file.fileName, storedName, fileType, file.mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
-                    indexedFileId = String(inserted.rows[0].id);
-                });
+                const save = async (): Promise<TelegramPersistedWrite> => {
+                    finalPath = await saveAndIndexWithCompensation(provider, localFilePath!, storedName!, file.mimeType, storageFolder, async savedPath => {
+                        const inserted = await query(`
+                            INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                            RETURNING id
+                        `, [file.fileName, storedName, fileType, file.mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+                        indexedFileId = String(inserted.rows[0].id);
+                    });
+                    if (!indexedFileId) throw new Error('Telegram 文件保存后缺少索引 ID');
+                    return { savedPath: finalPath, fileId: indexedFileId };
+                };
+                const leasedSave = () => withStorageAccountOperationLease(pool, activeAccountId, 'telegram_upload', save);
+                if (file.withLease) {
+                    const persisted = await runLeaseProtectedTelegramSave(
+                        file.withLease,
+                        leasedSave,
+                        saved => compensateIndexedWriteAfterCancel({
+                            fileId: saved.fileId,
+                            savedPath: saved.savedPath,
+                            deleteIndex: async fileId => (await query('DELETE FROM files WHERE id = $1', [fileId])).rowCount === 1,
+                            deleteObject: savedPath => provider.deleteFile(savedPath),
+                        }),
+                        async () => {
+                            if (signal?.aborted) throw new Error('下载任务已停止');
+                            const state = await waitForChannelExecutionPermission(
+                                getExecutionControlState,
+                                signal || new AbortController().signal,
+                                { allowUserPauseForActiveWorker: true },
+                            );
+                            if (state === 'cancelled') throw new Error('下载任务已停止');
+                        },
+                    );
+                    finalPath = persisted.savedPath;
+                    indexedFileId = persisted.fileId;
+                    file.leaseSettled = true;
+                } else {
+                    await leasedSave();
+                }
                 if (fs.existsSync(localFilePath!)) fs.unlinkSync(localFilePath!);
                 localFilePath = undefined;
 
-                if (signal?.aborted) {
+                // Durable child-lease saves validate cancellation before success settlement. Once
+                // settled, late AbortSignal delivery must not delete a file whose child is success.
+                if (signal?.aborted && !file.leaseSettled) {
                     const compensation = indexedFileId
                         ? await compensateIndexedWriteAfterCancel({
                             fileId: indexedFileId,
@@ -1624,6 +1694,7 @@ async function processFileUpload(
             });
 
         } catch (error) {
+            if ((error as Error)?.name === 'TelegramDownloadLeaseLostError') throw error;
             console.error('🤖 文件上传失败:', error);
             if (isStorageQuotaCooldownError(error)) {
                 await markStorageAccountCooldown(error.storageAccountId || file.storageTarget?.accountId, error.provider, error.reason, error.cooldownUntil, error.message);
@@ -2029,6 +2100,7 @@ export async function downloadTelegramChannelRange(
     taskSignal?: AbortSignal,
     ownerUserId?: number,
     storageTarget: StorageTargetSnapshot = storageManager.getActiveTarget(),
+    withItemLease?: <T>(ref: TelegramDownloadMessageRef, operation: () => Promise<T>) => Promise<T>,
 ): Promise<{ requested: number; found: number; skipped: number; failed: number; successful: number; successfulMessageIds: number[]; failedMessageIds: number[]; skippedMessageIds: number[]; firstId: number; lastId: number }> {
     const userClient = getTelegramUserClient();
     if (!userClient || !isTelegramUserClientReady()) {
@@ -2276,6 +2348,7 @@ export async function downloadTelegramChannelRange(
                 groupIndex: item.groupIndex,
                 groupSize: item.groupSize,
                 storageTarget,
+                withLease: withItemLease ? operation => withItemLease(item.persistentRef, operation) : undefined,
             };
             try {
                 if (taskResolvedStorageFolder !== undefined) {
@@ -2299,7 +2372,7 @@ export async function downloadTelegramChannelRange(
                 if (uploadItem.status === 'success') {
                     successful += 1;
                     successfulMessageIds.push(item.id);
-                    await onItemSettled?.(item.persistentRef, 'success');
+                    if (!uploadItem.leaseSettled) await onItemSettled?.(item.persistentRef, 'success');
                 } else if (uploadItem.storageCooldownUntil) {
                     throw new StorageQuotaCooldownError(uploadItem.error || 'Google Drive 今日上传额度已达上限，任务将自动暂停 24 小时后继续。', {
                         provider: 'google_drive',
@@ -2313,6 +2386,7 @@ export async function downloadTelegramChannelRange(
                     await onItemSettled?.(item.persistentRef, 'failed', uploadItem.error || '下载失败');
                 }
             } catch (err) {
+                if ((err as Error)?.name === 'TelegramDownloadLeaseLostError') throw err;
                 if (isStorageQuotaCooldownError(err)) {
                     throw err;
                 }
@@ -2653,14 +2727,16 @@ export async function handleFileUpload(client: TelegramClient, event: NewMessage
 
                 if (signal?.aborted) throw new Error('下载任务已停止');
                 try {
-                    finalPath = await saveAndIndexWithCompensation(provider, localFilePath, storedName, mimeType, storageFolder, async savedPath => {
-                        const inserted = await query(`
-                            INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                            RETURNING id
-                        `, [finalFileName, storedName, fileType, mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
-                        indexedFileId = String(inserted.rows[0].id);
-                    });
+                    finalPath = await withStorageAccountOperationLease(pool, activeAccountId, 'telegram_upload', () =>
+                        saveAndIndexWithCompensation(provider, localFilePath!, storedName, mimeType, storageFolder, async savedPath => {
+                            const inserted = await query(`
+                                INSERT INTO files (name, stored_name, type, mime_type, size, path, thumbnail_path, width, height, source, folder, storage_account_id)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                RETURNING id
+                            `, [finalFileName, storedName, fileType, mimeType, actualSize, savedPath, thumbnailPath, dimensions.width, dimensions.height, sourceRef, storageFolder, activeAccountId]);
+                            indexedFileId = String(inserted.rows[0].id);
+                        }),
+                    );
                     if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
                     lastLocalPath = undefined;
                     localFilePath = undefined;
