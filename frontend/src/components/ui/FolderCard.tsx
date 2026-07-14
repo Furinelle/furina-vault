@@ -13,6 +13,7 @@ export interface FolderData {
     fileCount: number;
     coverFile?: FileData; // 用于显示缩略图的文件（第一个有缩略图的文件）
     latestDate?: string;
+    isFavorite?: boolean;
 }
 
 const getFileTypeIcon = (type: FileData["type"]) => {
@@ -63,7 +64,7 @@ export const FolderCard = ({
         return acc;
     }, {} as Record<string, number>);
 
-    const isFavorite = folder.files.length > 0 && folder.files.every(f => !!f.is_favorite);
+    const isFavorite = folder.isFavorite ?? (folder.files.length > 0 && folder.files.every(f => !!f.is_favorite));
 
     const handleCardClick = () => {
         if (isSelectionMode) {

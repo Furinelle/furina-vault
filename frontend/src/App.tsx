@@ -22,6 +22,7 @@ import { authService } from "./services/auth";
 import type { QueueItem } from "./components/ui/UploadQueueModal";
 import { LatestRequest } from "./services/latestRequest";
 import { BoundedUploadQueue } from "./services/boundedUploadQueue";
+import { buildFolderViewModels, isFileViewEmpty } from "./services/folderView";
 
 const SettingsPage = lazy(() => import("./components/pages/SettingsPage").then(module => ({ default: module.SettingsPage })));
 const PreviewModal = lazy(() => import("./components/ui/PreviewModal").then(module => ({ default: module.PreviewModal })));
@@ -367,6 +368,9 @@ function App() {
         setFiles(prev => prev.map(file =>
           file.folder === folderName ? { ...file, is_favorite: result.isFavorite } : file
         ));
+        setFolderAggregations(prev => prev.map(folder =>
+          folder.name === folderName ? { ...folder, isFavorite: result.isFavorite } : folder
+        ));
         setNotification({
           show: true,
           message: result.isFavorite ? '已添加到收藏' : '已取消收藏',
@@ -643,6 +647,9 @@ function App() {
     try {
       await fileApi.renameFolder(renamingFolder, newName);
       setFiles(prev => prev.map(f => f.folder === renamingFolder ? { ...f, folder: newName } : f));
+      setFolderAggregations(prev => prev.map(folder =>
+        folder.name === renamingFolder ? { ...folder, name: newName } : folder
+      ));
       if (currentFolder === renamingFolder) {
         setCurrentFolder(newName);
       }
@@ -699,57 +706,11 @@ function App() {
     });
   }, [files, currentCategory, searchQuery]);
 
-  // 按文件夹分组文件，生成文件夹列表
+  // 根目录文件分页只返回散文件；文件夹卡片必须使用服务端聚合结果。
   const folders = useMemo(() => {
-    if (currentCategory === 'ytdlp') {
-      return [];
-    }
-    const folderMap = new Map<string, FileData[]>();
-
-    // 只处理有文件夹的文件
-    filteredFiles.forEach(file => {
-      if (file.folder) {
-        if (!folderMap.has(file.folder)) {
-          folderMap.set(file.folder, []);
-        }
-        folderMap.get(file.folder)!.push(file);
-      }
-    });
-
-    // 生成 FolderData 数组
-    const result: FolderData[] = [];
-    folderMap.forEach((files, name) => {
-      // 排除占位文件进行统计和封面展示
-      const realFiles = files.filter(f => f.name !== '.folder');
-      
-      // 找到第一个有缩略图的文件作为封面
-      const coverFile = realFiles.find(f => f.thumbnailUrl || f.type === 'image' || f.type === 'video') || realFiles[0];
-
-      result.push({
-        name,
-        files,
-        fileCount: realFiles.length,
-        coverFile,
-        latestDate: files.reduce((latest, file) => {
-          return !latest || new Date(file.created_at) > new Date(latest) ? file.created_at : latest;
-        }, '')
-      });
-    });
-
-    // 排序逻辑
-    return result.sort((a, b) => {
-      let comparison = 0;
-      if (sortConfig.key === 'name') {
-        comparison = a.name.localeCompare(b.name, 'zh-CN');
-      } else {
-        // 文件夹日期排序使用其中最新文件的日期
-        const dateA = a.latestDate ? new Date(a.latestDate).getTime() : 0;
-        const dateB = b.latestDate ? new Date(b.latestDate).getTime() : 0;
-        comparison = dateA - dateB;
-      }
-      return sortConfig.direction === 'asc' ? comparison : -comparison;
-    });
-  }, [filteredFiles, sortConfig]);
+    if (currentCategory === 'ytdlp' || currentFolder !== null) return [];
+    return buildFolderViewModels(folderAggregations, sortConfig) as FolderData[];
+  }, [currentCategory, currentFolder, folderAggregations, sortConfig]);
 
   const visibleFolders = useMemo(() => {
     if (isFoldersExpanded) return folders;
@@ -797,7 +758,10 @@ function App() {
     });
   }, [currentFolder, displayFiles, folders, looseFiles]);
 
-  const allFolderNames = useMemo(() => Array.from(new Set(files.filter(f => f.folder).map(f => f.folder!))), [files]);
+  const allFolderNames = useMemo(() => Array.from(new Set([
+    ...folderAggregations.map(folder => folder.name),
+    ...files.filter(f => f.folder).map(f => f.folder!),
+  ])), [files, folderAggregations]);
 
   const handleMoveFile = async (destinationFolder: string | null) => {
     if (!movingFile) return;
@@ -1022,7 +986,7 @@ function App() {
                   <div className="flex items-center justify-center py-20">
                     <RefreshCw className="h-8 w-8 animate-spin text-muted-foreground" />
                   </div>
-                ) : filteredFiles.length === 0 ? (
+                ) : isFileViewEmpty(filteredFiles, folders) ? (
                   <EmptyState />
                 ) : currentFolder ? (
                   /* 文件夹内容视图 */
