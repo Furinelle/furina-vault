@@ -75,6 +75,8 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
         googleDriveRedirectUri?: string;
         telegramUserDownloadEnabled?: boolean;
         telegramUserSessionReady?: boolean;
+        telegramAllowedUserIds?: number[];
+        telegramAllowedUserIdsFromEnv?: boolean;
     } | null>(null);
     const [isSaving, setIsSaving] = useState(false);
     const [showOneDriveForm, setShowOneDriveForm] = useState(false);
@@ -128,6 +130,8 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
 
     // Telegram User Download State
     const [showTelegramUserDownload, setShowTelegramUserDownload] = useState(false);
+    const [telegramAllowedUserIdsInput, setTelegramAllowedUserIdsInput] = useState("");
+    const [isSavingTelegramAllowedUsers, setIsSavingTelegramAllowedUsers] = useState(false);
     const [cleanupRetentionDays, setCleanupRetentionDays] = useState(7);
     const [isCleaningDownloadItems, setIsCleaningDownloadItems] = useState(false);
 
@@ -145,10 +149,26 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
         }
     };
 
+    const handleSaveTelegramAllowedUsers = async () => {
+        if (isSavingTelegramAllowedUsers) return;
+        setIsSavingTelegramAllowedUsers(true);
+        try {
+            const result = await fileApi.setTelegramAllowedUserIds(telegramAllowedUserIdsInput);
+            setTelegramAllowedUserIdsInput(result.userIds.join(', '));
+            await reloadStorageConfig();
+            alert('Telegram 允许用户列表已保存');
+        } catch (error: any) {
+            alert(error.message || '更新 Telegram 允许用户列表失败');
+        } finally {
+            setIsSavingTelegramAllowedUsers(false);
+        }
+    };
+
     const reloadStorageConfig = async () => {
         const data = await fileApi.getStorageConfig();
         setConfig(data);
         setShowTelegramUserDownload(!!data.telegramUserDownloadEnabled);
+        setTelegramAllowedUserIdsInput((data.telegramAllowedUserIds || []).join(', '));
         return data;
     };
 
@@ -702,6 +722,56 @@ export const SettingsPage = ({ storageStats }: SettingsPageProps) => {
             </SettingsSection>
 
             {/* Telegram Download Section */}
+            <SettingsSection title="Telegram Bot 设置">
+                <div className="p-4 bg-muted/20 border-b border-border/50">
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-start gap-3">
+                            <div className="p-2 rounded-lg bg-muted text-muted-foreground">
+                                <ShieldCheck className="h-4 w-4" />
+                            </div>
+                            <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-sm font-medium">允许使用 Bot 的 Telegram 用户</span>
+                                    {config?.telegramAllowedUserIdsFromEnv ? (
+                                        <span className="px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 text-[11px] font-semibold">由环境变量管理</span>
+                                    ) : config?.telegramAllowedUserIds?.length ? (
+                                        <span className="px-2 py-0.5 rounded-full bg-green-500/10 text-green-600 dark:text-green-400 text-[11px] font-semibold">已配置 {config.telegramAllowedUserIds.length} 个</span>
+                                    ) : (
+                                        <span className="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-400 text-[11px] font-semibold">未配置</span>
+                                    )}
+                                </div>
+                                <p className="text-xs text-muted-foreground mt-1">
+                                    输入允许通过 Telegram Bot PIN 登录的 user id，多个用英文逗号、空格或换行分隔。空列表会拒绝所有用户；首次无人认证时，首个正确输入 PIN 的用户会自动加入。
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div className="p-4 space-y-3">
+                    <textarea
+                        value={telegramAllowedUserIdsInput}
+                        onChange={(event) => setTelegramAllowedUserIdsInput(event.target.value)}
+                        disabled={!!config?.telegramAllowedUserIdsFromEnv || isSavingTelegramAllowedUsers}
+                        rows={3}
+                        placeholder="例如：123456789, 987654321"
+                        className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary disabled:bg-muted/40 disabled:text-muted-foreground"
+                    />
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <p className="text-xs text-muted-foreground">
+                            获取 user id：让用户在 Telegram 私聊 <code className="px-1 py-0.5 rounded bg-muted">@userinfobot</code> 查看 Id。
+                            {config?.telegramAllowedUserIdsFromEnv ? ' 当前后端设置了 TELEGRAM_ALLOWED_USER_IDS，请修改 .env 并重启后端。' : ''}
+                        </p>
+                        <Button
+                            size="sm"
+                            onClick={handleSaveTelegramAllowedUsers}
+                            disabled={!!config?.telegramAllowedUserIdsFromEnv || isSavingTelegramAllowedUsers || !telegramAllowedUserIdsInput.trim()}
+                        >
+                            {isSavingTelegramAllowedUsers ? '保存中...' : '保存允许列表'}
+                        </Button>
+                    </div>
+                </div>
+            </SettingsSection>
+
             <SettingsSection title="Telegram 下载设置">
                 <div className="p-4 bg-muted/20 border-b border-border/50">
                     <div className="flex items-center justify-between gap-4">
