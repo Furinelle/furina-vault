@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 import {
     heartbeatTelegramDownloadRefsWithQuery,
@@ -10,6 +11,16 @@ import {
 import { runLeaseProtectedTelegramSave } from './telegramUpload.js';
 
 const ref = { id: 42, source: '@source', origin: 'channel' as const, leaseToken: '11111111-1111-1111-1111-111111111111' };
+
+test('claim locks the parent before selecting children and repeats runnable guards on final CAS', () => {
+    const source = fs.readFileSync(new URL('./telegramChannelJobs.ts', import.meta.url), 'utf8');
+    const claim = source.slice(source.indexOf('async function claimPendingDownloadRefs'), source.indexOf('export async function restoreTelegramDownloadRefsWithQuery'));
+    assert.match(claim, /WITH locked_job AS \([\s\S]*FOR UPDATE OF j[\s\S]*\), candidates AS/);
+    assert.match(claim, /JOIN locked_job j ON j\.id = i\.job_id/);
+    assert.match(claim, /UPDATE telegram_download_items i[\s\S]*FROM candidates c, telegram_background_jobs j/);
+    assert.match(claim, /i\.id = c\.id[\s\S]*i\.status = 'pending'[\s\S]*j\.id = i\.job_id[\s\S]*j\.cancelled_at IS NULL[\s\S]*j\.paused_at IS NULL[\s\S]*j\.finished_at IS NULL/);
+    assert.match(claim, /j\.status NOT IN \('cancelled', 'paused', 'cooling'\)/);
+});
 
 test('heartbeat treats a zero-row token update as immediate lease loss', async () => {
     const calls: Array<{ text: string; params?: unknown[] }> = [];
@@ -96,6 +107,26 @@ test('heartbeat skips a lease while its final save and settlement transaction ho
         return 'saved';
     });
     assert.equal(heartbeatQueries, 0);
+});
+
+test('external save completes before the final lease transaction opens', async () => {
+    const calls: string[] = [];
+    const result = await runLeaseProtectedTelegramSave(
+        async operation => {
+            calls.push('lease:begin');
+            const value = await operation();
+            calls.push('lease:commit');
+            return value;
+        },
+        async () => {
+            calls.push('storage:save');
+            return { savedPath: 'remote/object', fileId: 'file-1' };
+        },
+        async () => ({ status: 'compensated' as const }),
+    );
+
+    assert.deepEqual(result, { savedPath: 'remote/object', fileId: 'file-1' });
+    assert.deepEqual(calls, ['storage:save', 'lease:begin', 'lease:commit']);
 });
 
 test('validation failure after save compensates before the lease transaction may settle success', async () => {

@@ -113,11 +113,9 @@ export async function runLeaseProtectedTelegramSave<T extends TelegramPersistedW
 ): Promise<T> {
     let persisted: T | undefined;
     try {
-        return await withLease(async () => {
-            persisted = await save();
-            await validateBeforeSettlement();
-            return persisted;
-        });
+        persisted = await save();
+        await validateBeforeSettlement();
+        return await withLease(async () => persisted!);
     } catch (error) {
         if (persisted) {
             const compensation = await compensate(persisted);

@@ -70,7 +70,7 @@ app.use(cors({
         },
     credentials: !allowAnyOrigin,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'X-API-Key', 'X-Upload-Id', 'X-Chunk-Index', 'X-Chunk-Size', 'X-Chunk-Sha256', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'X-API-Key', 'X-Upload-Id', 'X-Chunk-Index', 'X-Chunk-Size', 'X-Chunk-Sha256', 'X-Confirmation-Token', 'Authorization'],
 }));
 
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '2mb' }));

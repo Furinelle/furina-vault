@@ -906,12 +906,13 @@ function isFloodWait(error: unknown): { seconds: number } | null {
 type TelegramJobControlState = 'run' | 'paused' | 'cancelled' | 'cooldown';
 
 async function putJobIntoStorageCooldown(jobId: string, cooldownUntil: Date, reasonText: string): Promise<void> {
-    await updateJob(jobId, {
-        status: 'cooling',
-        download_status: 'cooling',
-        cooldown_until: cooldownUntil,
-        error: reasonText,
-    });
+    await query(
+        `UPDATE telegram_background_jobs
+         SET status = CASE WHEN paused_at IS NULL THEN 'cooling' ELSE 'paused' END,
+             download_status = 'cooling', cooldown_until = $2, error = $3, updated_at = NOW()
+         WHERE id = $1 AND cancelled_at IS NULL AND finished_at IS NULL`,
+        [jobId, cooldownUntil, reasonText],
+    );
     await query(
         `UPDATE telegram_download_items
          SET status = 'pending', locked_at = NULL, last_error = $2, updated_at = NOW()
@@ -994,18 +995,25 @@ function persistedTelegramFileInfo(row: any): TelegramFileInfo {
 
 async function claimPendingDownloadRefs(jobId: string, limit = TG_JOB_DOWNLOAD_BATCH_SIZE): Promise<TelegramDownloadMessageRef[]> {
     const result = await query(
-        `WITH candidates AS (
+        `WITH locked_job AS (
+             SELECT j.id
+             FROM telegram_background_jobs j
+             WHERE j.id = $1
+               AND j.cancelled_at IS NULL
+               AND j.paused_at IS NULL
+               AND j.finished_at IS NULL
+               AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+               AND j.status NOT IN ('cancelled', 'paused', 'cooling')
+             FOR UPDATE OF j
+         ), candidates AS (
              SELECT i.id
              FROM telegram_download_items i
-             JOIN telegram_background_jobs j ON j.id = i.job_id
+             JOIN locked_job j ON j.id = i.job_id
              WHERE i.job_id = $1
                AND i.status = 'pending'
                AND i.attempts < $2
                AND i.file_name IS NOT NULL
                AND i.mime_type IS NOT NULL
-               AND j.cancelled_at IS NULL
-               AND j.finished_at IS NULL
-               AND j.status NOT IN ('cancelled', 'paused', 'cooling')
                AND NOT EXISTS (
                    SELECT 1 FROM telegram_write_reconciliations r
                    WHERE r.item_id = i.id AND r.status = 'pending'
@@ -1017,8 +1025,14 @@ async function claimPendingDownloadRefs(jobId: string, limit = TG_JOB_DOWNLOAD_B
          UPDATE telegram_download_items i
          SET status = 'downloading', locked_at = NOW(), lease_token = gen_random_uuid(),
              lease_expires_at = NOW() + INTERVAL '10 minutes', updated_at = NOW()
-         FROM candidates c
+         FROM candidates c, telegram_background_jobs j
          WHERE i.id = c.id AND i.status = 'pending'
+           AND j.id = i.job_id
+           AND j.cancelled_at IS NULL
+           AND j.paused_at IS NULL
+           AND j.finished_at IS NULL
+           AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+           AND j.status NOT IN ('cancelled', 'paused', 'cooling')
          RETURNING i.id, i.source, i.source_peer, i.origin, i.message_id, i.grouped_id, i.channel_post_id,
                    i.file_name, i.mime_type, i.generated_name, i.total_size, i.folder_override,
                    i.shared_caption, i.group_index, i.group_size, i.lease_token`,
@@ -1608,10 +1622,13 @@ export async function resumeTelegramBackgroundJob(userId: number, selector: stri
     if (!jobId) return null;
     const result = await query(
         `UPDATE telegram_background_jobs
-         SET status = 'running', paused_at = NULL, finished_at = NULL, error = NULL, download_status = 'active', updated_at = NOW()
+         SET status = 'running', paused_at = NULL, finished_at = NULL, error = NULL,
+             download_status = CASE WHEN cooldown_until IS NOT NULL AND cooldown_until > NOW() THEN 'cooling' ELSE 'active' END,
+             updated_at = NOW()
          WHERE user_id = $1 AND id = $2::uuid
            AND ($3::bigint IS NULL OR chat_id = $3::bigint)
            AND cancelled_at IS NULL AND status = 'paused'
+           AND (cooldown_until IS NULL OR cooldown_until <= NOW())
          RETURNING id, source, status`,
         [userId, jobId, chatId || null]
     );
@@ -1927,6 +1944,7 @@ async function recoverTelegramJob(botClient: TelegramClient, job: any): Promise<
         if (latestJob?.paused_at || latestJob?.status === 'paused') return;
         const remainingStats = await getJobItemStats(job.id);
         if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) return;
+        const persistedFailed = Number(remainingStats.failed || 0);
         let finalized: boolean;
         if (job.kind === 'subscription_sync') {
             const subscriptionId = String(job.params?.subscriptionId || '');
@@ -1934,16 +1952,28 @@ async function recoverTelegramJob(botClient: TelegramClient, job: any): Promise<
             if (!subscriptionId || targetMessageId <= 0) {
                 throw new Error('恢复订阅任务缺少 subscriptionId/toId，禁止非原子推进 cursor');
             }
+            const recoveryHasFailures = persistedFailed > 0 || result.failed > 0;
+            const persistedFailureBoundary = recoveryHasFailures
+                ? await query(
+                    `SELECT MIN(message_id)::int AS first_failed_id
+                     FROM telegram_download_items
+                     WHERE job_id = $1 AND status = 'failed'`,
+                    [job.id],
+                )
+                : null;
+            const firstFailedId = Number(persistedFailureBoundary?.rows[0]?.first_failed_id || 0);
             finalized = await finalizeSubscriptionJobInTransaction(pool as unknown as TelegramTransactionPool, {
                 jobId: String(job.id),
                 subscriptionId,
-                status: result.failed > 0 ? 'completed_with_errors' : 'completed',
-                safeAdvanceId: result.failed > 0
-                    ? contiguousProcessedMessageId(Number(job.params?.fromId || 1) - 1, result.successfulMessageIds, result.skippedMessageIds, result.failedMessageIds)
+                status: recoveryHasFailures ? 'completed_with_errors' : 'completed',
+                safeAdvanceId: recoveryHasFailures
+                    ? (firstFailedId > 0
+                        ? Math.max(Number(job.params?.fromId || 1) - 1, firstFailedId - 1)
+                        : contiguousProcessedMessageId(Number(job.params?.fromId || 1) - 1, result.successfulMessageIds, result.skippedMessageIds, result.failedMessageIds))
                     : targetMessageId,
                 enqueuedCount: result.found,
                 skippedCount: result.skipped,
-                error: result.failed > 0 ? `${result.failed} 个文件下载失败` : null,
+                error: recoveryHasFailures ? `${persistedFailed || result.failed} 个文件下载失败` : null,
             });
         } else {
             finalized = (await updateJob(job.id, {

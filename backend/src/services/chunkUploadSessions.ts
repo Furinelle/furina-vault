@@ -50,7 +50,7 @@ export type ChunkCancelResult = 'cancelled' | 'busy' | 'terminal' | 'not_found';
 
 export interface ChunkUploadSessionRepository {
     createSession(session: ChunkUploadSession): Promise<void>;
-    reserveSession(session: ChunkUploadSession, globalBudgetBytes: number): Promise<boolean>;
+    reserveSession(session: ChunkUploadSession, globalBudgetBytes: number, diskFreeBytes?: number, diskReserveBytes?: number): Promise<boolean>;
     getReservedBytes(): Promise<number>;
     getSession(uploadId: string, ownerId: string): Promise<ChunkUploadSession | null>;
     getChunk(uploadId: string, ownerId: string, index: number): Promise<ChunkUploadChunk | null>;
@@ -89,6 +89,14 @@ export async function writeChunkAtomically(input: {
     await fsPromises.mkdir(path.dirname(input.finalPath), { recursive: true });
     const committedPath = `${input.finalPath}.${crypto.randomUUID()}.chunk`;
     const temporaryPath = `${committedPath}.part`;
+    const lockPath = `${input.finalPath}.lock`;
+    let lockHandle: fsPromises.FileHandle;
+    try {
+        lockHandle = await fsPromises.open(lockPath, 'wx');
+    } catch (error: any) {
+        if (error?.code === 'EEXIST') throw new ChunkUploadProtocolError('ChunkWriteBusyError', '同一分块正在写入，请稍后重试');
+        throw error;
+    }
     const hash = crypto.createHash('sha256');
     let size = 0;
     const counter = new (await import('node:stream')).Transform({
@@ -109,6 +117,9 @@ export async function writeChunkAtomically(input: {
     } catch (error) {
         await fsPromises.rm(temporaryPath, { force: true }).catch(() => undefined);
         throw error;
+    } finally {
+        await lockHandle.close().catch(() => undefined);
+        await fsPromises.rm(lockPath, { force: true }).catch(() => undefined);
     }
 }
 
@@ -134,6 +145,8 @@ export async function verifyChunkIntegrity(chunk: ChunkUploadChunk, expectedDire
 }
 
 export class ChunkUploadSessionStore {
+    private readonly chunkWriteLocks = new Map<string, Promise<void>>();
+
     constructor(
         private readonly repository: ChunkUploadSessionRepository,
         private readonly limits?: ChunkUploadLimits,
@@ -152,13 +165,42 @@ export class ChunkUploadSessionStore {
         if (diskFreeBytes - session.totalSize < this.limits.diskReserveBytes) {
             throw new ChunkUploadProtocolError('ChunkDiskReserveError', '临时磁盘预留空间不足');
         }
-        const reserved = await this.repository.reserveSession(session, this.limits.globalBudgetBytes);
+        const reserved = await this.repository.reserveSession(
+            session,
+            this.limits.globalBudgetBytes,
+            diskFreeBytes,
+            this.limits.diskReserveBytes,
+        );
         if (!reserved) {
             throw new ChunkUploadProtocolError('ChunkBudgetError', '全局临时上传预算不足');
         }
     }
 
     async writeChunk(input: {
+        uploadId: string;
+        ownerId: string;
+        index: number;
+        expectedSize: number;
+        expectedSha256: string;
+        finalPath: string;
+        input: Readable;
+        maxChunkBytes: number;
+    }): Promise<ChunkRecordResult> {
+        const lockKey = `${input.uploadId}:${input.index}`;
+        const previous = this.chunkWriteLocks.get(lockKey) || Promise.resolve();
+        let release!: () => void;
+        const current = new Promise<void>(resolve => { release = resolve; });
+        this.chunkWriteLocks.set(lockKey, current);
+        await previous;
+        try {
+            return await this.writeChunkUnlocked(input);
+        } finally {
+            release();
+            if (this.chunkWriteLocks.get(lockKey) === current) this.chunkWriteLocks.delete(lockKey);
+        }
+    }
+
+    private async writeChunkUnlocked(input: {
         uploadId: string;
         ownerId: string;
         index: number;
@@ -290,7 +332,12 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
         );
     }
 
-    async reserveSession(value: ChunkUploadSession, globalBudgetBytes: number): Promise<boolean> {
+    async reserveSession(
+        value: ChunkUploadSession,
+        globalBudgetBytes: number,
+        diskFreeBytes?: number,
+        diskReserveBytes = 0,
+    ): Promise<boolean> {
         const client = await this.pool.connect();
         try {
             await client.query('BEGIN');
@@ -300,7 +347,12 @@ export class PostgresChunkUploadSessionRepository implements ChunkUploadSessionR
                  FROM chunk_upload_sessions
                  WHERE status IN ('open','completing','failed') AND expires_at > NOW()`,
             );
-            if (Number(budget.rows[0]?.reserved_bytes || 0) + value.totalSize > globalBudgetBytes) {
+            const reservedBytes = Number(budget.rows[0]?.reserved_bytes || 0);
+            if (reservedBytes + value.totalSize > globalBudgetBytes) {
+                await client.query('ROLLBACK');
+                return false;
+            }
+            if (diskFreeBytes !== undefined && reservedBytes + value.totalSize + diskReserveBytes > diskFreeBytes) {
                 await client.query('ROLLBACK');
                 return false;
             }
