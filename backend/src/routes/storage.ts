@@ -17,6 +17,7 @@ import { oauthFlowStore, OAuthFlowError, type OAuthProvider } from '../services/
 import { getOAuthRouteConfig, renderOAuthSuccessPage } from '../services/oauthRouteConfig.js';
 import { deleteStorageAccountWithClient, StorageAccountConflictError, StorageAccountNotFoundError } from '../services/storageAccountLifecycle.js';
 import { logOperationalEvent } from '../services/operationalEvents.js';
+import { webDestructiveConfirmationStore } from '../services/webDestructiveConfirmation.js';
 
 // ESM compatibility
 const checkDiskSpace = (checkDiskSpaceModule as any).default || checkDiskSpaceModule;
@@ -538,9 +539,24 @@ router.get('/accounts', requireAuth, async (req: Request, res: Response) => {
     }
 });
 
+// 为账户及其索引删除签发一次性确认令牌
+router.post('/accounts/:id/delete-confirmation', requireAuth, async (req: Request, res: Response) => {
+    const account = await query('SELECT id, name, type, is_active FROM storage_accounts WHERE id = $1', [req.params.id]);
+    if (!account.rows[0]) return res.status(404).json({ error: '存储账户不存在' });
+    if (account.rows[0].is_active) return res.status(409).json({ error: '不能删除当前正在使用的存储账户' });
+    const authToken = getAuthToken(req);
+    if (!authToken) return res.status(401).json({ error: '未认证' });
+    res.json(webDestructiveConfirmationStore.issue({ authToken, action: 'delete_storage_account', objectId: req.params.id }));
+});
+
 // 删除账户
 router.delete('/accounts/:id', requireAuth, async (req: Request, res: Response) => {
     const { id } = req.params;
+    const authToken = getAuthToken(req);
+    const confirmationToken = String(req.header('x-confirmation-token') || '');
+    if (!authToken || !confirmationToken || webDestructiveConfirmationStore.consume(confirmationToken, { authToken, action: 'delete_storage_account', objectId: id }).status !== 'ok') {
+        return res.status(409).json({ error: '需要一次性删除确认令牌', code: 'CONFIRMATION_REQUIRED' });
+    }
     const { storageManager } = await import('../services/storage.js');
     const client = await pool.connect();
     let accountName = '';

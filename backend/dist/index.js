@@ -486,11 +486,21 @@ async function deleteStorageAccountWithClient(client2, accountId) {
   if (taskReference.rows.length > 0) throw new StorageAccountConflictError("job");
   const uploadReference = await client2.query(
     `SELECT id FROM storage_account_leases
-         WHERE storage_account_id = $1 AND released_at IS NULL AND expires_at > NOW()
+         WHERE storage_account_id = $1 AND released_at IS NULL
          LIMIT 1 FOR UPDATE`,
     [accountId]
   );
   if (uploadReference.rows.length > 0) throw new StorageAccountConflictError("upload");
+  const reconciliationReference = await client2.query(
+    `SELECT operation_id FROM telegram_write_reconciliations
+         WHERE account_id = $1 AND status = 'pending'
+         UNION ALL
+         SELECT operation_id FROM chunk_upload_reconciliations
+         WHERE account_id = $1 AND status = 'pending'
+         LIMIT 1`,
+    [accountId]
+  );
+  if (reconciliationReference.rows.length > 0) throw new StorageAccountConflictError("upload");
   const chunkReference = await client2.query(
     `SELECT upload_id FROM chunk_upload_sessions
          WHERE target_account_id = $1 AND status IN ('open', 'completing')
@@ -839,11 +849,19 @@ var init_storage = __esm({
       }
     };
     WebDAVStorageProvider = class {
-      constructor(id, url, username, password) {
+      constructor(id, url, username, password, requestTimeoutMs = (() => {
+        const configured = Number(process.env.WEBDAV_INACTIVITY_TIMEOUT_MS);
+        return Number.isFinite(configured) && configured > 0 ? Math.max(3e4, configured) : 5 * 60 * 1e3;
+      })(), uploadTimeoutMs = (() => {
+        const configured = Number(process.env.WEBDAV_UPLOAD_TIMEOUT_MS);
+        return Number.isFinite(configured) && configured > 0 ? Math.max(6e4, configured) : 6 * 60 * 60 * 1e3;
+      })()) {
         this.id = id;
         this.url = url;
         this.username = username;
         this.password = password;
+        this.requestTimeoutMs = requestTimeoutMs;
+        this.uploadTimeoutMs = uploadTimeoutMs;
         this.client = createClient(url, {
           username,
           password
@@ -853,15 +871,43 @@ var init_storage = __esm({
       url;
       username;
       password;
+      requestTimeoutMs;
+      uploadTimeoutMs;
       name = "webdav";
       client;
+      async withRequestTimeout(operation, label, timeoutMs = this.requestTimeoutMs) {
+        const controller = new AbortController();
+        let timeout;
+        const refresh = () => {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        };
+        refresh();
+        try {
+          return await operation(controller.signal, refresh);
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          throw error;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
       async saveFile(tempPath, fileName, _mimeType, folder) {
         try {
           const remotePath = folder ? `${folder}/${fileName}` : fileName;
           if (folder) {
-            await this.client.createDirectory(`/${folder}`, { recursive: true });
+            await this.withRequestTimeout(
+              (signal) => this.client.createDirectory(`/${folder}`, { recursive: true, signal }),
+              "WebDAV create directory"
+            );
           }
-          await this.client.putFileContents(`/${remotePath}`, fs4.createReadStream(tempPath));
+          await this.withRequestTimeout(
+            (signal) => this.client.putFileContents(`/${remotePath}`, fs4.createReadStream(tempPath), { signal }),
+            "WebDAV upload",
+            this.uploadTimeoutMs
+          );
           console.log("[WebDAV] Upload successful:", remotePath);
           return remotePath;
         } catch (error) {
@@ -871,7 +917,21 @@ var init_storage = __esm({
       }
       async getFileStream(storedPath) {
         try {
-          return this.client.createReadStream(`/${storedPath}`);
+          const controller = new AbortController();
+          let timeout;
+          const refresh = () => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => {
+              controller.abort(new Error(`WebDAV download timed out after ${this.requestTimeoutMs}ms`));
+            }, this.requestTimeoutMs);
+          };
+          const stream = this.client.createReadStream(`/${storedPath}`, { signal: controller.signal });
+          refresh();
+          stream.on("data", refresh);
+          stream.once("end", () => clearTimeout(timeout));
+          stream.once("close", () => clearTimeout(timeout));
+          stream.once("error", () => clearTimeout(timeout));
+          return stream;
         } catch (error) {
           console.error("[WebDAV] Get stream failed:", error.message);
           throw new Error(`WebDAV get stream failed: ${error.message}`);
@@ -882,7 +942,10 @@ var init_storage = __esm({
       }
       async deleteFile(storedPath) {
         try {
-          await this.client.deleteFile(`/${storedPath}`);
+          await this.withRequestTimeout(
+            (signal) => this.client.deleteFile(`/${storedPath}`, { signal }),
+            "WebDAV delete"
+          );
           console.log("[WebDAV] Delete successful:", storedPath);
         } catch (error) {
           console.error("[WebDAV] Delete failed:", error.message);
@@ -891,11 +954,14 @@ var init_storage = __esm({
       }
       async getFileSize(storedPath) {
         try {
-          const stat = await this.client.stat(`/${storedPath}`);
+          const stat = await this.withRequestTimeout(
+            (signal) => this.client.stat(`/${storedPath}`, { signal }),
+            "WebDAV stat"
+          );
           return stat.size || 0;
         } catch (error) {
           console.error("[WebDAV] Get file size failed:", error.message);
-          return 0;
+          throw new Error(`WebDAV get file size failed: ${error.message}`);
         }
       }
     };
@@ -4762,6 +4828,16 @@ async function acquireStorageAccountOperationLease(pool2, accountId, purpose, op
 
 // src/services/telegramWriteReconciliation.ts
 import crypto10 from "node:crypto";
+async function ownsTelegramReconciliationLease(db, operationId, leaseToken) {
+  const result = await db.query(
+    `UPDATE telegram_write_reconciliations
+         SET lease_expires_at = NOW() + INTERVAL '5 minutes', updated_at = NOW()
+         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'
+         RETURNING operation_id`,
+    [operationId, leaseToken]
+  );
+  return result.rowCount === 1;
+}
 async function beginTelegramWriteReconciliation(db, input) {
   const operationId = crypto10.randomUUID();
   const result = await db.query(
@@ -4861,13 +4937,13 @@ async function claimTelegramWriteReconciliations(db, leaseToken, limit = 100) {
 async function resolveClaimedTelegramWrite(input) {
   const { db, row, leaseToken } = input;
   if (row.itemStatus === "success" && row.fileId && row.objectState === "present" && row.indexState === "present") {
-    const result = await db.query(
+    const result2 = await db.query(
       `UPDATE telegram_write_reconciliations SET status = 'resolved', resolution = 'committed', reason = '\u91CD\u542F\u626B\u63CF\u786E\u8BA4 child \u5DF2\u6210\u529F',
              resolved_at = NOW(), lease_token = NULL, lease_expires_at = NULL, updated_at = NOW()
              WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'`,
       [row.operationId, leaseToken]
     );
-    return result.rowCount === 1 ? "resolved" : "pending";
+    return result2.rowCount === 1 ? "resolved" : "pending";
   }
   if (row.objectState === "unknown" && !row.storedPath) {
     await db.query(
@@ -4881,6 +4957,7 @@ async function resolveClaimedTelegramWrite(input) {
   let objectState = row.objectState;
   let indexState = row.indexState;
   const errors = [];
+  if (!await ownsTelegramReconciliationLease(db, row.operationId, leaseToken)) return "pending";
   if (row.storedPath && objectState !== "deleted") {
     try {
       await input.deleteObject(row.storedPath);
@@ -4890,6 +4967,7 @@ async function resolveClaimedTelegramWrite(input) {
       errors.push(`object: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  if (!await ownsTelegramReconciliationLease(db, row.operationId, leaseToken)) return "pending";
   if (row.fileId && indexState !== "deleted") {
     try {
       const deleted = await db.query("DELETE FROM files WHERE id = $1", [row.fileId]);
@@ -4903,15 +4981,17 @@ async function resolveClaimedTelegramWrite(input) {
     errors.push("index: \u7F3A\u5C11\u7CBE\u786E file_id");
   }
   const resolved = objectState === "deleted" && indexState === "deleted";
-  await db.query(
+  const result = await db.query(
     `UPDATE telegram_write_reconciliations SET object_state = $3, index_state = $4,
          status = CASE WHEN $5::boolean THEN 'resolved' ELSE 'pending' END,
          resolution = CASE WHEN $5::boolean THEN 'compensated' ELSE resolution END,
          reason = $6, resolved_at = CASE WHEN $5::boolean THEN NOW() ELSE NULL END,
          lease_token = NULL, lease_expires_at = NULL, updated_at = NOW()
-         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'`,
+         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'
+         RETURNING operation_id`,
     [row.operationId, leaseToken, objectState, indexState, resolved, errors.join("; ") || "\u91CD\u542F\u626B\u63CF\u8865\u507F\u5DF2\u786E\u8BA4"]
   );
+  if (result.rowCount !== 1) return "pending";
   return resolved ? "resolved" : "pending";
 }
 
@@ -4948,11 +5028,9 @@ function appendTelegramDebugLog(line) {
 async function runLeaseProtectedTelegramSave(withLease, save, compensate, validateBeforeSettlement = async () => void 0) {
   let persisted;
   try {
-    return await withLease(async () => {
-      persisted = await save();
-      await validateBeforeSettlement();
-      return persisted;
-    });
+    persisted = await save();
+    await validateBeforeSettlement();
+    return await withLease(async () => persisted);
   } catch (error) {
     if (persisted) {
       const compensation = await compensate(persisted);
@@ -7890,12 +7968,13 @@ function isFloodWait(error) {
   return null;
 }
 async function putJobIntoStorageCooldown(jobId, cooldownUntil, reasonText) {
-  await updateJob(jobId, {
-    status: "cooling",
-    download_status: "cooling",
-    cooldown_until: cooldownUntil,
-    error: reasonText
-  });
+  await query(
+    `UPDATE telegram_background_jobs
+         SET status = CASE WHEN paused_at IS NULL THEN 'cooling' ELSE 'paused' END,
+             download_status = 'cooling', cooldown_until = $2, error = $3, updated_at = NOW()
+         WHERE id = $1 AND cancelled_at IS NULL AND finished_at IS NULL`,
+    [jobId, cooldownUntil, reasonText]
+  );
   await query(
     `UPDATE telegram_download_items
          SET status = 'pending', locked_at = NULL, last_error = $2, updated_at = NOW()
@@ -7970,18 +8049,25 @@ function persistedTelegramFileInfo(row) {
 }
 async function claimPendingDownloadRefs(jobId, limit = TG_JOB_DOWNLOAD_BATCH_SIZE) {
   const result = await query(
-    `WITH candidates AS (
+    `WITH locked_job AS (
+             SELECT j.id
+             FROM telegram_background_jobs j
+             WHERE j.id = $1
+               AND j.cancelled_at IS NULL
+               AND j.paused_at IS NULL
+               AND j.finished_at IS NULL
+               AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+               AND j.status NOT IN ('cancelled', 'paused', 'cooling')
+             FOR UPDATE OF j
+         ), candidates AS (
              SELECT i.id
              FROM telegram_download_items i
-             JOIN telegram_background_jobs j ON j.id = i.job_id
+             JOIN locked_job j ON j.id = i.job_id
              WHERE i.job_id = $1
                AND i.status = 'pending'
                AND i.attempts < $2
                AND i.file_name IS NOT NULL
                AND i.mime_type IS NOT NULL
-               AND j.cancelled_at IS NULL
-               AND j.finished_at IS NULL
-               AND j.status NOT IN ('cancelled', 'paused', 'cooling')
                AND NOT EXISTS (
                    SELECT 1 FROM telegram_write_reconciliations r
                    WHERE r.item_id = i.id AND r.status = 'pending'
@@ -7993,8 +8079,14 @@ async function claimPendingDownloadRefs(jobId, limit = TG_JOB_DOWNLOAD_BATCH_SIZ
          UPDATE telegram_download_items i
          SET status = 'downloading', locked_at = NOW(), lease_token = gen_random_uuid(),
              lease_expires_at = NOW() + INTERVAL '10 minutes', updated_at = NOW()
-         FROM candidates c
+         FROM candidates c, telegram_background_jobs j
          WHERE i.id = c.id AND i.status = 'pending'
+           AND j.id = i.job_id
+           AND j.cancelled_at IS NULL
+           AND j.paused_at IS NULL
+           AND j.finished_at IS NULL
+           AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+           AND j.status NOT IN ('cancelled', 'paused', 'cooling')
          RETURNING i.id, i.source, i.source_peer, i.origin, i.message_id, i.grouped_id, i.channel_post_id,
                    i.file_name, i.mime_type, i.generated_name, i.total_size, i.folder_override,
                    i.shared_caption, i.group_index, i.group_size, i.lease_token`,
@@ -8539,10 +8631,13 @@ async function resumeTelegramBackgroundJob(userId, selector, chatId) {
   if (!jobId) return null;
   const result = await query(
     `UPDATE telegram_background_jobs
-         SET status = 'running', paused_at = NULL, finished_at = NULL, error = NULL, download_status = 'active', updated_at = NOW()
+         SET status = 'running', paused_at = NULL, finished_at = NULL, error = NULL,
+             download_status = CASE WHEN cooldown_until IS NOT NULL AND cooldown_until > NOW() THEN 'cooling' ELSE 'active' END,
+             updated_at = NOW()
          WHERE user_id = $1 AND id = $2::uuid
            AND ($3::bigint IS NULL OR chat_id = $3::bigint)
            AND cancelled_at IS NULL AND status = 'paused'
+           AND (cooldown_until IS NULL OR cooldown_until <= NOW())
          RETURNING id, source, status`,
     [userId, jobId, chatId || null]
   );
@@ -8806,6 +8901,7 @@ async function recoverTelegramJob(botClient, job) {
     if (latestJob?.paused_at || latestJob?.status === "paused") return;
     const remainingStats = await getJobItemStats(job.id);
     if (Number(remainingStats.pending || 0) + Number(remainingStats.downloading || 0) > 0) return;
+    const persistedFailed = Number(remainingStats.failed || 0);
     let finalized;
     if (job.kind === "subscription_sync") {
       const subscriptionId = String(job.params?.subscriptionId || "");
@@ -8813,14 +8909,22 @@ async function recoverTelegramJob(botClient, job) {
       if (!subscriptionId || targetMessageId <= 0) {
         throw new Error("\u6062\u590D\u8BA2\u9605\u4EFB\u52A1\u7F3A\u5C11 subscriptionId/toId\uFF0C\u7981\u6B62\u975E\u539F\u5B50\u63A8\u8FDB cursor");
       }
+      const recoveryHasFailures = persistedFailed > 0 || result.failed > 0;
+      const persistedFailureBoundary = recoveryHasFailures ? await query(
+        `SELECT MIN(message_id)::int AS first_failed_id
+                     FROM telegram_download_items
+                     WHERE job_id = $1 AND status = 'failed'`,
+        [job.id]
+      ) : null;
+      const firstFailedId = Number(persistedFailureBoundary?.rows[0]?.first_failed_id || 0);
       finalized = await finalizeSubscriptionJobInTransaction(pool, {
         jobId: String(job.id),
         subscriptionId,
-        status: result.failed > 0 ? "completed_with_errors" : "completed",
-        safeAdvanceId: result.failed > 0 ? contiguousProcessedMessageId(Number(job.params?.fromId || 1) - 1, result.successfulMessageIds, result.skippedMessageIds, result.failedMessageIds) : targetMessageId,
+        status: recoveryHasFailures ? "completed_with_errors" : "completed",
+        safeAdvanceId: recoveryHasFailures ? firstFailedId > 0 ? Math.max(Number(job.params?.fromId || 1) - 1, firstFailedId - 1) : contiguousProcessedMessageId(Number(job.params?.fromId || 1) - 1, result.successfulMessageIds, result.skippedMessageIds, result.failedMessageIds) : targetMessageId,
         enqueuedCount: result.found,
         skippedCount: result.skipped,
-        error: result.failed > 0 ? `${result.failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null
+        error: recoveryHasFailures ? `${persistedFailed || result.failed} \u4E2A\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25` : null
       });
     } else {
       finalized = await updateJob(job.id, {
@@ -13316,6 +13420,41 @@ function createFileDeletionService(dependencies) {
   };
 }
 
+// src/services/webDestructiveConfirmation.ts
+import crypto16 from "node:crypto";
+function hash(value) {
+  return crypto16.createHash("sha256").update(value).digest("hex");
+}
+var WebDestructiveConfirmationStore = class {
+  constructor(ttlMs = 5 * 60 * 1e3, now = () => Date.now()) {
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+  ttlMs;
+  now;
+  values = /* @__PURE__ */ new Map();
+  issue(input) {
+    const token = crypto16.randomBytes(24).toString("base64url");
+    const expiresAt = this.now() + this.ttlMs;
+    this.values.set(token, { action: input.action, objectId: input.objectId, authTokenHash: hash(input.authToken), expiresAt });
+    return { confirmationToken: token, expiresAt };
+  }
+  consume(token, input) {
+    const value = this.values.get(token);
+    if (!value) return { status: "missing" };
+    if (value.expiresAt < this.now()) {
+      this.values.delete(token);
+      return { status: "expired" };
+    }
+    if (value.authTokenHash !== hash(input.authToken) || value.action !== input.action || value.objectId !== input.objectId) {
+      return { status: "mismatch" };
+    }
+    this.values.delete(token);
+    return { status: "ok" };
+  }
+};
+var webDestructiveConfirmationStore = new WebDestructiveConfirmationStore();
+
 // src/routes/files.ts
 init_localPath();
 
@@ -13962,9 +14101,21 @@ router2.get("/:id([0-9a-fA-F-]{36})/thumbnail", async (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u7F29\u7565\u56FE\u5931\u8D25" });
   }
 });
+router2.post("/:id([0-9a-fA-F-]{36})/delete-confirmation", async (req, res) => {
+  const file = await getScopedFileById(req.params.id);
+  if (!file) return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728" });
+  const authToken = getAuthToken(req);
+  if (!authToken) return res.status(401).json({ error: "\u672A\u8BA4\u8BC1" });
+  res.json(webDestructiveConfirmationStore.issue({ authToken, action: "delete_file", objectId: req.params.id }));
+});
 router2.delete("/:id([0-9a-fA-F-]{36})", async (req, res) => {
   try {
     const { id } = req.params;
+    const authToken = getAuthToken(req);
+    const confirmationToken = String(req.header("x-confirmation-token") || "");
+    if (!authToken || !confirmationToken || webDestructiveConfirmationStore.consume(confirmationToken, { authToken, action: "delete_file", objectId: id }).status !== "ok") {
+      return res.status(409).json({ error: "\u9700\u8981\u4E00\u6B21\u6027\u5220\u9664\u786E\u8BA4\u4EE4\u724C", code: "CONFIRMATION_REQUIRED" });
+    }
     const file = await getScopedFileById(id);
     if (!file) {
       return res.status(404).json({ error: "\u6587\u4EF6\u4E0D\u5B58\u5728" });
@@ -14156,9 +14307,9 @@ function logOperationalEvent(event, requestId, data) {
 }
 
 // src/services/batchDeleteConfirmation.ts
-import crypto16 from "node:crypto";
+import crypto17 from "node:crypto";
 function hashAuthToken(token) {
-  return crypto16.createHash("sha256").update(token).digest("hex");
+  return crypto17.createHash("sha256").update(token).digest("hex");
 }
 function normalizeFileIds(fileIds) {
   return [...new Set(fileIds)].sort();
@@ -14171,7 +14322,7 @@ var BatchDeleteConfirmationStore = class {
   constructor(options = {}) {
     this.ttlMs = options.ttlMs ?? 5 * 60 * 1e3;
     this.now = options.now ?? (() => Date.now());
-    this.tokenFactory = options.tokenFactory ?? (() => crypto16.randomBytes(24).toString("base64url"));
+    this.tokenFactory = options.tokenFactory ?? (() => crypto17.randomBytes(24).toString("base64url"));
   }
   issue(input) {
     const confirmationToken = this.tokenFactory();
@@ -14669,12 +14820,12 @@ import os3 from "os";
 import path19 from "path";
 import fs14 from "fs";
 import axios3 from "axios";
-import crypto18 from "crypto";
+import crypto19 from "crypto";
 
 // src/services/oauthFlowStore.ts
 init_db();
 init_credentialCrypto();
-import crypto17 from "node:crypto";
+import crypto18 from "node:crypto";
 var OAuthFlowError = class extends Error {
   code = "OAUTH_FLOW_INVALID";
   constructor() {
@@ -14683,7 +14834,7 @@ var OAuthFlowError = class extends Error {
   }
 };
 function sha256(value) {
-  return crypto17.createHash("sha256").update(value).digest("hex");
+  return crypto18.createHash("sha256").update(value).digest("hex");
 }
 function parsePendingConfig(value) {
   const parsed = typeof value === "string" ? JSON.parse(value) : value;
@@ -14700,8 +14851,8 @@ var OAuthFlowStore = class {
     this.db = options.db ?? pool;
     this.ttlMs = options.ttlMs ?? 10 * 60 * 1e3;
     this.now = options.now ?? (() => Date.now());
-    this.stateFactory = options.stateFactory ?? (() => crypto17.randomBytes(32).toString("base64url"));
-    this.nonceFactory = options.nonceFactory ?? (() => crypto17.randomBytes(24).toString("base64url"));
+    this.stateFactory = options.stateFactory ?? (() => crypto18.randomBytes(32).toString("base64url"));
+    this.nonceFactory = options.nonceFactory ?? (() => crypto18.randomBytes(24).toString("base64url"));
   }
   async ensureSchema() {
     if (!this.schemaPromise) {
@@ -14854,7 +15005,7 @@ var checkDiskSpace2 = checkDiskSpaceModule2.default || checkDiskSpaceModule2;
 var router5 = Router5();
 var UPLOAD_DIR6 = process.env.UPLOAD_DIR || "./data/uploads";
 function sendOAuthSuccessPage(res, input) {
-  const nonce = crypto18.randomBytes(16).toString("base64");
+  const nonce = crypto19.randomBytes(16).toString("base64");
   res.setHeader("Content-Security-Policy", [
     "default-src 'self'",
     "style-src 'unsafe-inline'",
@@ -15292,8 +15443,21 @@ router5.get("/accounts", requireAuth, async (req, res) => {
     res.status(500).json({ error: "\u83B7\u53D6\u8D26\u6237\u5217\u8868\u5931\u8D25" });
   }
 });
+router5.post("/accounts/:id/delete-confirmation", requireAuth, async (req, res) => {
+  const account = await query("SELECT id, name, type, is_active FROM storage_accounts WHERE id = $1", [req.params.id]);
+  if (!account.rows[0]) return res.status(404).json({ error: "\u5B58\u50A8\u8D26\u6237\u4E0D\u5B58\u5728" });
+  if (account.rows[0].is_active) return res.status(409).json({ error: "\u4E0D\u80FD\u5220\u9664\u5F53\u524D\u6B63\u5728\u4F7F\u7528\u7684\u5B58\u50A8\u8D26\u6237" });
+  const authToken = getAuthToken(req);
+  if (!authToken) return res.status(401).json({ error: "\u672A\u8BA4\u8BC1" });
+  res.json(webDestructiveConfirmationStore.issue({ authToken, action: "delete_storage_account", objectId: req.params.id }));
+});
 router5.delete("/accounts/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
+  const authToken = getAuthToken(req);
+  const confirmationToken = String(req.header("x-confirmation-token") || "");
+  if (!authToken || !confirmationToken || webDestructiveConfirmationStore.consume(confirmationToken, { authToken, action: "delete_storage_account", objectId: id }).status !== "ok") {
+    return res.status(409).json({ error: "\u9700\u8981\u4E00\u6B21\u6027\u5220\u9664\u786E\u8BA4\u4EE4\u724C", code: "CONFIRMATION_REQUIRED" });
+  }
   const { storageManager: storageManager2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
   const client2 = await pool.connect();
   let accountName = "";
@@ -15333,7 +15497,7 @@ var storage_default = router5;
 // src/routes/chunkedUpload.ts
 init_db();
 import { Router as Router6 } from "express";
-import crypto21 from "node:crypto";
+import crypto22 from "node:crypto";
 import fs16 from "node:fs";
 import fsPromises2 from "node:fs/promises";
 import path21 from "node:path";
@@ -15343,7 +15507,17 @@ import checkDiskSpaceModule3 from "check-disk-space";
 init_storage();
 
 // src/services/chunkUploadReconciliation.ts
-import crypto19 from "node:crypto";
+import crypto20 from "node:crypto";
+async function ownsChunkReconciliationLease(db, operationId, leaseToken) {
+  const result = await db.query(
+    `UPDATE chunk_upload_reconciliations
+         SET lease_expires_at = NOW() + INTERVAL '5 minutes', updated_at = NOW()
+         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'
+         RETURNING operation_id`,
+    [operationId, leaseToken]
+  );
+  return result.rowCount === 1;
+}
 async function claimChunkReconciliations(db, leaseToken, limit = 100) {
   const result = await db.query(
     `WITH candidates AS (
@@ -15397,6 +15571,7 @@ async function resolveClaimedChunkReconciliation(input) {
   let objectState = row.objectState;
   let indexState = row.indexState;
   const errors = [];
+  if (!await ownsChunkReconciliationLease(db, row.operationId, leaseToken)) return "pending";
   if (row.storedPath && objectState !== "deleted") {
     try {
       await input.deleteObject(row.storedPath);
@@ -15406,6 +15581,7 @@ async function resolveClaimedChunkReconciliation(input) {
       errors.push(`object: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  if (!await ownsChunkReconciliationLease(db, row.operationId, leaseToken)) return "pending";
   if (row.fileId && indexState !== "deleted") {
     try {
       const deleted = await db.query("DELETE FROM files WHERE id = $1", [row.fileId]);
@@ -15417,18 +15593,20 @@ async function resolveClaimedChunkReconciliation(input) {
     }
   } else if (!row.fileId && indexState === "unknown") errors.push("index: \u7F3A\u5C11\u7CBE\u786E file_id");
   const resolved = objectState === "deleted" && indexState === "deleted";
-  await db.query(
+  const update = await db.query(
     `UPDATE chunk_upload_reconciliations SET object_state = $3, index_state = $4,
          status = CASE WHEN $5::boolean THEN 'resolved' ELSE 'pending' END,
          resolution = CASE WHEN $5::boolean THEN 'compensated' ELSE resolution END, reason = $6,
          resolved_at = CASE WHEN $5::boolean THEN NOW() ELSE NULL END, lease_token = NULL, lease_expires_at = NULL, updated_at = NOW()
-         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'`,
+         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'
+         RETURNING operation_id`,
     [row.operationId, leaseToken, objectState, indexState, resolved, errors.join("; ") || "\u91CD\u542F\u626B\u63CF\u8865\u507F\u5DF2\u786E\u8BA4"]
   );
+  if (update.rowCount !== 1) return "pending";
   return resolved ? "resolved" : "pending";
 }
 async function beginChunkCompletionReconciliation(db, input) {
-  const operationId = crypto19.randomUUID();
+  const operationId = crypto20.randomUUID();
   const result = await db.query(
     `INSERT INTO chunk_upload_reconciliations
          (operation_id, upload_id, completion_token, provider, account_id, object_state, index_state, reason, status, created_at, updated_at)
@@ -15518,7 +15696,7 @@ async function compensateChunkCompletionFailure(input) {
 }
 
 // src/services/chunkUploadSessions.ts
-import crypto20 from "node:crypto";
+import crypto21 from "node:crypto";
 import fs15 from "node:fs";
 import fsPromises from "node:fs/promises";
 import path20 from "node:path";
@@ -15531,28 +15709,39 @@ var ChunkUploadProtocolError = class extends Error {
 };
 async function writeChunkAtomically(input) {
   await fsPromises.mkdir(path20.dirname(input.finalPath), { recursive: true });
-  const committedPath = `${input.finalPath}.${crypto20.randomUUID()}.chunk`;
+  const committedPath = `${input.finalPath}.${crypto21.randomUUID()}.chunk`;
   const temporaryPath = `${committedPath}.part`;
-  const hash = crypto20.createHash("sha256");
+  const lockPath = `${input.finalPath}.lock`;
+  let lockHandle;
+  try {
+    lockHandle = await fsPromises.open(lockPath, "wx");
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new ChunkUploadProtocolError("ChunkWriteBusyError", "\u540C\u4E00\u5206\u5757\u6B63\u5728\u5199\u5165\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
+    throw error;
+  }
+  const hash2 = crypto21.createHash("sha256");
   let size = 0;
   const counter = new (await import("node:stream")).Transform({
     transform(chunk, _encoding, callback) {
       size += chunk.length;
       if (size > input.maxChunkBytes) return callback(new ChunkUploadProtocolError("ChunkTooLargeError", "\u5355\u4E2A\u5206\u5757\u8FC7\u5927"));
-      hash.update(chunk);
+      hash2.update(chunk);
       callback(null, chunk);
     }
   });
   try {
     await pipeline(input.stream, counter, fs15.createWriteStream(temporaryPath, { flags: "wx" }));
     if (size !== input.expectedSize) throw new ChunkUploadProtocolError("ChunkSizeMismatchError", "\u5206\u5757\u5927\u5C0F\u4E0D\u5339\u914D");
-    const sha2562 = hash.digest("hex");
+    const sha2562 = hash2.digest("hex");
     if (sha2562 !== input.expectedSha256.toLowerCase()) throw new ChunkUploadProtocolError("ChunkHashMismatchError", "\u5206\u5757\u54C8\u5E0C\u4E0D\u5339\u914D");
     await fsPromises.rename(temporaryPath, committedPath);
     return { index: -1, size, sha256: sha2562, path: committedPath, createdAt: /* @__PURE__ */ new Date() };
   } catch (error) {
     await fsPromises.rm(temporaryPath, { force: true }).catch(() => void 0);
     throw error;
+  } finally {
+    await lockHandle.close().catch(() => void 0);
+    await fsPromises.rm(lockPath, { force: true }).catch(() => void 0);
   }
 }
 async function verifyChunkIntegrity(chunk, expectedDirectory, maxChunkBytes) {
@@ -15563,14 +15752,14 @@ async function verifyChunkIntegrity(chunk, expectedDirectory, maxChunkBytes) {
   if (stat.size !== chunk.size || stat.size < 1 || stat.size > maxChunkBytes) {
     throw new ChunkUploadProtocolError("ChunkSizeMismatchError", `\u5206\u5757 ${chunk.index} \u5927\u5C0F\u65E0\u6548`);
   }
-  const hash = crypto20.createHash("sha256");
+  const hash2 = crypto21.createHash("sha256");
   await pipeline(fs15.createReadStream(chunkPath), new (await import("node:stream")).Writable({
     write(buffer, _encoding, callback) {
-      hash.update(buffer);
+      hash2.update(buffer);
       callback();
     }
   }));
-  if (hash.digest("hex") !== chunk.sha256) {
+  if (hash2.digest("hex") !== chunk.sha256) {
     throw new ChunkUploadProtocolError("ChunkHashMismatchError", `\u5206\u5757 ${chunk.index} \u54C8\u5E0C\u65E0\u6548`);
   }
   return chunkPath;
@@ -15582,6 +15771,7 @@ var ChunkUploadSessionStore = class {
   }
   repository;
   limits;
+  chunkWriteLocks = /* @__PURE__ */ new Map();
   create(session) {
     return this.repository.createSession(session);
   }
@@ -15594,12 +15784,33 @@ var ChunkUploadSessionStore = class {
     if (diskFreeBytes - session.totalSize < this.limits.diskReserveBytes) {
       throw new ChunkUploadProtocolError("ChunkDiskReserveError", "\u4E34\u65F6\u78C1\u76D8\u9884\u7559\u7A7A\u95F4\u4E0D\u8DB3");
     }
-    const reserved = await this.repository.reserveSession(session, this.limits.globalBudgetBytes);
+    const reserved = await this.repository.reserveSession(
+      session,
+      this.limits.globalBudgetBytes,
+      diskFreeBytes,
+      this.limits.diskReserveBytes
+    );
     if (!reserved) {
       throw new ChunkUploadProtocolError("ChunkBudgetError", "\u5168\u5C40\u4E34\u65F6\u4E0A\u4F20\u9884\u7B97\u4E0D\u8DB3");
     }
   }
   async writeChunk(input) {
+    const lockKey = `${input.uploadId}:${input.index}`;
+    const previous = this.chunkWriteLocks.get(lockKey) || Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => {
+      release = resolve;
+    });
+    this.chunkWriteLocks.set(lockKey, current);
+    await previous;
+    try {
+      return await this.writeChunkUnlocked(input);
+    } finally {
+      release();
+      if (this.chunkWriteLocks.get(lockKey) === current) this.chunkWriteLocks.delete(lockKey);
+    }
+  }
+  async writeChunkUnlocked(input) {
     const existing = await this.repository.getSession(input.uploadId, input.ownerId);
     if (!existing || existing.status !== "open") throw new ChunkUploadProtocolError("ChunkSessionStateError", "\u4E0A\u4F20\u4F1A\u8BDD\u4E0D\u53EF\u5199");
     const known = await this.repository.getChunk(input.uploadId, input.ownerId, input.index);
@@ -15725,7 +15936,7 @@ var PostgresChunkUploadSessionRepository = class {
       this.insertParams(value)
     );
   }
-  async reserveSession(value, globalBudgetBytes) {
+  async reserveSession(value, globalBudgetBytes, diskFreeBytes, diskReserveBytes = 0) {
     const client2 = await this.pool.connect();
     try {
       await client2.query("BEGIN");
@@ -15735,7 +15946,12 @@ var PostgresChunkUploadSessionRepository = class {
                  FROM chunk_upload_sessions
                  WHERE status IN ('open','completing','failed') AND expires_at > NOW()`
       );
-      if (Number(budget.rows[0]?.reserved_bytes || 0) + value.totalSize > globalBudgetBytes) {
+      const reservedBytes = Number(budget.rows[0]?.reserved_bytes || 0);
+      if (reservedBytes + value.totalSize > globalBudgetBytes) {
+        await client2.query("ROLLBACK");
+        return false;
+      }
+      if (diskFreeBytes !== void 0 && reservedBytes + value.totalSize + diskReserveBytes > diskFreeBytes) {
         await client2.query("ROLLBACK");
         return false;
       }
@@ -16030,7 +16246,7 @@ var chunkStore = new ChunkUploadSessionStore(chunkRepository, {
   getDiskFreeBytes: async () => (await checkDiskSpace3(path21.resolve(CHUNK_DIR))).free
 });
 var runChunkMaintenance = async () => {
-  const reconciliationLease = crypto21.randomUUID();
+  const reconciliationLease = crypto22.randomUUID();
   const pending = await claimChunkReconciliations(pool, reconciliationLease, 100);
   for (const row of pending) {
     const target = storageManager.getTarget(row.provider, row.accountId);
@@ -16061,7 +16277,7 @@ router6.use(rateLimit3({
 function ownerId(req) {
   const token = getAuthToken(req);
   if (!token) throw new ChunkUploadProtocolError("ChunkOwnerError", "\u7F3A\u5C11\u8BA4\u8BC1\u4F1A\u8BDD");
-  return crypto21.createHash("sha256").update(token).digest("hex");
+  return crypto22.createHash("sha256").update(token).digest("hex");
 }
 function decodeFilename2(filename) {
   try {
@@ -16109,7 +16325,7 @@ router6.post("/init", async (req, res) => {
     const target = storageManager.getActiveTarget();
     const now = /* @__PURE__ */ new Date();
     const session = {
-      uploadId: crypto21.randomUUID(),
+      uploadId: crypto22.randomUUID(),
       ownerId: ownerId(req),
       filename: decodeFilename2(filename).slice(0, 255),
       mimeType: mimeType.slice(0, 100),
@@ -16186,7 +16402,7 @@ router6.post("/chunk", async (req, res) => {
   }
 });
 async function mergeChunks(uploadId, chunks, targetPath, expectedBytes) {
-  const temporary = `${targetPath}.${crypto21.randomUUID()}.part`;
+  const temporary = `${targetPath}.${crypto22.randomUUID()}.part`;
   await fsPromises2.mkdir(path21.dirname(targetPath), { recursive: true });
   const output = fs16.createWriteStream(temporary, { flags: "wx" });
   try {
@@ -16245,7 +16461,7 @@ router6.post("/complete", async (req, res) => {
     if (current.status === "failed") {
       return res.status(409).json({ error: "\u4E0A\u6B21\u5B8C\u6210\u5931\u8D25\uFF0C\u8BF7\u5148\u91CD\u8BD5\u4E0A\u4F20\u4F1A\u8BDD", retryable: true, lastError: current.lastError });
     }
-    token = crypto21.randomUUID();
+    token = crypto22.randomUUID();
     const claim = await chunkStore.claimCompletion(uploadId, owner, token, new Date(Date.now() + COMPLETION_LEASE_MS));
     if (!claim) return res.status(409).json({ error: "\u4E0A\u4F20\u672A\u5B8C\u6574\u3001\u5DF2\u7531\u5176\u4ED6\u8BF7\u6C42\u5904\u7406\u6216\u72B6\u6001\u4E0D\u53EF\u5B8C\u6210" });
     completionHeartbeat = setInterval(() => {
@@ -16455,7 +16671,7 @@ var chunkedUpload_default = router6;
 // src/index.ts
 init_db();
 import helmet from "helmet";
-import crypto22 from "node:crypto";
+import crypto23 from "node:crypto";
 dotenv3.config();
 var app = express();
 app.set("trust proxy", process.env.TRUST_PROXY || "loopback");
@@ -16492,12 +16708,12 @@ app.use(cors({
   },
   credentials: !allowAnyOrigin,
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-  allowedHeaders: ["Content-Type", "X-API-Key", "X-Upload-Id", "X-Chunk-Index", "X-Chunk-Size", "X-Chunk-Sha256", "Authorization"]
+  allowedHeaders: ["Content-Type", "X-API-Key", "X-Upload-Id", "X-Chunk-Index", "X-Chunk-Size", "X-Chunk-Sha256", "X-Confirmation-Token", "Authorization"]
 }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "2mb" }));
 app.use((req, res, next) => {
   const provided = normalizeRequestId(req.headers["x-request-id"]);
-  const requestId = provided || crypto22.randomUUID();
+  const requestId = provided || crypto23.randomUUID();
   res.locals.requestId = requestId;
   res.setHeader("X-Request-Id", requestId);
   next();

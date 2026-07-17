@@ -383,7 +383,15 @@ export class WebDAVStorageProvider implements IStorageProvider {
         public id: string,
         private url: string,
         private username?: string,
-        private password?: string
+        private password?: string,
+        private requestTimeoutMs = (() => {
+            const configured = Number(process.env.WEBDAV_INACTIVITY_TIMEOUT_MS);
+            return Number.isFinite(configured) && configured > 0 ? Math.max(30_000, configured) : 5 * 60 * 1000;
+        })(),
+        private uploadTimeoutMs = (() => {
+            const configured = Number(process.env.WEBDAV_UPLOAD_TIMEOUT_MS);
+            return Number.isFinite(configured) && configured > 0 ? Math.max(60_000, configured) : 6 * 60 * 60 * 1000;
+        })(),
     ) {
         this.client = createClient(url, {
             username: username,
@@ -391,13 +399,44 @@ export class WebDAVStorageProvider implements IStorageProvider {
         });
     }
 
+    private async withRequestTimeout<T>(
+        operation: (signal: AbortSignal, refresh: () => void) => Promise<T>,
+        label: string,
+        timeoutMs = this.requestTimeoutMs,
+    ): Promise<T> {
+        const controller = new AbortController();
+        let timeout: ReturnType<typeof setTimeout>;
+        const refresh = () => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => {
+                controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+        };
+        refresh();
+        try {
+            return await operation(controller.signal, refresh);
+        } catch (error) {
+            if (controller.signal.aborted) throw controller.signal.reason;
+            throw error;
+        } finally {
+            clearTimeout(timeout!);
+        }
+    }
+
     async saveFile(tempPath: string, fileName: string, _mimeType?: string, folder?: string | null): Promise<string> {
         try {
             const remotePath = folder ? `${folder}/${fileName}` : fileName;
             if (folder) {
-                await this.client.createDirectory(`/${folder}`, { recursive: true });
+                await this.withRequestTimeout(
+                    signal => this.client.createDirectory(`/${folder}`, { recursive: true, signal }),
+                    'WebDAV create directory',
+                );
             }
-            await this.client.putFileContents(`/${remotePath}`, fs.createReadStream(tempPath));
+            await this.withRequestTimeout(
+                signal => this.client.putFileContents(`/${remotePath}`, fs.createReadStream(tempPath), { signal }),
+                'WebDAV upload',
+                this.uploadTimeoutMs,
+            );
             console.log('[WebDAV] Upload successful:', remotePath);
             return remotePath;
         } catch (error: any) {
@@ -408,7 +447,21 @@ export class WebDAVStorageProvider implements IStorageProvider {
 
     async getFileStream(storedPath: string): Promise<NodeJS.ReadableStream> {
         try {
-            return this.client.createReadStream(`/${storedPath}`);
+            const controller = new AbortController();
+            let timeout: ReturnType<typeof setTimeout>;
+            const refresh = () => {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => {
+                    controller.abort(new Error(`WebDAV download timed out after ${this.requestTimeoutMs}ms`));
+                }, this.requestTimeoutMs);
+            };
+            const stream = this.client.createReadStream(`/${storedPath}`, { signal: controller.signal });
+            refresh();
+            stream.on('data', refresh);
+            stream.once('end', () => clearTimeout(timeout));
+            stream.once('close', () => clearTimeout(timeout));
+            stream.once('error', () => clearTimeout(timeout));
+            return stream;
         } catch (error: any) {
             console.error('[WebDAV] Get stream failed:', error.message);
             throw new Error(`WebDAV get stream failed: ${error.message}`);
@@ -421,7 +474,10 @@ export class WebDAVStorageProvider implements IStorageProvider {
 
     async deleteFile(storedPath: string): Promise<void> {
         try {
-            await this.client.deleteFile(`/${storedPath}`);
+            await this.withRequestTimeout(
+                signal => this.client.deleteFile(`/${storedPath}`, { signal }),
+                'WebDAV delete',
+            );
             console.log('[WebDAV] Delete successful:', storedPath);
         } catch (error: any) {
             console.error('[WebDAV] Delete failed:', error.message);
@@ -431,11 +487,14 @@ export class WebDAVStorageProvider implements IStorageProvider {
 
     async getFileSize(storedPath: string): Promise<number> {
         try {
-            const stat = await this.client.stat(`/${storedPath}`) as any;
+            const stat = await this.withRequestTimeout(
+                signal => this.client.stat(`/${storedPath}`, { signal }),
+                'WebDAV stat',
+            ) as any;
             return stat.size || 0;
         } catch (error: any) {
             console.error('[WebDAV] Get file size failed:', error.message);
-            return 0;
+            throw new Error(`WebDAV get file size failed: ${error.message}`);
         }
     }
 }

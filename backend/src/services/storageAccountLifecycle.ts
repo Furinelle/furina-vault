@@ -80,11 +80,22 @@ export async function deleteStorageAccountWithClient(client: LifecycleClient, ac
 
     const uploadReference = await client.query(
         `SELECT id FROM storage_account_leases
-         WHERE storage_account_id = $1 AND released_at IS NULL AND expires_at > NOW()
+         WHERE storage_account_id = $1 AND released_at IS NULL
          LIMIT 1 FOR UPDATE`,
         [accountId],
     );
     if (uploadReference.rows.length > 0) throw new StorageAccountConflictError('upload');
+
+    const reconciliationReference = await client.query(
+        `SELECT operation_id FROM telegram_write_reconciliations
+         WHERE account_id = $1 AND status = 'pending'
+         UNION ALL
+         SELECT operation_id FROM chunk_upload_reconciliations
+         WHERE account_id = $1 AND status = 'pending'
+         LIMIT 1`,
+        [accountId],
+    );
+    if (reconciliationReference.rows.length > 0) throw new StorageAccountConflictError('upload');
 
     const chunkReference = await client.query(
         `SELECT upload_id FROM chunk_upload_sessions

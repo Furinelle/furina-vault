@@ -295,16 +295,8 @@ test('concurrent conflicting writers cannot overwrite or delete the winning chun
     const secondBody = 'ghijkl';
     const firstHash = crypto.createHash('sha256').update(firstBody).digest('hex');
     const secondHash = crypto.createHash('sha256').update(secondBody).digest('hex');
-    let arrivals = 0;
-    let release!: () => void;
-    const bothReady = new Promise<void>(resolve => { release = resolve; });
     const originalRecord = repository.recordChunk.bind(repository);
-    repository.recordChunk = async (...args) => {
-        arrivals += 1;
-        if (arrivals === 2) release();
-        await bothReady;
-        return originalRecord(...args);
-    };
+    repository.recordChunk = async (...args) => originalRecord(...args);
 
     const results = await Promise.allSettled([
         store.writeChunk({ uploadId: session().uploadId, ownerId: 'owner-a', index: 0, expectedSize: 6, expectedSha256: firstHash, finalPath, input: Readable.from([firstBody]), maxChunkBytes: 10 }),

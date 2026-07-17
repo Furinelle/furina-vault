@@ -18,6 +18,17 @@ interface Queryable {
     query(text: string, params?: unknown[]): Promise<unknown>;
 }
 
+async function ownsChunkReconciliationLease(db: Queryable, operationId: string, leaseToken: string): Promise<boolean> {
+    const result = await db.query(
+        `UPDATE chunk_upload_reconciliations
+         SET lease_expires_at = NOW() + INTERVAL '5 minutes', updated_at = NOW()
+         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'
+         RETURNING operation_id`,
+        [operationId, leaseToken],
+    ) as { rowCount?: number | null };
+    return result.rowCount === 1;
+}
+
 export interface ClaimedChunkReconciliation {
     operationId: string;
     uploadId: string;
@@ -80,10 +91,12 @@ export async function resolveClaimedChunkReconciliation(input: {
     let objectState = row.objectState;
     let indexState = row.indexState;
     const errors: string[] = [];
+    if (!(await ownsChunkReconciliationLease(db, row.operationId, leaseToken))) return 'pending';
     if (row.storedPath && objectState !== 'deleted') {
         try { await input.deleteObject(row.storedPath); objectState = 'deleted'; }
         catch (error) { objectState = 'unknown'; errors.push(`object: ${error instanceof Error ? error.message : String(error)}`); }
     }
+    if (!(await ownsChunkReconciliationLease(db, row.operationId, leaseToken))) return 'pending';
     if (row.fileId && indexState !== 'deleted') {
         try {
             const deleted = await db.query('DELETE FROM files WHERE id = $1', [row.fileId]) as { rowCount?: number | null };
@@ -92,14 +105,16 @@ export async function resolveClaimedChunkReconciliation(input: {
         } catch (error) { indexState = 'unknown'; errors.push(`index: ${error instanceof Error ? error.message : String(error)}`); }
     } else if (!row.fileId && indexState === 'unknown') errors.push('index: 缺少精确 file_id');
     const resolved = objectState === 'deleted' && indexState === 'deleted';
-    await db.query(
+    const update = await db.query(
         `UPDATE chunk_upload_reconciliations SET object_state = $3, index_state = $4,
          status = CASE WHEN $5::boolean THEN 'resolved' ELSE 'pending' END,
          resolution = CASE WHEN $5::boolean THEN 'compensated' ELSE resolution END, reason = $6,
          resolved_at = CASE WHEN $5::boolean THEN NOW() ELSE NULL END, lease_token = NULL, lease_expires_at = NULL, updated_at = NOW()
-         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'`,
+         WHERE operation_id = $1 AND lease_token = $2::uuid AND status = 'pending'
+         RETURNING operation_id`,
         [row.operationId, leaseToken, objectState, indexState, resolved, errors.join('; ') || '重启扫描补偿已确认'],
-    );
+    ) as { rowCount?: number | null };
+    if (update.rowCount !== 1) return 'pending';
     return resolved ? 'resolved' : 'pending';
 }
 

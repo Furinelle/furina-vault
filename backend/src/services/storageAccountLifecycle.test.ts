@@ -28,6 +28,7 @@ test('delete locks account, rechecks active jobs and upload leases, then atomica
         { rows: [] },
         { rows: [] },
         { rows: [] },
+        { rows: [] },
         { rowCount: 3 },
         { rows: [{ id: 'account' }], rowCount: 1 },
     ]);
@@ -36,10 +37,12 @@ test('delete locks account, rechecks active jobs and upload leases, then atomica
     assert.match(client.calls[0].text, /FOR UPDATE/);
     assert.match(client.calls[1].text, /telegram_background_jobs/);
     assert.match(client.calls[2].text, /storage_account_leases/);
-    assert.match(client.calls[3].text, /chunk_upload_sessions/);
-    assert.match(client.calls[3].text, /status IN \('open', 'completing'\)/);
-    assert.match(client.calls[4].text, /DELETE FROM files/);
-    assert.match(client.calls[5].text, /DELETE FROM storage_accounts/);
+    assert.match(client.calls[3].text, /telegram_write_reconciliations/);
+    assert.match(client.calls[3].text, /chunk_upload_reconciliations/);
+    assert.match(client.calls[4].text, /chunk_upload_sessions/);
+    assert.match(client.calls[4].text, /status IN \('open', 'completing'\)/);
+    assert.match(client.calls[5].text, /DELETE FROM files/);
+    assert.match(client.calls[6].text, /DELETE FROM storage_accounts/);
 });
 
 test('delete refuses an account referenced by an upload lease before deleting files', async () => {
@@ -61,6 +64,7 @@ test('delete refuses an account referenced by an open or completing chunk sessio
             { rows: [{ id: 'account', name: 'A', type: 's3', is_active: false }] },
             { rows: [] },
             { rows: [] },
+            { rows: [] },
             { rows: [{ upload_id: 'upload', status }] },
         ]);
         await assert.rejects(
@@ -74,6 +78,7 @@ test('delete refuses an account referenced by an open or completing chunk sessio
 test('delete failure after file delete is surfaced so caller transaction can roll back', async () => {
     const client = new ScriptedClient([
         { rows: [{ id: 'account', name: 'A', type: 'webdav', is_active: false }] },
+        { rows: [] },
         { rows: [] },
         { rows: [] },
         { rows: [] },

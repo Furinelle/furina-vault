@@ -5,6 +5,8 @@ import path from 'path';
 import { getSignedUrl } from '../middleware/signedUrl.js';
 import { getScopedFileById, removePhysicalFile, updateScopedFileById } from '../utils/fileScope.js';
 import { createFileDeletionService } from '../services/fileDeletion.js';
+import { webDestructiveConfirmationStore } from '../services/webDestructiveConfirmation.js';
+import { getAuthToken } from './auth.js';
 import { isPathInside } from '../utils/localPath.js';
 import { generateMediaPreview } from '../utils/thumbnail.js';
 import {
@@ -592,10 +594,24 @@ router.get('/:id([0-9a-fA-F-]{36})/thumbnail', async (req: Request, res: Respons
     }
 });
 
+// 为单文件物理删除签发一次性确认令牌
+router.post('/:id([0-9a-fA-F-]{36})/delete-confirmation', async (req: Request, res: Response) => {
+    const file = await getScopedFileById(req.params.id);
+    if (!file) return res.status(404).json({ error: '文件不存在' });
+    const authToken = getAuthToken(req);
+    if (!authToken) return res.status(401).json({ error: '未认证' });
+    res.json(webDestructiveConfirmationStore.issue({ authToken, action: 'delete_file', objectId: req.params.id }));
+});
+
 // 删除文件
 router.delete('/:id([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
+        const authToken = getAuthToken(req);
+        const confirmationToken = String(req.header('x-confirmation-token') || '');
+        if (!authToken || !confirmationToken || webDestructiveConfirmationStore.consume(confirmationToken, { authToken, action: 'delete_file', objectId: id }).status !== 'ok') {
+            return res.status(409).json({ error: '需要一次性删除确认令牌', code: 'CONFIRMATION_REQUIRED' });
+        }
         const file = await getScopedFileById(id);
 
         if (!file) {

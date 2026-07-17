@@ -332,10 +332,15 @@ class FileAPI {
 
     // 删除文件
     async deleteFile(id: string): Promise<{ status: 'complete'; deletedIds: string[]; message: string }> {
+        const confirmationResponse = await fetch(`${API_BASE}/api/files/${id}/delete-confirmation`, {
+            credentials: 'include', method: 'POST', headers: getHeaders(),
+        });
+        if (!confirmationResponse.ok) throw new Error((await confirmationResponse.json().catch(() => ({}))).error || '无法创建删除确认');
+        const { confirmationToken } = await confirmationResponse.json();
         const response = await fetch(`${API_BASE}/api/files/${id}`, {
             credentials: 'include',
             method: 'DELETE',
-            headers: getHeaders(),
+            headers: getHeaders({ 'X-Confirmation-Token': confirmationToken }),
         });
         if (response.status === 401) throw new Error('UNAUTHORIZED');
         const payload = await response.json().catch(() => ({}));
@@ -591,10 +596,15 @@ class FileAPI {
 
     // 删除账户
     async deleteAccount(accountId: string): Promise<{ success: boolean; message: string }> {
+        const confirmationResponse = await fetch(`${API_BASE}/api/storage/accounts/${accountId}/delete-confirmation`, {
+            credentials: 'include', method: 'POST', headers: getHeaders(),
+        });
+        if (!confirmationResponse.ok) throw new Error((await confirmationResponse.json().catch(() => ({}))).error || '无法创建删除确认');
+        const { confirmationToken } = await confirmationResponse.json();
         const response = await fetch(`${API_BASE}/api/storage/accounts/${accountId}`, {
             credentials: 'include',
             method: 'DELETE',
-            headers: getHeaders(),
+            headers: getHeaders({ 'X-Confirmation-Token': confirmationToken }),
         });
         if (response.status === 401) throw new Error('UNAUTHORIZED');
         if (!response.ok) {
