@@ -28,7 +28,7 @@ VOLUME_NAME=${VOLUME_NAME:-${COMPOSE_PROJECT_NAME:-tg-vault}_file-storage}
 # upper bound of the data volume plus the database dump and safety reserve.
 VOLUME_BYTES=$(docker run --rm -v "$VOLUME_NAME:/data:ro" alpine:3.20 sh -c 'du -sb /data | cut -f1' | tail -1 | cut -f1 | tr -d ' ')
 DATABASE_BYTES=$(docker compose exec -T postgres psql -U tgvault -d tgvault -Atqc 'SELECT pg_database_size(current_database())' | tail -1 | tr -d ' ')
-AVAILABLE_BYTES=${BACKUP_AVAILABLE_BYTES_OVERRIDE:-$(df --output=avail -B1 "$DEST" | tail -1 | tr -d ' ')}
+AVAILABLE_BYTES=${BACKUP_AVAILABLE_BYTES_OVERRIDE:-$(df -Pk "$DEST" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }')}
 MIN_FREE_BYTES=${BACKUP_MIN_FREE_BYTES:-536870912}
 for value in "$VOLUME_BYTES" "$DATABASE_BYTES" "$AVAILABLE_BYTES" "$MIN_FREE_BYTES"; do
   [[ "$value" =~ ^[0-9]+$ ]] || { rm -rf "$DEST"; echo "无法计算备份容量需求。" >&2; exit 1; }

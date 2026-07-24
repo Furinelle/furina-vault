@@ -21,6 +21,8 @@ nano .env
 ```dotenv
 DB_PASSWORD=使用 openssl rand -hex 32 生成的随机值
 IMAGE_VERSION=v2.0.1
+BACKEND_IMAGE=ghcr.io/furinelle/tg-vault-backend
+FRONTEND_IMAGE=ghcr.io/furinelle/tg-vault-frontend
 VITE_API_URL=https://api.example.com
 OAUTH_CALLBACK_BASE_URL=https://api.example.com
 OAUTH_FRONTEND_ORIGIN=https://cloud.example.com
@@ -69,6 +71,14 @@ docker compose up -d --build
 ```
 
 如果 `git status --short` 显示本地改动，先人工确认，不要强制覆盖。
+
+使用已发布的不可变 GHCR 镜像更新时，把 `IMAGE_VERSION` 设置为发布工作流生成的
+`sha-<short-commit>` 标签，然后执行：
+
+```bash
+docker compose pull backend frontend
+docker compose up -d --no-build
+```
 
 可选验证：
 
