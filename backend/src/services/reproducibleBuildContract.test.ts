@@ -43,3 +43,10 @@ test('quality workflow uses lockfile-installed SBOM tooling and exercises deploy
     assert.match(workflow, /bash deploy\/install\.test\.sh/);
     assert.match(workflow, /bash deploy\/backup-restore\.test\.sh/);
 });
+
+test('image jobs build without publishing when Docker Hub credentials are absent', () => {
+    assert.equal((workflow.match(/DOCKER_PUBLISH:/g) || []).length, 2);
+    assert.equal((workflow.match(/if: env\.DOCKER_PUBLISH == 'true'/g) || []).length, 6);
+    assert.equal((workflow.match(/if: env\.DOCKER_PUBLISH != 'true'/g) || []).length, 4);
+    assert.equal((workflow.match(/push: false/g) || []).length, 2);
+});
