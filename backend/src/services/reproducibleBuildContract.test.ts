@@ -19,6 +19,8 @@ test('release images use locked dependencies, pinned bases, verified yt-dlp and 
     assert.match(frontend, /nginx@sha256:/);
     assert.match(compose, /postgres@sha256:/);
     assert.equal((compose.match(/\$\{IMAGE_VERSION:\?IMAGE_VERSION is required\}/g) || []).length, 2);
+    assert.match(compose, /\$\{BACKEND_IMAGE:-tg-vault-backend\}/);
+    assert.match(compose, /\$\{FRONTEND_IMAGE:-tg-vault-frontend\}/);
     assert.doesNotMatch(compose, /IMAGE_VERSION:-latest/);
     assert.match(compose, /OAUTH_CALLBACK_BASE_URL/);
     assert.match(compose, /OAUTH_FRONTEND_ORIGIN/);
@@ -44,10 +46,15 @@ test('quality workflow uses lockfile-installed SBOM tooling and exercises deploy
     assert.match(workflow, /bash deploy\/backup-restore\.test\.sh/);
 });
 
-test('image jobs build without publishing when Docker Hub credentials are absent', () => {
-    assert.equal((workflow.match(/DOCKER_PUBLISH:/g) || []).length, 2);
-    assert.equal((workflow.match(/if: env\.DOCKER_PUBLISH == 'true'/g) || []).length, 6);
-    assert.equal((workflow.match(/if: env\.DOCKER_PUBLISH != 'true'/g) || []).length, 4);
+test('image jobs publish immutable GHCR images while pull requests remain build-only', () => {
+    assert.match(workflow, /packages: write/);
+    assert.equal((workflow.match(/IMAGE_PUBLISH:/g) || []).length, 2);
+    assert.equal((workflow.match(/if: env\.IMAGE_PUBLISH == 'true'/g) || []).length, 6);
+    assert.equal((workflow.match(/if: env\.IMAGE_PUBLISH != 'true'/g) || []).length, 4);
+    assert.equal((workflow.match(/registry: ghcr\.io/g) || []).length, 2);
+    assert.equal((workflow.match(/password: \$\{\{ secrets\.GITHUB_TOKEN \}\}/g) || []).length, 2);
+    assert.equal((workflow.match(/images: ghcr\.io\/furinelle\/tg-vault-/g) || []).length, 2);
+    assert.equal((workflow.match(/type=sha,prefix=sha-/g) || []).length, 2);
     assert.equal((workflow.match(/push: false/g) || []).length, 2);
 });
 
