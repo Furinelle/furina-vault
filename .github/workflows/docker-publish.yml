@@ -27,10 +27,38 @@ jobs:
             frontend/package-lock.json
       - name: Verify backend
         working-directory: backend
-        run: npm ci && npm audit --omit=dev --audit-level=high && npm test && npm run typecheck && npm run build
+        run: npm ci && npm test && npm run typecheck && npm run build
+      - name: Audit backend dependencies
+        working-directory: backend
+        run: |
+          for attempt in 1 2 3; do
+            if npm audit --omit=dev --audit-level=high --fetch-retries=0 --fetch-timeout=60000; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Backend dependency audit failed after 3 attempts."
+              exit 1
+            fi
+            echo "::warning::Backend dependency audit attempt $attempt failed; retrying."
+            sleep $((attempt * 20))
+          done
       - name: Verify frontend
         working-directory: frontend
-        run: npm ci && npm audit --omit=dev --audit-level=high && npm test && npm run lint && npm run build
+        run: npm ci && npm test && npm run lint && npm run build
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: |
+          for attempt in 1 2 3; do
+            if npm audit --omit=dev --audit-level=high --fetch-retries=0 --fetch-timeout=60000; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Frontend dependency audit failed after 3 attempts."
+              exit 1
+            fi
+            echo "::warning::Frontend dependency audit attempt $attempt failed; retrying."
+            sleep $((attempt * 20))
+          done
       - name: Verify deployment scripts
         run: |
           bash -n deploy/*.sh
