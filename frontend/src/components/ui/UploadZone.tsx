@@ -1,16 +1,24 @@
 import { useState, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { UploadCloud, File as FileIcon, Loader2 } from "lucide-react";
+import { UploadCloud, File as FileIcon } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useTranslation } from "react-i18next";
+import type { UploadCapabilities } from "../../services/api";
+import { IndeterminateSpinner } from "./IndeterminateSpinner";
 
 interface UploadZoneProps {
     onDrop?: (files: File[]) => void;
     uploading?: boolean;
     uploadProgress?: number;
+    capabilities?: UploadCapabilities | null;
 }
 
-export const UploadZone = ({ onDrop, uploading = false, uploadProgress = 0 }: UploadZoneProps) => {
+function formatGiB(bytes: number): string {
+    const value = bytes / 1024 / 1024 / 1024;
+    return `${Number.isInteger(value) ? value : value.toFixed(1)} GiB`;
+}
+
+export const UploadZone = ({ onDrop, uploading = false, uploadProgress = 0, capabilities }: UploadZoneProps) => {
     const [isDragActive, setIsDragActive] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const { t } = useTranslation();
@@ -67,9 +75,9 @@ export const UploadZone = ({ onDrop, uploading = false, uploadProgress = 0 }: Up
                 "relative group flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-border py-10 px-4 text-center transition-all duration-300 ease-out cursor-pointer overflow-hidden",
                 isDragActive
                     ? "border-primary bg-primary/5 scale-[1.01]"
-                    : "hover:border-primary/50 hover:bg-accent/30",
-                uploading && "pointer-events-none opacity-80"
+                    : "hover:border-primary/50 hover:bg-accent/30"
             )}
+            aria-label={t("app.dropTitle")}
         >
             <input
                 ref={fileInputRef}
@@ -101,7 +109,7 @@ export const UploadZone = ({ onDrop, uploading = false, uploadProgress = 0 }: Up
                 className="z-10 bg-background p-4 rounded-full shadow-sm mb-4 ring-1 ring-border group-hover:shadow-md transition-shadow"
             >
                 {uploading ? (
-                    <Loader2 className="h-8 w-8 text-primary animate-spin" />
+                    <IndeterminateSpinner label="正在处理上传" size="lg" />
                 ) : (
                     <UploadCloud className={cn("h-8 w-8 transition-colors", isDragActive ? "text-primary" : "text-muted-foreground")} />
                 )}
@@ -110,16 +118,18 @@ export const UploadZone = ({ onDrop, uploading = false, uploadProgress = 0 }: Up
             <div className="z-10 flex flex-col gap-1">
                 <h3 className="text-lg font-semibold tracking-tight">
                     {uploading
-                        ? `上传中... ${uploadProgress}%`
+                        ? t("upload.uploading", { percent: uploadProgress })
                         : isDragActive
-                            ? t("app.dropActive") || "放开以上传"
-                            : t("app.dropTitle") || "点击或拖放文件上传"
+                            ? t("app.dropActive")
+                            : t("app.dropTitle")
                     }
                 </h3>
                 <p className="text-sm text-muted-foreground">
                     {uploading
-                        ? "请稍候，正在上传文件..."
-                        : t("app.dropSubtitle") || "支持图片、视频、音频、文档等各种格式"
+                        ? t("upload.keepUsing")
+                        : capabilities
+                            ? `${t("upload.anyFile")} · 超过 ${Math.round(capabilities.simpleUploadThresholdBytes / 1024 / 1024)} MiB 自动分片 · 最大 ${formatGiB(capabilities.maxChunkUploadBytes)}`
+                            : `${t("upload.anyFile")} · 上传限制加载中…`
                     }
                 </p>
             </div>

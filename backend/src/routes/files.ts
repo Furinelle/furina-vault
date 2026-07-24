@@ -1,9 +1,10 @@
 import { Router, Request, Response } from 'express';
+import { buildStorageCapabilities } from '../utils/storageProductContract.js';
 import { query } from '../db/index.js';
 import fs from 'fs';
 import path from 'path';
 import { getSignedUrl } from '../middleware/signedUrl.js';
-import { getScopedFileById, removePhysicalFile, updateScopedFileById } from '../utils/fileScope.js';
+import { getCurrentStorageScope, getScopedFileById, nextParam, removePhysicalFile, updateScopedFileById } from '../utils/fileScope.js';
 import { createFileDeletionService } from '../services/fileDeletion.js';
 import { webDestructiveConfirmationStore } from '../services/webDestructiveConfirmation.js';
 import { getAuthToken } from './auth.js';
@@ -16,6 +17,9 @@ import {
     normalizeFileQuery,
     type FileQueryScope,
 } from '../services/fileQuery.js';
+import { normalizeFolderPath } from '../utils/folderPath.js';
+import { classifyMediaProxyError } from '../services/mediaProxyError.js';
+import { buildCloudMediaResponse } from '../services/cloudMediaResponse.js';
 
 const router = Router();
 
@@ -74,6 +78,45 @@ async function serveLocalPathWithRange(req: Request, res: Response, filePath: st
 
     res.set('Content-Length', String(stat.size));
     fs.createReadStream(filePath).pipe(res);
+}
+
+async function serveCloudMediaStream(
+    req: Request,
+    res: Response,
+    provider: { getFileStream(path: string, options?: { range?: string }): Promise<NodeJS.ReadableStream> },
+    storedPath: string,
+    mimeType: string,
+): Promise<void> {
+    const range = req.headers.range;
+    const stream = await provider.getFileStream(storedPath, range ? { range } : undefined) as NodeJS.ReadableStream & {
+        upstreamStatus?: number;
+        upstreamHeaders?: Record<string, string | number | string[] | undefined> | { get(name: string): unknown };
+        once(event: string, listener: (...args: any[]) => void): unknown;
+        pipe(destination: NodeJS.WritableStream): unknown;
+        destroy?(error?: Error): void;
+    };
+    const upstream = buildCloudMediaResponse({
+        upstreamStatus: stream.upstreamStatus,
+        upstreamHeaders: stream.upstreamHeaders,
+        requestedRange: range,
+    });
+    res.status(upstream.status).set({
+        'Content-Type': mimeType || 'application/octet-stream',
+        'Cache-Control': 'private, no-store',
+        ...upstream.headers,
+    });
+    stream.once('error', (error: Error) => {
+        console.error('云端媒体流中断:', error);
+        if (!res.headersSent) {
+            const response = classifyMediaProxyError(error);
+            if (response.retryAfter) res.set('Retry-After', String(response.retryAfter));
+            res.status(response.status).json({ code: response.code, error: response.error });
+        } else {
+            res.destroy(error);
+        }
+    });
+    req.once('aborted', () => stream.destroy?.());
+    stream.pipe(res);
 }
 
 function parseRangeHeader(range: string | undefined, size: number): { start: number; end: number } | null {
@@ -209,9 +252,11 @@ router.post('/folders', async (req: Request, res: Response) => {
             return res.status(400).json({ error: '文件夹名称不能为空' });
         }
 
-        const trimmedName = folderName.trim();
-        if (/[\/\\:*?"<>|]/.test(trimmedName)) {
-            return res.status(400).json({ error: '文件夹名包含非法字符' });
+        let trimmedName: string;
+        try {
+            trimmedName = normalizeFolderPath(folderName);
+        } catch (error) {
+            return res.status(400).json({ error: error instanceof Error ? error.message : '文件夹路径无效' });
         }
 
         const { storageManager } = await import('../services/storage.js');
@@ -272,6 +317,12 @@ router.post('/folders/favorite', async (req: Request, res: Response) => {
         if (!folderName || typeof folderName !== 'string') {
             return res.status(400).json({ error: '参数错误' });
         }
+        let normalizedFolder: string;
+        try {
+            normalizedFolder = normalizeFolderPath(folderName);
+        } catch (error) {
+            return res.status(400).json({ error: error instanceof Error ? error.message : '文件夹路径无效' });
+        }
 
         const { storageManager } = await import('../services/storage.js');
         const activeAccountId = storageManager.getActiveAccountId();
@@ -282,13 +333,21 @@ router.post('/folders/favorite', async (req: Request, res: Response) => {
         let params: any[] = [];
 
         if (provider.name === 'local') {
-            selectQuery = 'SELECT COUNT(*)::int as cnt, BOOL_AND(is_favorite)::boolean as all_fav FROM files WHERE source = \'local\' AND folder = $1';
-            updateQuery = 'UPDATE files SET is_favorite = $1, updated_at = NOW() WHERE source = \'local\' AND folder = $2';
-            params = [folderName];
+            selectQuery = `SELECT COUNT(*)::int as cnt, BOOL_AND(is_favorite)::boolean as all_fav
+                           FROM files WHERE source = 'local'
+                           AND (folder = $1 OR LEFT(folder, LENGTH($1) + 1) = $1 || '/')`;
+            updateQuery = `UPDATE files SET is_favorite = $1, updated_at = NOW()
+                           WHERE source = 'local'
+                           AND (folder = $2 OR LEFT(folder, LENGTH($2) + 1) = $2 || '/')`;
+            params = [normalizedFolder];
         } else {
-            selectQuery = 'SELECT COUNT(*)::int as cnt, BOOL_AND(is_favorite)::boolean as all_fav FROM files WHERE storage_account_id = $1 AND folder = $2';
-            updateQuery = 'UPDATE files SET is_favorite = $1, updated_at = NOW() WHERE storage_account_id = $2 AND folder = $3';
-            params = [activeAccountId, folderName];
+            selectQuery = `SELECT COUNT(*)::int as cnt, BOOL_AND(is_favorite)::boolean as all_fav
+                           FROM files WHERE storage_account_id = $1
+                           AND (folder = $2 OR LEFT(folder, LENGTH($2) + 1) = $2 || '/')`;
+            updateQuery = `UPDATE files SET is_favorite = $1, updated_at = NOW()
+                           WHERE storage_account_id = $2
+                           AND (folder = $3 OR LEFT(folder, LENGTH($3) + 1) = $3 || '/')`;
+            params = [activeAccountId, normalizedFolder];
         }
 
         const selectResult = await query(selectQuery, params);
@@ -302,9 +361,9 @@ router.post('/folders/favorite', async (req: Request, res: Response) => {
         const newFavorite = !allFav;
 
         if (provider.name === 'local') {
-            await query(updateQuery, [newFavorite, folderName]);
+            await query(updateQuery, [newFavorite, normalizedFolder]);
         } else {
-            await query(updateQuery, [newFavorite, activeAccountId, folderName]);
+            await query(updateQuery, [newFavorite, activeAccountId, normalizedFolder]);
         }
 
         res.json({ success: true, isFavorite: newFavorite });
@@ -338,6 +397,43 @@ router.get('/:id([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
     }
 });
 
+// 查询媒体源状态（媒体标签本身无法读取错误响应正文）
+router.get('/:id([0-9a-fA-F-]{36})/media-status', async (req: Request, res: Response) => {
+    try {
+        const file = await getScopedFileById(req.params.id);
+        if (!file) return res.status(404).json({ code: 'FILE_NOT_FOUND', error: '文件记录不存在' });
+
+        if (file.preview_path && (file.type === 'image' || file.type === 'video')) {
+            const localPreviewPath = path.join(PREVIEW_DIR, path.basename(file.preview_path));
+            if (fs.existsSync(localPreviewPath)) {
+                return res.json({ available: true, source: 'local_preview' });
+            }
+        }
+
+        if (file.source === 'local' || file.source === 'web') {
+            const filePath = await getSafeLocalFilePath(file);
+            return fs.existsSync(filePath)
+                ? res.json({ available: true, source: 'local' })
+                : res.status(410).json({ code: 'MEDIA_SOURCE_MISSING', error: '服务器中的源文件已不存在。', reason: 'not_found' });
+        }
+
+        const { storageManager } = await import('../services/storage.js');
+        const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
+        if (provider.probeFileReadable) await provider.probeFileReadable(file.path);
+        else if (provider.getFileAvailability) await provider.getFileAvailability(file.path);
+        return res.json({ available: true, source: file.source });
+    } catch (error) {
+        console.error('查询媒体源状态失败:', error);
+        const response = classifyMediaProxyError(error);
+        if (response.retryAfter) res.set('Retry-After', String(response.retryAfter));
+        return res.status(response.status).json({
+            code: response.code,
+            error: response.error,
+            ...(response.reason ? { reason: response.reason } : {}),
+        });
+    }
+});
+
 // 预览文件
 router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response) => {
     try {
@@ -346,6 +442,21 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
 
         if (!file) {
             return res.status(404).json({ error: '文件不存在' });
+        }
+
+        const localPreviewPath = file.preview_path && (file.type === 'image' || file.type === 'video')
+            ? path.join(PREVIEW_DIR, path.basename(file.preview_path))
+            : null;
+        if (localPreviewPath && fs.existsSync(localPreviewPath)) {
+            await serveLocalPathWithRange(
+                req,
+                res,
+                localPreviewPath,
+                file.type === 'video' ? 'video/mp4' : 'image/webp',
+                'public, max-age=86400',
+                `"${file.id}-${file.updated_at}-${file.preview_path}"`,
+            );
+            return;
         }
 
         if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
@@ -357,19 +468,21 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
                 if (url) {
                     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
                     return res.redirect(url);
-                } else {
-                    // 如果提供商不支持预览 URL（如 WebDAV），则流式传输
-                    const stream = await provider.getFileStream(file.path);
-                    res.set({
-                        'Content-Type': file.mime_type || 'application/octet-stream',
-                        'Cache-Control': 'public, max-age=86400',
-                    });
-                    (stream as any).pipe(res);
-                    return;
                 }
+
+                await serveCloudMediaStream(
+                    req,
+                    res,
+                    provider,
+                    file.path,
+                    file.mime_type || 'application/octet-stream',
+                );
+                return;
             } catch (err) {
                 console.error(`获取 ${file.source} 预览链接/流失败:`, err);
-                return res.status(500).json({ error: '获取预览失败' });
+                const response = classifyMediaProxyError(err);
+                if (response.retryAfter) res.set('Retry-After', String(response.retryAfter));
+                return res.status(response.status).json({ code: response.code, error: response.error });
             }
         }
 
@@ -437,20 +550,29 @@ router.get('/:id([0-9a-fA-F-]{36})/original', async (req: Request, res: Response
         if (!file) return res.status(404).json({ error: '文件不存在' });
 
         if (file.source === 'onedrive' || file.source === 'aliyun_oss' || file.source === 's3' || file.source === 'webdav' || file.source === 'google_drive') {
-            const { storageManager } = await import('../services/storage.js');
-            const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
-            const url = await provider.getPreviewUrl(file.path);
-            if (url) {
-                res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-                return res.redirect(url);
+            try {
+                const { storageManager } = await import('../services/storage.js');
+                const provider = storageManager.getProvider(`${file.source}:${file.storage_account_id}`);
+                const url = await provider.getPreviewUrl(file.path);
+                if (url) {
+                    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+                    return res.redirect(url);
+                }
+
+                await serveCloudMediaStream(
+                    req,
+                    res,
+                    provider,
+                    file.path,
+                    file.mime_type || 'application/octet-stream',
+                );
+                return;
+            } catch (error) {
+                console.error('获取原始文件失败:', error);
+                const response = classifyMediaProxyError(error);
+                if (response.retryAfter) res.set('Retry-After', String(response.retryAfter));
+                return res.status(response.status).json({ code: response.code, error: response.error });
             }
-            const stream = await provider.getFileStream(file.path);
-            res.set({
-                'Content-Type': file.mime_type || 'application/octet-stream',
-                'Cache-Control': 'public, max-age=86400',
-            });
-            (stream as any).pipe(res);
-            return;
         }
 
         const filePath = await getSafeLocalFilePath(file);
@@ -725,10 +847,22 @@ router.patch('/:id([0-9a-fA-F-]{36})/move', async (req: Request, res: Response) 
             return res.status(400).json({ error: '文件夹名称格式错误' });
         }
 
-        const trimmedFolder = folder ? folder.trim() : null;
+        let trimmedFolder: string | null = null;
+        try {
+            trimmedFolder = folder ? normalizeFolderPath(folder) : null;
+        } catch (error) {
+            return res.status(400).json({ error: error instanceof Error ? error.message : '文件夹路径无效' });
+        }
 
-        if (trimmedFolder && /[\/\\:*?"<>|]/.test(trimmedFolder)) {
-            return res.status(400).json({ error: '文件夹名包含非法字符' });
+        if (trimmedFolder) {
+            const scope = await getCurrentStorageScope();
+            const folderParam = nextParam(scope, 1);
+            const exists = await query(
+                `SELECT 1 FROM files WHERE ${scope.clause}
+                 AND (folder = ${folderParam} OR LEFT(folder, LENGTH(${folderParam}) + 1) = ${folderParam} || '/') LIMIT 1`,
+                [...scope.params, trimmedFolder],
+            );
+            if (!exists.rows[0]) return res.status(404).json({ error: '目标文件夹不存在' });
         }
 
         const file = await getScopedFileById(id);
@@ -757,10 +891,15 @@ router.post('/:id([0-9a-fA-F-]{36})/share', async (req: Request, res: Response) 
             return res.status(404).json({ error: '文件不存在' });
         }
 
-        // 检查存储源是否支持分享
-        const supportedSources = ['onedrive', 'google_drive'];
-        if (!supportedSources.includes(file.source)) {
-            return res.status(400).json({ error: '当前存储源暂不支持文件分享' });
+        const capabilities = buildStorageCapabilities(String(file.source));
+        if (!capabilities.share) {
+            return res.status(400).json({ error: '当前存储源暂不支持文件分享', code: 'SHARE_UNSUPPORTED' });
+        }
+        if (password && !capabilities.sharePassword) {
+            return res.status(400).json({ error: '当前存储源不支持分享密码', code: 'SHARE_PASSWORD_UNSUPPORTED' });
+        }
+        if (expiration && !capabilities.shareExpiration) {
+            return res.status(400).json({ error: '当前存储源不支持分享过期时间', code: 'SHARE_EXPIRATION_UNSUPPORTED' });
         }
 
         const { storageManager } = await import('../services/storage.js');

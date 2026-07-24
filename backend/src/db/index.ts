@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import { buildSqlLogEvent, parseSqlLoggingConfig, shouldLogSqlQuery, sqlOperation } from '../utils/dbLogging.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -114,6 +115,14 @@ async function initializeDatabase() {
             created_at TIMESTAMPTZ DEFAULT NOW()
         )`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at)`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS task_center_dismissals (
+            source_type VARCHAR(30) NOT NULL,
+            task_id VARCHAR(128) NOT NULL,
+            task_updated_at TIMESTAMPTZ NOT NULL,
+            dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (source_type, task_id)
+        )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_task_center_dismissals_version ON task_center_dismissals(source_type, task_id, task_updated_at)`);
         await pool.query(`CREATE TABLE IF NOT EXISTS storage_account_cooldowns (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             storage_account_id UUID REFERENCES storage_accounts(id) ON DELETE CASCADE,
@@ -140,19 +149,27 @@ export function ensureDatabaseInitialized(): Promise<void> {
     return initializationPromise;
 }
 
+const sqlLoggingConfig = parseSqlLoggingConfig();
+
 pool.on('connect', () => {
-    console.log('📦 已连接到 PostgreSQL 数据库');
+    if (process.env.LOG_LEVEL === 'debug') console.log(JSON.stringify({ event: 'db.connected' }));
 });
 
 pool.on('error', (err) => {
-    console.error('❌ 数据库连接错误:', err);
+    console.error(JSON.stringify({ event: 'db.pool_error', code: (err as any)?.code || 'UNKNOWN' }));
 });
 
 export const query = async (text: string, params?: unknown[]) => {
     const start = Date.now();
     const res = await pool.query(text, params);
     const duration = Date.now() - start;
-    console.log('🔍 执行查询', { text: text.substring(0, 50), duration, rows: res.rowCount });
+    if (shouldLogSqlQuery(duration, sqlLoggingConfig)) {
+        console.log(JSON.stringify(buildSqlLogEvent({
+            durationMs: duration,
+            rowCount: res.rowCount,
+            operation: sqlOperation(text),
+        })));
+    }
     return res;
 };
 

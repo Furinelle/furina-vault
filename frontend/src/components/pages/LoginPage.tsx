@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Eye, EyeOff, LogIn, AlertCircle, ShieldCheck, ArrowLeft } from 'lucide-react';
 import { authService } from '../../services/auth';
+import { IndeterminateSpinner } from '../ui/IndeterminateSpinner';
 
 interface LoginPageProps {
     onLogin: (password: string) => Promise<{ success: boolean; error?: string; requiresTOTP?: boolean }>;
@@ -180,6 +181,8 @@ export const LoginPage = ({ onLogin, setupRequired = false, onSetup }: LoginPage
                                         type="button"
                                         onClick={() => setShowPassword(!showPassword)}
                                         className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                                        aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                                        title={showPassword ? '隐藏密码' : '显示密码'}
                                     >
                                         {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                                     </button>
@@ -231,11 +234,11 @@ export const LoginPage = ({ onLogin, setupRequired = false, onSetup }: LoginPage
                                 className="w-full h-12 mt-6 rounded-xl bg-primary text-primary-foreground font-medium flex items-center justify-center gap-2 hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 {loading ? (
-                                    <div className="w-5 h-5 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                                    <IndeterminateSpinner label={setupRequired ? "正在创建管理员" : "正在登录"} size="md" tone="current" />
                                 ) : (
                                     <>
                                         <LogIn className="w-5 h-5" />
-                                        <span>{setupRequired ? '创建管理员并进入' : '下一步'}</span>
+                                        <span>{setupRequired ? '创建管理员并进入' : '登录'}</span>
                                     </>
                                 )}
                             </motion.button>
@@ -299,7 +302,7 @@ export const LoginPage = ({ onLogin, setupRequired = false, onSetup }: LoginPage
                                 className="w-full h-12 mt-6 rounded-xl bg-primary text-primary-foreground font-medium flex items-center justify-center gap-2 hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 {loading ? (
-                                    <div className="w-5 h-5 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                                    <IndeterminateSpinner label="正在验证身份验证码" size="md" tone="current" />
                                 ) : (
                                     <>
                                         <ShieldCheck className="w-5 h-5" />

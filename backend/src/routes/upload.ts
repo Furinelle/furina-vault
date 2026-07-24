@@ -16,6 +16,9 @@ import { findDuplicateFile, getDuplicateMode } from '../utils/duplicatePolicy.js
 import { saveAndIndexWithCompensation } from '../services/storageWrite.js';
 import { rateLimit } from 'express-rate-limit';
 import { acquireStorageAccountOperationLease, type StorageAccountOperationLease } from '../services/storageAccountOperation.js';
+import { lockStorageAccountForUse } from '../services/storageAccountLifecycle.js';
+import { normalizeFolderPath } from '../utils/folderPath.js';
+import { buildUploadCapabilities, SIMPLE_UPLOAD_MAX_BYTES } from '../utils/uploadCapabilities.js';
 
 const router = Router();
 export const apiRouter = Router();
@@ -72,7 +75,7 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage,
     limits: {
-        fileSize: 2 * 1024 * 1024 * 1024 // 2GB limit
+        fileSize: SIMPLE_UPLOAD_MAX_BYTES,
     }
 });
 
@@ -83,17 +86,50 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     }
 
     const file = req.file;
-    const { folder } = req.body;
+    const { folder, targetProvider, targetAccountId } = req.body;
     const originalName = decodeFilename(file.originalname);
     const mimeType = file.mimetype;
     const size = file.size;
     const tempPath = path.resolve(file.path);
     let storageLease: StorageAccountOperationLease | null = null;
 
-    const target = storageManager.getActiveTarget();
+    let target;
+    try {
+        if (targetProvider) {
+            if (targetAccountId) {
+                const client = await pool.connect();
+                try {
+                    await client.query('BEGIN');
+                    const account = await lockStorageAccountForUse(client, String(targetAccountId));
+                    if (account.type !== String(targetProvider)) throw new Error('上传目标账户与 provider 不匹配');
+                    await client.query('COMMIT');
+                } catch (error) {
+                    await client.query('ROLLBACK').catch(() => undefined);
+                    throw error;
+                } finally {
+                    client.release();
+                }
+            } else if (String(targetProvider) !== 'local') {
+                throw new Error('云存储上传目标缺少账户');
+            }
+            target = storageManager.getTarget(String(targetProvider), targetAccountId ? String(targetAccountId) : null);
+        } else {
+            target = storageManager.getActiveTarget();
+        }
+    } catch (error) {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        return res.status(409).json({ error: error instanceof Error ? error.message : '上传目标无效' });
+    }
     const { provider, accountId: activeAccountId } = target;
+    let requestedFolder: string | null = null;
+    try {
+        requestedFolder = folder ? normalizeFolderPath(folder) : null;
+    } catch (error) {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        return res.status(400).json({ error: error instanceof Error ? error.message : '文件夹路径无效' });
+    }
     const storageRules = await getStoragePathRules();
-    const storageFolder = buildStorageFolderWithRules({ source, folder: folder || null, mimeType, fileName: originalName }, storageRules);
+    const storageFolder = buildStorageFolderWithRules({ source, folder: requestedFolder, mimeType, fileName: originalName }, storageRules);
     // 3. 生成唯一的存储文件名
     const storedName = await getUniqueStoredName(originalName, storageFolder, activeAccountId);
 
@@ -106,8 +142,8 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         await assertStorageTargetWritable(target);
         console.log(`[Upload] 🛠️  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || 'none (local)'}`);
 
-        // 2. 在保存到永久存储前生成缩略图和获取尺寸
-        // 方案A：只在本地存储生成缩略图；OneDrive/S3/OSS/WebDAV/Google Drive 等第三方存储不生成本地缩略图。
+        // Media derivatives are generated from the upload source before cloud providers consume it.
+        // This keeps gallery thumbnails and previews independent from remote download quotas.
         let thumbnailPath = null;
         let previewPath = null;
         let width = null;
@@ -132,7 +168,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             }
         }
 
-        if (provider.name === 'local' && (mimeType.startsWith('image/') || mimeType.startsWith('video/'))) {
+        if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
             try {
                 const thumbResult = await generateThumbnail(tempPath, storedName, mimeType);
                 if (thumbResult) {
@@ -149,7 +185,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
             }
         }
 
-        if (provider.name === 'local' && mimeType.startsWith('image/')) {
+        if (mimeType.startsWith('image/')) {
             try {
                 const previewResult = await generateMediaPreview(tempPath, storedName, mimeType);
                 if (previewResult) {
@@ -181,19 +217,23 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
                 [originalName, storedName, type, mimeType, size, savedPath, thumbnailPath, previewPath, width, height, provider.name, storageFolder, activeAccountId]
             );
         });
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-
         const newFile = result!.rows[0];
 
-        if (provider.name === 'local' && type === 'video') {
-            void generateMediaPreview(storedPath, storedName, mimeType)
+        if (type === 'video') {
+            const previewSource = provider.name === 'local' ? storedPath : tempPath;
+            void generateMediaPreview(previewSource, storedName, mimeType)
                 .then(async (previewResult) => {
                     if (!previewResult) return;
                     const generatedPreviewName = path.basename(previewResult);
                     await query('UPDATE files SET preview_path = $1, updated_at = NOW() WHERE id = $2', [generatedPreviewName, newFile.id]);
                     console.log(`[Upload] 🎞️ Video preview generated async: ${generatedPreviewName}`);
                 })
-                .catch((error) => console.error('异步生成视频预览失败:', error));
+                .catch((error) => console.error('异步生成视频预览失败:', error))
+                .finally(() => {
+                    if (provider.name !== 'local' && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+                });
+        } else if (fs.existsSync(tempPath)) {
+            fs.unlinkSync(tempPath);
         }
 
         res.json({
@@ -206,7 +246,10 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
                 thumbnailUrl: thumbnailPath ? getSignedUrl(newFile.id, 'thumbnail') : undefined,
                 previewUrl: getSignedUrl(newFile.id, 'preview'),
                 date: newFile.created_at,
-                source: provider.name
+                source: provider.name,
+                folder: storageFolder,
+                storageAccountId: activeAccountId,
+                target: { provider: provider.name, accountId: activeAccountId, folder: storageFolder },
             }
         });
     } catch (error) {
@@ -220,6 +263,11 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         await storageLease?.release();
     }
 };
+
+// 服务端上传能力契约（前端必须以此决定直传/分片与展示真实限制）
+router.get('/capabilities', (_req: Request, res: Response) => {
+    res.json(buildUploadCapabilities());
+});
 
 // 内部上传接口（前端使用）
 router.post('/', uploadLimiter, upload.single('file'), async (req: Request, res: Response) => {
