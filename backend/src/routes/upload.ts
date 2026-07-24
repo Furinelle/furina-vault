@@ -19,6 +19,7 @@ import { acquireStorageAccountOperationLease, type StorageAccountOperationLease 
 import { lockStorageAccountForUse } from '../services/storageAccountLifecycle.js';
 import { normalizeFolderPath } from '../utils/folderPath.js';
 import { buildUploadCapabilities, SIMPLE_UPLOAD_MAX_BYTES } from '../utils/uploadCapabilities.js';
+import { cleanupStaleSimpleUploadTempFiles, resolveSimpleUploadTempDir } from '../services/simpleUploadTemp.js';
 
 const router = Router();
 export const apiRouter = Router();
@@ -55,10 +56,19 @@ function decodeFilename(filename: string): string {
     return filename;
 }
 
-const TEMP_DIR = path.join(process.cwd(), 'data', 'temp');
+const TEMP_DIR = resolveSimpleUploadTempDir();
 if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
+const configuredTempMaxAge = Number(process.env.UPLOAD_TEMP_MAX_AGE_MS);
+const TEMP_MAX_AGE_MS = Number.isFinite(configuredTempMaxAge) && configuredTempMaxAge > 0
+    ? configuredTempMaxAge
+    : 24 * 60 * 60 * 1000;
+void cleanupStaleSimpleUploadTempFiles(TEMP_DIR, TEMP_MAX_AGE_MS)
+    .then(removed => {
+        if (removed.length > 0) console.log(`[Upload] Cleaned ${removed.length} stale temporary file(s)`);
+    })
+    .catch(() => console.warn('[Upload] Failed to clean stale temporary files'));
 
 // 配置 multer 存储到临时目录
 const storage = multer.diskStorage({
@@ -92,55 +102,51 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
     const size = file.size;
     const tempPath = path.resolve(file.path);
     let storageLease: StorageAccountOperationLease | null = null;
+    let deferredTempCleanup = false;
 
-    let target;
     try {
-        if (targetProvider) {
-            if (targetAccountId) {
-                const client = await pool.connect();
-                try {
-                    await client.query('BEGIN');
-                    const account = await lockStorageAccountForUse(client, String(targetAccountId));
-                    if (account.type !== String(targetProvider)) throw new Error('上传目标账户与 provider 不匹配');
-                    await client.query('COMMIT');
-                } catch (error) {
-                    await client.query('ROLLBACK').catch(() => undefined);
-                    throw error;
-                } finally {
-                    client.release();
+        let target;
+        try {
+            if (targetProvider) {
+                if (targetAccountId) {
+                    const client = await pool.connect();
+                    try {
+                        await client.query('BEGIN');
+                        const account = await lockStorageAccountForUse(client, String(targetAccountId));
+                        if (account.type !== String(targetProvider)) throw new Error('上传目标账户与 provider 不匹配');
+                        await client.query('COMMIT');
+                    } catch (error) {
+                        await client.query('ROLLBACK').catch(() => undefined);
+                        throw error;
+                    } finally {
+                        client.release();
+                    }
+                } else if (String(targetProvider) !== 'local') {
+                    throw new Error('云存储上传目标缺少账户');
                 }
-            } else if (String(targetProvider) !== 'local') {
-                throw new Error('云存储上传目标缺少账户');
+                target = storageManager.getTarget(String(targetProvider), targetAccountId ? String(targetAccountId) : null);
+            } else {
+                target = storageManager.getActiveTarget();
             }
-            target = storageManager.getTarget(String(targetProvider), targetAccountId ? String(targetAccountId) : null);
-        } else {
-            target = storageManager.getActiveTarget();
+        } catch (error) {
+            return res.status(409).json({ error: error instanceof Error ? error.message : '上传目标无效' });
         }
-    } catch (error) {
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-        return res.status(409).json({ error: error instanceof Error ? error.message : '上传目标无效' });
-    }
-    const { provider, accountId: activeAccountId } = target;
-    let requestedFolder: string | null = null;
-    try {
-        requestedFolder = folder ? normalizeFolderPath(folder) : null;
-    } catch (error) {
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-        return res.status(400).json({ error: error instanceof Error ? error.message : '文件夹路径无效' });
-    }
-    const storageRules = await getStoragePathRules();
-    const storageFolder = buildStorageFolderWithRules({ source, folder: requestedFolder, mimeType, fileName: originalName }, storageRules);
-    // 3. 生成唯一的存储文件名
-    const storedName = await getUniqueStoredName(originalName, storageFolder, activeAccountId);
+        const { provider, accountId: activeAccountId } = target;
+        let requestedFolder: string | null = null;
+        try {
+            requestedFolder = folder ? normalizeFolderPath(folder) : null;
+        } catch (error) {
+            return res.status(400).json({ error: error instanceof Error ? error.message : '文件夹路径无效' });
+        }
+        const storageRules = await getStoragePathRules();
+        const storageFolder = buildStorageFolderWithRules({ source, folder: requestedFolder, mimeType, fileName: originalName }, storageRules);
+        const storedName = await getUniqueStoredName(originalName, storageFolder, activeAccountId);
 
-    console.log(`[Upload] 📁 Received file: ${originalName} (${mimeType}, ${size} bytes)`);
-    console.log(`[Upload] 🏠 Local temp path: ${tempPath}`);
-
-    try {
+        console.log(`[Upload] Received ${size} byte file (${mimeType})`);
         storageLease = await acquireStorageAccountOperationLease(pool, activeAccountId, 'web_upload');
         // 1. 使用请求开始时捕获的不可变存储目标
         await assertStorageTargetWritable(target);
-        console.log(`[Upload] 🛠️  Current storage provider: ${provider.name}, activeAccountId: ${activeAccountId || 'none (local)'}`);
+        console.log(`[Upload] Current storage provider: ${provider.name}`);
 
         // Media derivatives are generated from the upload source before cloud providers consume it.
         // This keeps gallery thumbnails and previews independent from remote download quotas.
@@ -152,7 +158,6 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         if (duplicateMode === 'skip') {
             const duplicate = await findDuplicateFile(originalName, storageFolder, size, activeAccountId);
             if (duplicate) {
-                if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
                 return res.json({
                     success: true,
                     skipped: true,
@@ -221,6 +226,7 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
 
         if (type === 'video') {
             const previewSource = provider.name === 'local' ? storedPath : tempPath;
+            deferredTempCleanup = provider.name !== 'local';
             void generateMediaPreview(previewSource, storedName, mimeType)
                 .then(async (previewResult) => {
                     if (!previewResult) return;
@@ -230,10 +236,8 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
                 })
                 .catch((error) => console.error('异步生成视频预览失败:', error))
                 .finally(() => {
-                    if (provider.name !== 'local' && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+                    if (provider.name !== 'local') void fs.promises.unlink(tempPath).catch(() => undefined);
                 });
-        } else if (fs.existsSync(tempPath)) {
-            fs.unlinkSync(tempPath);
         }
 
         res.json({
@@ -254,13 +258,15 @@ const handleUpload = async (req: Request, res: Response, source: string = 'web')
         });
     } catch (error) {
         console.error('上传处理失败:', error);
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
         if (isStorageCooldownError(error)) {
             return sendStorageCooldownHttpError(res, error);
         }
         res.status(500).json({ error: '文件上传失败' });
     } finally {
         await storageLease?.release();
+        if (!deferredTempCleanup) {
+            await fs.promises.unlink(tempPath).catch(() => undefined);
+        }
     }
 };
 

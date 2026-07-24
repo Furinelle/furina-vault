@@ -1,6 +1,8 @@
 
 import http from 'http';
 import axios from 'axios';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { URL } from 'url';
 
 // ============================================
@@ -36,9 +38,9 @@ const server = http.createServer(async (req, res) => {
     const error = url.searchParams.get('error');
 
     if (error) {
-        console.error('授权失败:', error, url.searchParams.get('error_description'));
+        console.error('授权失败:', error);
         res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(`<h1>授权失败</h1><p>${error}</p>`);
+        res.end('<h1>授权失败</h1><p>授权服务返回了错误，请检查终端中的错误代码。</p>');
         server.close();
         return;
     }
@@ -62,14 +64,26 @@ const server = http.createServer(async (req, res) => {
             );
 
             const { access_token, refresh_token, expires_in } = tokenRes.data;
+            const tokenOutput = process.env.ONEDRIVE_TOKEN_OUTPUT?.trim();
+            if (tokenOutput) {
+                const outputPath = path.resolve(tokenOutput);
+                await fs.mkdir(path.dirname(outputPath), { recursive: true, mode: 0o700 });
+                await fs.writeFile(
+                    outputPath,
+                    JSON.stringify({ access_token, refresh_token, expires_in }, null, 2),
+                    { encoding: 'utf8', mode: 0o600 },
+                );
+                await fs.chmod(outputPath, 0o600);
+                console.log(`令牌已写入权限受限文件：${outputPath}`);
+            }
 
             console.log('==========================================');
             console.log('✓ 授权成功！');
             console.log('==========================================\n');
-            console.log(`Access Token (有效期 ${expires_in} 秒):`);
-            console.log(access_token.substring(0, 100) + '...\n');
-            console.log('Refresh Token 已生成。请通过应用设置页面保存，或保存到安全的密码管理器/环境变量中。');
-            console.log('为避免终端日志泄露，脚本不再打印完整 refresh token。');
+            console.log(`令牌已生成（Access Token 有效期 ${expires_in} 秒），不会输出到终端日志。`);
+            if (!tokenOutput) {
+                console.log('如需保存，请设置 ONEDRIVE_TOKEN_OUTPUT 为权限受控的目标文件后重新授权。');
+            }
 
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(`
@@ -77,16 +91,16 @@ const server = http.createServer(async (req, res) => {
                 <head><title>授权成功</title></head>
                 <body style="font-family: Arial; padding: 40px; text-align: center;">
                     <h1 style="color: green;">✓ 授权成功！</h1>
-                    <p>请返回终端查看令牌信息。</p>
+                    <p>令牌不会显示在网页或终端日志中。</p>
                     <p>您可以关闭此窗口。</p>
                 </body>
                 </html>
             `);
 
-        } catch (err: any) {
-            console.error('换取令牌失败:', err.response?.data || err.message);
+        } catch {
+            console.error('换取令牌失败');
             res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(`<h1>换取令牌失败</h1><pre>${JSON.stringify(err.response?.data, null, 2)}</pre>`);
+            res.end('<h1>换取令牌失败</h1><p>请返回终端检查配置后重试。</p>');
         }
 
         server.close();

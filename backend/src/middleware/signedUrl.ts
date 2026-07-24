@@ -6,6 +6,11 @@ import { requireAuth } from '../routes/auth.js';
 export type SignedUrlType = 'preview' | 'thumbnail' | 'download';
 
 const SIGNED_URL_TYPES = new Set<SignedUrlType>(['preview', 'thumbnail', 'download']);
+export const SIGNED_URL_MAX_EXPIRES_IN_SECONDS: Record<SignedUrlType, number> = {
+    thumbnail: 24 * 60 * 60,
+    preview: 60 * 60,
+    download: 60 * 60,
+};
 
 function normalizeSignedUrlType(value: string | undefined): SignedUrlType | null {
     if (!value) return null;
@@ -39,9 +44,14 @@ export function generateSignature(fileId: string, typeOrExpires: SignedUrlType |
     return crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex');
 }
 
-// 生成签名的 URL helper
-export function getSignedUrl(fileId: string, type: SignedUrlType, expiresIn: number = 24 * 60 * 60) {
-    const expires = Date.now() + (expiresIn * 1000);
+// 生成签名的 URL helper。内部调用也必须遵守与公开签发端点相同的类型上限。
+export function getSignedUrl(fileId: string, type: SignedUrlType, expiresIn?: number) {
+    const requested = expiresIn === undefined ? SIGNED_URL_MAX_EXPIRES_IN_SECONDS[type] : Math.floor(expiresIn);
+    if (!Number.isFinite(requested) || requested <= 0) {
+        throw new Error('Invalid signed URL expiration');
+    }
+    const effectiveExpiresIn = Math.min(requested, SIGNED_URL_MAX_EXPIRES_IN_SECONDS[type]);
+    const expires = Date.now() + (effectiveExpiresIn * 1000);
     const sign = generateSignature(fileId, type, expires);
     return `/api/files/${fileId}/${type}?sign=${sign}&expires=${expires}`;
 }
@@ -53,7 +63,12 @@ export function verifySignedUrl(req: Request): boolean {
     const { id, type } = getSignedUrlRouteParts(req);
 
     if (typeof sign !== 'string' || typeof expires !== 'string' || typeof id !== 'string' || !type) {
-        console.log('[SignedURL] Missing or invalid params:', { sign, expires, id, type });
+        console.log('[SignedURL] Missing or invalid params:', {
+            hasSign: typeof sign === 'string',
+            hasExpires: typeof expires === 'string',
+            id,
+            type,
+        });
         return false;
     }
 

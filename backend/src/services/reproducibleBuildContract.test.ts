@@ -36,3 +36,10 @@ test('release images use locked dependencies, pinned bases, verified yt-dlp and 
     assert.match(workflow, /Generate CycloneDX SBOM release assets/);
     assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40}/);
 });
+
+test('quality workflow uses lockfile-installed SBOM tooling and exercises deployment scripts', () => {
+    assert.doesNotMatch(workflow, /npx --yes @cyclonedx\/cyclonedx-npm/);
+    assert.match(workflow, /npm --prefix backend exec -- cyclonedx-npm/);
+    assert.match(workflow, /bash deploy\/install\.test\.sh/);
+    assert.match(workflow, /bash deploy\/backup-restore\.test\.sh/);
+});

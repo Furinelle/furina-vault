@@ -11,7 +11,7 @@ test('cloud image uploads generate local thumbnails and previews from the tempor
 
 test('cloud video temporary source survives until asynchronous preview generation settles', () => {
     assert.match(source, /const previewSource = provider\.name === 'local' \? storedPath : tempPath/);
-    assert.match(source, /generateMediaPreview\(previewSource[\s\S]*\.finally\(\(\) => \{[\s\S]*fs\.unlinkSync\(tempPath\)/);
+    assert.match(source, /generateMediaPreview\(previewSource[\s\S]*\.finally\(\(\) => \{[\s\S]*fs\.promises\.unlink\(tempPath\)/);
     const indexedAt = source.indexOf('const storedPath = await saveAndIndexWithCompensation');
     const videoAt = source.indexOf("if (type === 'video')", indexedAt);
     assert.ok(indexedAt >= 0 && videoAt > indexedAt);

@@ -23,6 +23,7 @@ import { normalizeRequestId } from './services/operationalEvents.js';
 import { markTransferTasksAfterRestart } from './services/transferTasks.js';
 import { initializeYtDlpQueue } from './services/ytDlpDownload.js';
 import { logRuntimeConfigSummary, validateRuntimeConfig } from './utils/runtimeConfig.js';
+import { PRIVATE_MEDIA_CACHE_CONTROL } from './services/mediaCachePolicy.js';
 
 dotenv.config();
 const runtimeConfigSummary = validateRuntimeConfig();
@@ -123,13 +124,17 @@ app.use('/api/auth', authRouter);
 
 // 静态文件服务（需要认证）
 app.use('/uploads', requireAuth, express.static(UPLOAD_DIR, {
-    maxAge: '1d',
     etag: true,
+    setHeaders: (_res) => {
+        _res.setHeader('Cache-Control', PRIVATE_MEDIA_CACHE_CONTROL);
+    },
 }));
 
 app.use('/thumbnails', requireAuth, express.static(THUMBNAIL_DIR, {
-    maxAge: '7d',
     etag: true,
+    setHeaders: (_res) => {
+        _res.setHeader('Cache-Control', PRIVATE_MEDIA_CACHE_CONTROL);
+    },
 }));
 
 // API 路由（需要认证）

@@ -1,35 +1,105 @@
-import dns from 'dns/promises';
-import net from 'net';
-
-function ipv4ToInt(ip: string): number {
-    return ip.split('.').reduce((acc, part) => ((acc << 8) + Number(part)) >>> 0, 0);
-}
-
-function isPrivateIPv4(ip: string): boolean {
-    const n = ipv4ToInt(ip);
-    const ranges: Array<[string, string]> = [
-        ['0.0.0.0', '0.255.255.255'],
-        ['10.0.0.0', '10.255.255.255'],
-        ['127.0.0.0', '127.255.255.255'],
-        ['169.254.0.0', '169.254.255.255'],
-        ['172.16.0.0', '172.31.255.255'],
-        ['192.168.0.0', '192.168.255.255'],
-        ['224.0.0.0', '239.255.255.255'],
-        ['240.0.0.0', '255.255.255.255'],
-    ];
-    return ranges.some(([start, end]) => n >= ipv4ToInt(start) && n <= ipv4ToInt(end));
-}
-
-function isPrivateIPv6(ip: string): boolean {
-    const normalized = ip.toLowerCase();
-    return normalized === '::1' || normalized === '::' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:');
-}
+import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import { Duplex } from 'node:stream';
+import ipaddr from 'ipaddr.js';
 
 export function isPrivateAddress(ip: string): boolean {
-    const version = net.isIP(ip);
-    if (version === 4) return isPrivateIPv4(ip);
-    if (version === 6) return isPrivateIPv6(ip);
-    return true;
+    try {
+        let address = ipaddr.parse(ip);
+        if (address instanceof ipaddr.IPv6 && address.isIPv4MappedAddress()) {
+            address = address.toIPv4Address();
+        }
+        return address.range() !== 'unicast';
+    } catch {
+        return true;
+    }
+}
+
+type LookupCallback = (
+    error: NodeJS.ErrnoException | null,
+    address?: string | Array<{ address: string; family: number }>,
+    family?: number,
+) => void;
+
+function publicOnlyLookup(
+    hostname: string,
+    options: number | { family?: number; all?: boolean },
+    callback: LookupCallback,
+): void {
+    const normalizedOptions = typeof options === 'number' ? { family: options } : options || {};
+    void dns.lookup(hostname, {
+        all: true,
+        family: normalizedOptions.family || 0,
+        verbatim: true,
+    }).then(addresses => {
+        if (addresses.length === 0 || addresses.some(item => isPrivateAddress(item.address))) {
+            const error = Object.assign(
+                new Error('不允许连接内网、回环或保留地址'),
+                { code: 'ERR_PRIVATE_NETWORK_ADDRESS' },
+            );
+            callback(error);
+            return;
+        }
+        if (normalizedOptions.all) {
+            callback(null, addresses);
+            return;
+        }
+        callback(null, addresses[0].address, addresses[0].family);
+    }).catch(error => callback(error as NodeJS.ErrnoException));
+}
+
+function connectionHostname(options: http.ClientRequestArgs): string {
+    return String(options.hostname || options.host || '').replace(/^\[|\]$/g, '');
+}
+
+class PublicOnlyHttpAgent extends http.Agent {
+    constructor() {
+        super({ lookup: publicOnlyLookup as any });
+    }
+
+    override createConnection(
+        options: http.ClientRequestArgs,
+        callback?: (error: Error | null, stream: Duplex) => void,
+    ): Duplex | null | undefined {
+        const hostname = connectionHostname(options);
+        if (net.isIP(hostname) && isPrivateAddress(hostname)) {
+            const error = new Error('不允许连接内网、回环或保留地址');
+            process.nextTick(() => callback?.(error, null as never));
+            return undefined;
+        }
+        return super.createConnection(options, callback as any);
+    }
+}
+
+class PublicOnlyHttpsAgent extends https.Agent {
+    constructor() {
+        super({ lookup: publicOnlyLookup as any });
+    }
+
+    override createConnection(
+        options: https.RequestOptions,
+        callback?: (error: Error | null, stream: Duplex) => void,
+    ): Duplex | null | undefined {
+        const hostname = connectionHostname(options);
+        if (net.isIP(hostname) && isPrivateAddress(hostname)) {
+            const error = new Error('不允许连接内网、回环或保留地址');
+            process.nextTick(() => callback?.(error, null as never));
+            return undefined;
+        }
+        return super.createConnection(options, callback as any);
+    }
+}
+
+export function createPublicOnlyHttpAgents(): {
+    httpAgent: http.Agent;
+    httpsAgent: https.Agent;
+} {
+    return {
+        httpAgent: new PublicOnlyHttpAgent(),
+        httpsAgent: new PublicOnlyHttpsAgent(),
+    };
 }
 
 export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {

@@ -106,6 +106,9 @@ CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
 CREATE INDEX IF NOT EXISTS idx_files_is_favorite ON files(is_favorite);
 CREATE INDEX IF NOT EXISTS idx_files_storage_account_id ON files(storage_account_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_account_path_unique
+    ON files(storage_account_id, path)
+    WHERE storage_account_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_files_account_created ON files(storage_account_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_files_source_created ON files(source, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_files_account_fav_created ON files(storage_account_id, is_favorite, created_at DESC, id DESC);

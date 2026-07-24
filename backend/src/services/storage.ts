@@ -4,6 +4,7 @@ import axios from 'axios';
 import OSS from 'ali-oss';
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl as getS3SignedUrl } from '@aws-sdk/s3-request-presigner';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { createClient, WebDAVClient } from 'webdav';
 import { google } from 'googleapis';
 import { query, pool } from '../db/index.js';
@@ -23,6 +24,7 @@ import {
 import { DEFAULT_STORAGE_COOLDOWN_MS, STORAGE_COOLDOWN_REASON_DAILY_UPLOAD_LIMIT } from './storageCooldown.js';
 import { switchStorageAccountWithClient, switchStorageToLocalWithClient } from './storageAccountLifecycle.js';
 import { validateConfiguredStorageTarget } from './storageTargetReadiness.js';
+import { createPublicOnlyHttpAgents } from '../utils/networkSecurity.js';
 
 export class StorageQuotaCooldownError extends Error {
     provider: string;
@@ -327,6 +329,7 @@ export class S3StorageProvider implements IStorageProvider {
         private bucket: string,
         private forcePathStyle: boolean = false
     ) {
+        const { httpAgent, httpsAgent } = createPublicOnlyHttpAgents();
         this.client = new S3Client({
             endpoint: endpoint,
             region: region,
@@ -338,6 +341,7 @@ export class S3StorageProvider implements IStorageProvider {
             // R2 对新版 SDK 默认的 flexible checksum 支持不完整，预签名 URL 会被判定 AccessDenied
             requestChecksumCalculation: 'WHEN_REQUIRED',
             responseChecksumValidation: 'WHEN_REQUIRED',
+            requestHandler: new NodeHttpHandler({ httpAgent, httpsAgent }),
         });
     }
 
@@ -424,26 +428,22 @@ export class S3StorageProvider implements IStorageProvider {
         }
     }
 
-    /**
-     * 列举桶内全部对象（分页遍历），用于"从存储桶导入"
-     */
-    async listObjects(): Promise<{ key: string; size: number }[]> {
-        const objects: { key: string; size: number }[] = [];
-        let continuationToken: string | undefined;
-        do {
-            const command = new ListObjectsV2Command({
-                Bucket: this.bucket,
-                ContinuationToken: continuationToken,
-                MaxKeys: 1000,
-            });
-            const response = await this.client.send(command);
-            for (const item of response.Contents || []) {
-                if (!item.Key) continue;
-                objects.push({ key: item.Key, size: Number(item.Size || 0) });
-            }
-            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
-        } while (continuationToken);
-        return objects;
+    /** Returns one bounded bucket page for retry-safe incremental importing. */
+    async listObjectsPage(continuationToken?: string): Promise<{
+        objects: { key: string; size: number }[];
+        nextContinuationToken?: string;
+    }> {
+        const response = await this.client.send(new ListObjectsV2Command({
+            Bucket: this.bucket,
+            ContinuationToken: continuationToken,
+            MaxKeys: 1000,
+        }));
+        return {
+            objects: (response.Contents || [])
+                .filter(item => Boolean(item.Key))
+                .map(item => ({ key: item.Key!, size: Number(item.Size || 0) })),
+            nextContinuationToken: response.IsTruncated ? response.NextContinuationToken : undefined,
+        };
     }
 }
 
@@ -466,9 +466,12 @@ export class WebDAVStorageProvider implements IStorageProvider {
             return Number.isFinite(configured) && configured > 0 ? Math.max(60_000, configured) : 6 * 60 * 60 * 1000;
         })(),
     ) {
+        const { httpAgent, httpsAgent } = createPublicOnlyHttpAgents();
         this.client = createClient(url, {
             username: username,
-            password: password
+            password: password,
+            httpAgent,
+            httpsAgent,
         });
     }
 

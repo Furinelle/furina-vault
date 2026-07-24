@@ -3,7 +3,12 @@ import { sha256Hex } from './chunkHash';
 
 import { API_BASE } from './config';
 import { classifyBatchDeleteResponse, type BatchDeleteResult } from './batchDeleteContract';
-import { chunkBounds, parseChunkUploadInit } from './chunkUploadProtocol';
+import {
+    advanceChunkUploadProgress,
+    chunkBounds,
+    parseChunkUploadInit,
+    runChunkUploadWorkers,
+} from './chunkUploadProtocol';
 
 // 同时在途的分块上传请求数，避免单流上传跑不满带宽
 const CHUNK_CONCURRENCY = 4;
@@ -588,6 +593,10 @@ class FileAPI {
         let maxChunkBytes: number;
         let totalChunks: number;
         let uploadedBytes = resumeSession?.receivedBytes || 0;
+        let progressState = {
+            localCompletedBytes: resumeSession?.receivedBytes || 0,
+            reportedBytes: resumeSession?.receivedBytes || 0,
+        };
         let uploadedChunks = new Set(resumeSession?.uploadedChunks || []);
 
         if (resumeSession) {
@@ -647,13 +656,13 @@ class FileAPI {
         }
 
         try {
-            // 并发上传尚未完成的分块，同时保留上游断点续传语义。
-            let nextChunkIndex = 0;
-            const uploadOneChunk = async (chunkIndex: number) => {
+            // 并发上传尚未完成的分块；任一失败会中止并等待所有在途请求结束。
+            const uploadOneChunk = async (chunkIndex: number, workerSignal: AbortSignal) => {
                 if (uploadedChunks.has(chunkIndex)) return;
                 const { start, end } = chunkBounds(file.size, chunkIndex, maxChunkBytes);
                 const chunk = file.slice(start, end);
                 const chunkHash = await sha256Hex(chunk);
+                if (workerSignal.aborted) throw workerSignal.reason;
 
                 const chunkResponse = await fetch(`${API_BASE}/api/chunked/chunk`, {
                     credentials: 'include',
@@ -666,7 +675,7 @@ class FileAPI {
                         'X-Chunk-Sha256': chunkHash,
                     }),
                     body: chunk,
-                    signal,
+                    signal: workerSignal,
                 });
 
                 if (chunkResponse.status === 401 || chunkResponse.status === 428) throw new Error('UNAUTHORIZED');
@@ -676,7 +685,13 @@ class FileAPI {
                 }
                 const chunkResult = await chunkResponse.json().catch(() => ({}));
                 const serverReceivedBytes = Number(chunkResult.receivedBytes || 0);
-                uploadedBytes = Math.min(file.size, Math.max(uploadedBytes + chunk.size, serverReceivedBytes));
+                progressState = advanceChunkUploadProgress(
+                    progressState,
+                    chunk.size,
+                    serverReceivedBytes,
+                    file.size,
+                );
+                uploadedBytes = progressState.reportedBytes;
 
                 onProgress?.({
                     loaded: uploadedBytes,
@@ -685,15 +700,12 @@ class FileAPI {
                 });
             };
 
-            const worker = async () => {
-                while (nextChunkIndex < totalChunks) {
-                    const chunkIndex = nextChunkIndex++;
-                    await uploadOneChunk(chunkIndex);
-                }
-            };
-
-            const workerCount = Math.min(CHUNK_CONCURRENCY, totalChunks);
-            await Promise.all(Array.from({ length: workerCount }, () => worker()));
+            await runChunkUploadWorkers({
+                totalChunks,
+                concurrency: CHUNK_CONCURRENCY,
+                uploadChunk: uploadOneChunk,
+                signal,
+            });
 
             const completeResponse = await fetch(`${API_BASE}/api/chunked/complete`, {
                 credentials: 'include',

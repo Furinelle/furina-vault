@@ -13,12 +13,17 @@ fi
 
 if [[ ! -f .env ]]; then
   umask 077
+  default_image_version=$(git describe --tags --always --dirty 2>/dev/null || printf 'worktree')
+  default_image_version=${default_image_version//[^A-Za-z0-9_.-]/-}
   cat > .env <<EOF
 DB_PASSWORD=$(openssl rand -hex 32)
 SESSION_SECRET=$(openssl rand -hex 32)
 STORAGE_CREDENTIALS_SECRET=$(openssl rand -hex 32)
+IMAGE_VERSION=$default_image_version
 VITE_API_URL=https://api.example.com
 CORS_ORIGIN=https://cloud.example.com
+OAUTH_CALLBACK_BASE_URL=https://api.example.com
+OAUTH_FRONTEND_ORIGIN=https://cloud.example.com
 DOMAIN=cloud.example.com
 COOKIE_SECURE=true
 EOF

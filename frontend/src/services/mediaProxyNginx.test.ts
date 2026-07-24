@@ -21,3 +21,10 @@ test('host Nginx deployment templates preserve Range and disable buffering', () 
         assert.match(template, /proxy_request_buffering off;/);
     }
 });
+
+test('authenticated static media cannot be cached by shared proxies', () => {
+    for (const template of [productionTemplate, initTemplate]) {
+        assert.match(template, /location \/uploads[\s\S]*proxy_hide_header Cache-Control;[\s\S]*Cache-Control "private, no-store"/);
+        assert.match(template, /location \/thumbnails[\s\S]*proxy_hide_header Cache-Control;[\s\S]*Cache-Control "private, no-store"/);
+    }
+});

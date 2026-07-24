@@ -3,24 +3,40 @@ import crypto from 'crypto';
 import { TOKEN_EXPIRY } from '../utils/config.js';
 import { query } from '../db/index.js';
 import { createWebSessionStore } from '../services/webSessionStore.js';
-import { generateSignature, type SignedUrlType } from '../middleware/signedUrl.js';
+import { generateSignature, SIGNED_URL_MAX_EXPIRES_IN_SECONDS, type SignedUrlType } from '../middleware/signedUrl.js';
 import { rateLimit } from 'express-rate-limit';
 import { is2FAEnabled, verifyTOTP, generateOTPAuthUrl, activate2FA, disable2FA, getClientIP, get2FAReadiness } from '../utils/security.js';
 import { UAParser } from 'ua-parser-js';
 import axios from 'axios';
 import { sendSecurityNotification } from '../services/telegramBot.js';
 import { changeWebPasswordAndRevokeSessions, createInitialAdminCredentials, isInitialSetupRequired, validateTelegramPin, validateWebPassword, verifyWebPassword } from '../utils/authSettings.js';
+import { assertPublicHttpsUrl, createPublicOnlyHttpAgents } from '../utils/networkSecurity.js';
 
 // 导入可能需要的辅助函数
 async function getIPLocation(ip: string) {
+    if (ip === '::1' || ip === '127.0.0.1') return '本地回环';
+    const template = process.env.IP_GEOLOCATION_URL?.trim();
+    if (!template) return '未启用外部定位';
+    if (!template.includes('{ip}')) return '未知位置';
     try {
-        if (ip === '::1' || ip === '127.0.0.1') return '本地回环';
-        const response = await axios.get(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-        if (response.data.status === 'success') {
-            return `${response.data.country} ${response.data.regionName} ${response.data.city} (${response.data.isp})`;
+        const endpoint = await assertPublicHttpsUrl(template.replaceAll('{ip}', encodeURIComponent(ip)));
+        const { httpAgent, httpsAgent } = createPublicOnlyHttpAgents();
+        try {
+            const response = await axios.get(endpoint.toString(), {
+                timeout: 3000,
+                maxRedirects: 0,
+                httpAgent,
+                httpsAgent,
+            });
+            if (response.data.status === 'success') {
+                return `${response.data.country} ${response.data.regionName} ${response.data.city} (${response.data.isp})`;
+            }
+        } finally {
+            httpAgent.destroy();
+            httpsAgent.destroy();
         }
-    } catch (e) {
-        console.error('获取 IP 位置失败:', e);
+    } catch {
+        console.warn('获取 IP 位置失败');
     }
     return '未知位置';
 }
@@ -48,12 +64,6 @@ async function sendLoginNotification(req: Request) {
 
 const router = Router();
 const SIGNED_URL_TYPES = new Set<SignedUrlType>(['preview', 'thumbnail', 'download']);
-const MAX_SIGNED_URL_EXPIRES_IN_SECONDS: Record<SignedUrlType, number> = {
-    thumbnail: 24 * 60 * 60,
-    preview: 60 * 60,
-    download: 60 * 60,
-};
-
 function normalizeSignedUrlType(value: unknown): SignedUrlType | null {
     if (typeof value !== 'string') return null;
     return SIGNED_URL_TYPES.has(value as SignedUrlType) ? value as SignedUrlType : null;
@@ -339,7 +349,7 @@ router.post('/sign-url', requireAuth, (req: Request, res: Response) => {
         return res.status(400).json({ error: '过期时间无效' });
     }
 
-    const maxExpiresIn = MAX_SIGNED_URL_EXPIRES_IN_SECONDS[signedType];
+    const maxExpiresIn = SIGNED_URL_MAX_EXPIRES_IN_SECONDS[signedType];
     if (expiresInSeconds > maxExpiresIn) {
         return res.status(400).json({
             error: signedType === 'thumbnail'

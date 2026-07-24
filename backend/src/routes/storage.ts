@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import type { PoolClient } from 'pg';
 import checkDiskSpaceModule from 'check-disk-space';
 import { pool, query } from '../db/index.js';
 import { requireAuth } from './auth.js';
@@ -18,7 +19,8 @@ import { getOAuthRouteConfig, renderOAuthSuccessPage } from '../services/oauthRo
 import { deleteStorageAccountWithClient, StorageAccountConflictError, StorageAccountNotFoundError } from '../services/storageAccountLifecycle.js';
 import { logOperationalEvent } from '../services/operationalEvents.js';
 import { webDestructiveConfirmationStore } from '../services/webDestructiveConfirmation.js';
-import { StorageProbeError } from '../services/storage.js';
+import { S3StorageProvider, StorageProbeError } from '../services/storage.js';
+import { runBucketImport, type BucketImportRecord } from '../services/bucketImport.js';
 import { getTelegramUserClientStatus } from '../services/telegramUserClientStatus.js';
 import { maintenanceImpact } from '../utils/maintenanceActions.js';
 import { buildStorageCapabilities, buildStorageStatsPayload } from '../utils/storageProductContract.js';
@@ -749,12 +751,15 @@ router.delete('/accounts/:id', requireAuth, async (req: Request, res: Response) 
 
 // 从当前活跃的 S3 存储桶导入未入库的文件（绕过 TG Vault 直传到桶里的文件借此补建索引）
 router.post('/import-from-bucket', requireAuth, async (_req: Request, res: Response) => {
+    let client: PoolClient | null = null;
+    let lockKey: string | null = null;
+    let lockHeld = false;
     try {
         const { storageManager } = await import('../services/storage.js');
         const { getFileType, getMimeTypeFromFilename } = await import('../utils/telegramUtils.js');
 
         const provider = storageManager.getProvider();
-        if (provider.name !== 's3' || typeof (provider as any).listObjects !== 'function') {
+        if (!(provider instanceof S3StorageProvider)) {
             return res.status(400).json({ error: '当前活跃存储源不是 S3 兼容存储，无法从桶导入' });
         }
         const activeAccountId = storageManager.getActiveAccountId();
@@ -762,46 +767,66 @@ router.post('/import-from-bucket', requireAuth, async (_req: Request, res: Respo
             return res.status(400).json({ error: '未找到活跃的存储账户' });
         }
 
-        const objects: { key: string; size: number }[] = await (provider as any).listObjects();
-
-        // 已入库的 path 集合（仅限当前账户）
-        const existing = await query('SELECT path FROM files WHERE storage_account_id = $1', [activeAccountId]);
-        const existingPaths = new Set<string>(existing.rows.map((r: any) => r.path));
-
-        let imported = 0;
-        let skipped = 0;
-        let excluded = 0;
-
-        for (const obj of objects) {
-            // 排除数据库备份目录与“目录占位”对象
-            if (obj.key.startsWith('_backups/') || obj.key.endsWith('/')) {
-                excluded++;
-                continue;
-            }
-            if (existingPaths.has(obj.key)) {
-                skipped++;
-                continue;
-            }
-
-            const baseName = obj.key.includes('/') ? obj.key.slice(obj.key.lastIndexOf('/') + 1) : obj.key;
-            const folder = obj.key.includes('/') ? obj.key.slice(0, obj.key.lastIndexOf('/')) : null;
-            const mimeType = getMimeTypeFromFilename(baseName);
-            const type = getFileType(mimeType);
-
-            await query(
-                `INSERT INTO files
-                (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
-                VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, NULL, NULL, $7, $8, $9)`,
-                [baseName, baseName, type, mimeType, obj.size, obj.key, provider.name, folder, activeAccountId]
-            );
-            imported++;
+        client = await pool.connect();
+        lockKey = `tg-vault:bucket-import:${activeAccountId}`;
+        const lockResult = await client.query(
+            'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
+            [lockKey],
+        );
+        lockHeld = lockResult.rows[0]?.locked === true;
+        if (!lockHeld) {
+            return res.status(409).json({ error: '当前存储账户已有导入任务正在运行' });
         }
 
-        console.log(`[Storage] Bucket import done: scanned=${objects.length} imported=${imported} skipped=${skipped} excluded=${excluded}`);
-        res.json({ success: true, scanned: objects.length, imported, skipped, excluded });
+        const result = await runBucketImport({
+            listPage: token => provider.listObjectsPage(token),
+            insertBatch: async (records: BucketImportRecord[]) => {
+                const incoming = records.map(record => {
+                    const mimeType = getMimeTypeFromFilename(record.name);
+                    return {
+                        ...record,
+                        mimeType,
+                        type: getFileType(mimeType),
+                    };
+                });
+                const inserted = await client!.query(
+                    `WITH incoming AS (
+                        SELECT *
+                        FROM jsonb_to_recordset($2::jsonb) AS item(
+                            name text,
+                            "storedName" text,
+                            type text,
+                            "mimeType" text,
+                            size bigint,
+                            path text,
+                            folder text
+                        )
+                    )
+                    INSERT INTO files
+                    (name, stored_name, type, mime_type, size, path, thumbnail_path, preview_path, width, height, source, folder, storage_account_id)
+                    SELECT item.name, item."storedName", item.type, item."mimeType", item.size, item.path,
+                           NULL, NULL, NULL, NULL, $3, item.folder, $1
+                    FROM incoming item
+                    ON CONFLICT (storage_account_id, path)
+                        WHERE storage_account_id IS NOT NULL
+                        DO NOTHING
+                    RETURNING id`,
+                    [activeAccountId, JSON.stringify(incoming), provider.name],
+                );
+                return inserted.rowCount || 0;
+            },
+        });
+
+        console.log(`[Storage] Bucket import done: scanned=${result.scanned} imported=${result.imported} skipped=${result.skipped} excluded=${result.excluded}`);
+        res.json({ success: true, ...result });
     } catch (error) {
         console.error('从存储桶导入失败:', error);
         res.status(500).json({ error: '从存储桶导入失败' });
+    } finally {
+        if (client && lockHeld && lockKey) {
+            await client.query('SELECT pg_advisory_unlock(hashtext($1))', [lockKey]).catch(() => undefined);
+        }
+        client?.release();
     }
 });
 

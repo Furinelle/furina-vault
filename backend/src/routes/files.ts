@@ -20,6 +20,7 @@ import {
 import { normalizeFolderPath } from '../utils/folderPath.js';
 import { classifyMediaProxyError } from '../services/mediaProxyError.js';
 import { buildCloudMediaResponse } from '../services/cloudMediaResponse.js';
+import { PRIVATE_MEDIA_CACHE_CONTROL } from '../services/mediaCachePolicy.js';
 
 const router = Router();
 
@@ -453,7 +454,7 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
                 res,
                 localPreviewPath,
                 file.type === 'video' ? 'video/mp4' : 'image/webp',
-                'public, max-age=86400',
+                PRIVATE_MEDIA_CACHE_CONTROL,
                 `"${file.id}-${file.updated_at}-${file.preview_path}"`,
             );
             return;
@@ -533,7 +534,7 @@ router.get('/:id([0-9a-fA-F-]{36})/preview', async (req: Request, res: Response)
             res,
             servedPath,
             servedMime,
-            'public, max-age=86400',
+            PRIVATE_MEDIA_CACHE_CONTROL,
             `"${file.id}-${file.updated_at}-${previewPath || 'original'}"`
         );
     } catch (error) {
@@ -577,7 +578,7 @@ router.get('/:id([0-9a-fA-F-]{36})/original', async (req: Request, res: Response
 
         const filePath = await getSafeLocalFilePath(file);
         if (!fs.existsSync(filePath)) return res.status(404).json({ error: '文件不存在于服务器' });
-        await serveLocalPathWithRange(req, res, filePath, file.mime_type || 'application/octet-stream', 'public, max-age=86400', `"${file.id}-${file.updated_at}-original"`);
+        await serveLocalPathWithRange(req, res, filePath, file.mime_type || 'application/octet-stream', PRIVATE_MEDIA_CACHE_CONTROL, `"${file.id}-${file.updated_at}-original"`);
     } catch (error) {
         console.error('获取原始文件失败:', error);
         res.status(500).json({ error: '获取原始文件失败' });
@@ -705,7 +706,7 @@ router.get('/:id([0-9a-fA-F-]{36})/thumbnail', async (req: Request, res: Respons
 
         res.set({
             'Content-Type': 'image/webp',
-            'Cache-Control': 'public, max-age=604800',
+            'Cache-Control': PRIVATE_MEDIA_CACHE_CONTROL,
         });
 
         const stream = fs.createReadStream(thumbPath);
